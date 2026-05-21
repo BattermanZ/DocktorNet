@@ -5,16 +5,17 @@
 
 ## 1. Purpose
 
-Docktornet reads Docker and Podman container labels and automatically reconciles them into four external systems:
+Docktornet reads Docker and Podman container labels and automatically reconciles them into three external systems:
 
 - **Nginx Proxy Manager (NPM)** — reverse proxy entries
 - **Cloudflare DNS** — CNAME records
-- **Cloudflare Tunnel** — ingress rules on a single shared tunnel
 - **Gatus** — monitoring configuration
 
 Services declare their public/internal routing and monitoring metadata directly via Docker labels. Docktornet turns service exposure into a mostly declarative workflow with eventual-consistency reconciliation.
 
 The target environment is a homelab with one main Docker host plus a few additional machines (some running Podman rootless). The system is designed for tens of services, not hundreds.
+
+**Cloudflare Tunnel and Cloudflare Access integration are out of scope for v1** — see §9 and §10. Both will be revisited in a future iteration that handles ingress rule management together with Access applications and policies as a single coherent feature.
 
 ## 2. Architecture
 
@@ -22,7 +23,7 @@ Two Rust binaries shipped in a single Cargo workspace.
 
 ### 2.1 Binaries
 
-- **`docktornet-server`** — runs on the main host. Receives label snapshots from agents, diffs them against SQLite, drives reconciliation against the four external systems. Owns all credentials for external APIs. Single-instance.
+- **`docktornet-server`** — runs on the main host. Receives label snapshots from agents, diffs them against SQLite, drives reconciliation against the three external systems. Owns all credentials for external APIs. Single-instance.
 - **`docktornet-agent`** — runs on every machine (including the main host itself). Polls one or more Docker/Podman sockets every 30s, parses `docktornet.*` labels, sends a full snapshot of its machine's containers to the server. Stateless.
 
 ### 2.2 Workspace layout
@@ -34,7 +35,7 @@ docktornet/
 │   ├── agent/              (binary)
 │   ├── server/             (binary)
 │   ├── core/               (shared types, label schema, snapshot structs)
-│   └── integrations/       (npm, cloudflare_dns, cloudflare_tunnel, gatus)
+│   └── integrations/       (npm, cloudflare_dns, gatus)
 ```
 
 ### 2.3 Communication
@@ -55,11 +56,11 @@ Both Docker and Podman expose the same REST API over a unix socket. The agent ac
 - **Diff cycle (every 30s):** the server compares each agent snapshot against the last known state in SQLite. Only changed/new/removed services trigger external API calls.
 - **Full resync (default 1h, configurable):** the server verifies every resource it claims to own still exists in the external systems and matches the expected configuration. Drift is corrected by re-creating missing resources and re-applying intended state.
 
-Docktornet **only manages resources whose IDs are tracked in SQLite**. Manually created NPM/DNS/tunnel entries are never read, modified, or deleted unless adopted (see §7).
+Docktornet **only manages resources whose IDs are tracked in SQLite**. Manually created NPM or DNS entries are never read, modified, or deleted unless explicitly adopted (see §6.4).
 
 ## 3. Label Schema
 
-All four integrations are independently opt-in. A container with no `docktornet.*` labels is silently ignored.
+All three integrations are independently opt-in. A container with no `docktornet.*` labels is silently ignored.
 
 ### 3.1 NPM (multiple proxy hosts per service via numeric index)
 
@@ -95,17 +96,7 @@ docktornet.cf.dns.target: "home.example.com"     # CNAME target
 docktornet.cf.dns.proxied: "true"
 ```
 
-### 3.3 Cloudflare Tunnel
-
-```yaml
-docktornet.cf.tunnel.hostname: "myapp.example.com"
-docktornet.cf.tunnel.service: "http://localhost:3000"
-docktornet.cf.tunnel.no_tls_verify: "false"      # optional originRequest override
-```
-
-All tunnel credentials and the tunnel ID live in server config — never in labels. The tunnel is shared and existing; docktornet only manages the ingress rules array on it.
-
-### 3.4 Gatus (multiple monitors per service via numeric index)
+### 3.3 Gatus (multiple monitors per service via numeric index)
 
 ```yaml
 docktornet.gatus.0.url: "https://myapp.example.com"
@@ -116,9 +107,9 @@ docktornet.gatus.1.url: "http://myapp.local:3000"
 docktornet.gatus.1.interval: "30s"
 ```
 
-### 3.5 Service identity
+### 3.4 Service identity
 
-A service is uniquely identified by `{machine_id}/{container_name}`. This is the SQLite primary key and is also used to derive filesystem paths (sanitised — see §6).
+A service is uniquely identified by `{machine_id}/{container_name}`. This is the SQLite primary key and is also used to derive filesystem paths (sanitised — see §7).
 
 A container rename triggers full reprovision (old service deleted, new one created). This is acceptable for homelab use; an explicit `docktornet.service_id` override label can be added in a later iteration if it becomes painful.
 
@@ -134,7 +125,6 @@ DOCKTORNET_SECRET=your-shared-secret
 DOCKTORNET_FULL_RESYNC_INTERVAL=1h
 DOCKTORNET_GATUS_CONFIG_DIR=/etc/gatus/config.d
 DOCKTORNET_DB_PATH=/data/docktornet.db
-DOCKTORNET_TUNNEL_BACKUP_DIR=/data/tunnel-backups
 
 # Safety / bootstrap
 DOCKTORNET_DRY_RUN=true                # default true on first run
@@ -145,13 +135,12 @@ DOCKTORNET_NPM_URL=http://npm:81
 DOCKTORNET_NPM_USER=admin@example.com
 DOCKTORNET_NPM_PASSWORD=changeme
 
-# Cloudflare
-DOCKTORNET_CF_ACCOUNT_ID=...
-DOCKTORNET_CF_API_KEY=...              # Global API Key (PUT to tunnel config doesn't accept Bearer tokens)
-DOCKTORNET_CF_EMAIL=you@example.com
-DOCKTORNET_CF_TUNNEL_ID=...
+# Cloudflare DNS (scoped API token: Zone.DNS:Edit on the target zone)
+DOCKTORNET_CF_API_TOKEN=...
 DOCKTORNET_CF_ZONE_ID=...
 ```
+
+The Cloudflare client uses a scoped API token via `Authorization: Bearer <token>`, with `Zone:Read` + `DNS:Edit` permissions limited to the target zone. No Global API Key is required, no email header is sent. (Tunnel-related env vars are removed — see §9.)
 
 ### 4.2 Agent (`agent.env`)
 
@@ -195,15 +184,6 @@ CREATE TABLE cf_dns_records (
     record_id   TEXT NOT NULL,           -- Cloudflare DNS record id
     FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
 );
-
-CREATE TABLE cf_tunnel_hostnames (
-    service_id  TEXT PRIMARY KEY,
-    hostname    TEXT NOT NULL,           -- ingress rule key
-    FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
-);
-
--- index helpful for tunnel reconciliation
-CREATE INDEX idx_tunnel_hostname ON cf_tunnel_hostnames(hostname);
 ```
 
 Gatus files are deterministic at `{gatus_config_dir}/{sanitized_service_id}.yaml` and require no table.
@@ -226,32 +206,25 @@ For each service tracked in SQLite:
 
 - **NPM hosts** — `GET /api/nginx/proxy-hosts/{id}` per stored id. If missing → recreate. Always re-run certificate auto-match: if a better (or newly available) cert now applies, update the host.
 - **Cloudflare DNS** — `GET /v4/zones/{zone}/dns_records/{record_id}`. If missing → recreate. If content differs → update.
-- **Cloudflare Tunnel** — fetch current ingress, ensure every hostname in `cf_tunnel_hostnames` is present and points to the right service. If any are missing or wrong, perform the read-modify-write cycle (see §6.3).
 - **Gatus** — verify each expected file exists and matches expected content. Regenerate as needed.
 
 The resync **never** deletes anything that is not tracked in SQLite.
 
-### 6.3 Cloudflare Tunnel safety
+### 6.3 Dry-run mode
 
-Tunnel ingress is a single array PUT — wide blast radius. Safeguards:
-
-1. **Pre-write backup** — before every PUT, the server `GET`s the current tunnel config and writes it to `${DOCKTORNET_TUNNEL_BACKUP_DIR}/<unix_timestamp>.json`. Backups are append-only; rotation is out of scope for v1 (operator can prune).
-2. **Dry-run mode** — when `DOCKTORNET_DRY_RUN=true`, the server computes the new ingress and logs the diff but does not PUT. Default value is `true` on a fresh install; operator must flip to `false` to enable writes. Dry-run applies to **all** integrations, not just the tunnel.
-3. **Read-modify-write semantics** — the server fetches the current ingress, removes only entries whose hostnames are in `cf_tunnel_hostnames` for the affected services, inserts the new set, and preserves all unknown entries plus the trailing catch-all (`{ service: "http_status:404" }`). If the existing config has no catch-all, docktornet appends one.
+When `DOCKTORNET_DRY_RUN=true`, the server computes the intended state and logs every reconcile action (create/update/delete payloads, file contents) but does not call any external API or write any Gatus file. Default value is `true` on a fresh install; the operator must flip to `false` to enable writes. Dry-run applies to all integrations uniformly.
 
 ### 6.4 Bootstrap collision policy
 
-Both NPM and Cloudflare DNS reject creates with duplicate hostnames. Cloudflare Tunnel write-replaces by hostname.
+Both NPM and Cloudflare DNS reject creates with duplicate hostnames.
 
 **Default (`DOCKTORNET_ADOPT_EXISTING=false`):**
 
 - On NPM/DNS duplicate-error: log a clear warning identifying the resource and existing ID, do NOT update SQLite, retry on every subsequent cycle. Operator must either delete the conflicting resource or set adoption mode.
-- For tunnel writes: before performing read-modify-write, check whether any new hostname already exists in the current ingress AND is not in `cf_tunnel_hostnames`. If yes, refuse to write the entire batch and log loudly. This prevents unintended overwrite of manually-managed tunnel entries.
 
 **Adoption mode (`DOCKTORNET_ADOPT_EXISTING=true`):**
 
 - On NPM/DNS duplicate: look up the existing resource by hostname, store its ID in SQLite, and apply the label-declared config to it. From that point on, docktornet treats it as its own resource (including deletion when labels are removed).
-- For tunnel: existing matching hostnames are overwritten as part of the read-modify-write cycle without an additional check.
 
 Adoption is reversible only by deleting the relevant SQLite rows (manual operator action).
 
@@ -268,7 +241,6 @@ Adoption is reversible only by deleting the relevant SQLite rows (manual operato
 |---|---|
 | `${DOCKTORNET_DB_PATH}` | SQLite database (server only) |
 | `${DOCKTORNET_GATUS_CONFIG_DIR}/*.yaml` | Per-service Gatus configs |
-| `${DOCKTORNET_TUNNEL_BACKUP_DIR}/<ts>.json` | Tunnel config backups |
 
 **Service-id sanitisation:** `service_id` is `{machine_id}/{container_name}`. For filenames, both components are slugified (replace non-alphanumeric with `_`) and joined with `__`: `batterdock__myapp.yaml`.
 
@@ -310,16 +282,24 @@ The main host runs both the server and an agent (otherwise the server cannot see
 
 ## 9. Out of Scope (v1)
 
+- **Cloudflare Tunnel ingress management** — deferred to v2; will be designed jointly with Access (see §10).
+- **Cloudflare Access applications and policies** — deferred to v2.
 - High availability of the server (single-instance only)
 - Encryption-at-rest for SQLite
 - A web UI
 - Metrics / Prometheus endpoint (logs to stdout are sufficient for v1)
 - An `EventDriven` mode using the Docker events socket (polling is sufficient for the agreed cadence)
-- Multi-tunnel support
 - Multi-zone Cloudflare DNS (one zone per server install)
-- Automatic tunnel-backup rotation
 - Per-service overrides of the `service_id`
 
-## 10. Open Questions
+## 10. v2 Considerations (informative)
 
-None remaining for v1. Items deferred above can become future iterations.
+Recorded here so the v1 architecture stays compatible with what's coming:
+
+- **Cloudflare Tunnel** — single shared existing tunnel, ingress rules managed via Cloudflare API (`PUT /v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations`). Wide-blast-radius PUT requires pre-write backup of current config to disk. Some Cloudflare PUT endpoints reportedly reject API tokens and require Global API Key + email; this needs reconfirming when v2 is built.
+- **Cloudflare Access** — protect tunnel-exposed services with Access applications and policies. Likely design: named reusable policies defined in server config (`homelab-users`, `family`, `public-bypass`), referenced by services via a label like `docktornet.cf.access.policy=<name>`.
+- **Compatibility** — the SQLite schema will gain `cf_tunnel_hostnames` and `cf_access_applications` tables. The `integrations/` crate will gain `cloudflare_tunnel` and `cloudflare_access` modules. Server config will gain account_id, tunnel_id, and possibly Global API Key fields. No v1 schema or label change is expected — v2 additions will be additive.
+
+## 11. Open Questions
+
+None remaining for v1.
