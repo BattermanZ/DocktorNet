@@ -6,7 +6,7 @@
 
 **Architecture:** Rust workspace with three crates (`core`, `agent`, `server`). Async via Tokio. `bollard` for Docker/Podman socket talk (they share the same Engine API). `axum` for the server HTTP listener. `sqlx` for SQLite. `reqwest` for the agent's outbound HTTP. Bearer-token auth between agent and server. Configuration via `.env` files and `dotenvy`.
 
-**Tech Stack:** Rust (edition 2021), tokio, axum 0.8, reqwest 0.12, sqlx 0.8 (sqlite), bollard 0.18, serde + serde_json, tracing, thiserror, anyhow, dotenvy, humantime-serde, mockito (test-only), tempfile (test-only).
+**Tech Stack:** Rust (edition 2024, MSRV 1.85), tokio, axum 0.8, reqwest 0.12, sqlx 0.8 (sqlite), bollard 0.18, serde + serde_json, tracing, thiserror, anyhow, dotenvy, humantime-serde, mockito (test-only), tempfile (test-only).
 
 **Branch:** `development` (already created). Each task ends with a commit to `development`; both remotes get pushed at the end of each natural milestone (called out in dedicated tasks).
 
@@ -95,7 +95,7 @@ members = [
 ]
 
 [workspace.package]
-edition      = "2021"
+edition      = "2024"
 rust-version = "1.85"
 license      = "MIT"
 authors      = ["BattermanZ"]
