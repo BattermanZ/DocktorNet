@@ -1,0 +1,36 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env files
+.env
+.env.local
+.env.*.local
+*.env
+
+# Local data / SQLite
+/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Tunnel backups
+tunnel-backups/
+
+# Brainstorm artifacts
+.superpowers/
+
+# Logs
+*.log
