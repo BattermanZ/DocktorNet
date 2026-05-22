@@ -1,4 +1,5 @@
 mod config;
+mod db;
 
 use anyhow::Result;
 use tracing::info;
@@ -8,10 +9,13 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let cfg = config::ServerConfig::from_env()?;
-    info!(listen = %cfg.listen, db = ?cfg.db_path, "server starting (HTTP not wired yet)");
+    let _pool = db::connect(&cfg.db_path).await?;
+    info!(listen = %cfg.listen, "server starting (HTTP routes not wired yet)");
     Ok(())
 }
