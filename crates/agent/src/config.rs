@@ -5,6 +5,7 @@ use docktornet_core::MachineId;
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AgentConfig {
     pub server_url: String,
     pub secret: String,
