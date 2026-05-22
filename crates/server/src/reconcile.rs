@@ -94,6 +94,6 @@ mod tests {
 
         let rows = storage::list_services_for_machine(&pool, "m1").await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(!dir.path().join("gatus/m1__app.yaml").exists());
+        assert!(!dir.path().join("gatus").exists());
     }
 }
