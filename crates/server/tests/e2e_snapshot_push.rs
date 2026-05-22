@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use docktornet_core::{ContainerEntry, MachineId, Snapshot};
@@ -42,5 +41,4 @@ async fn agent_push_lands_in_sqlite_via_real_http() {
 
     server_task.abort();
     let _ = tokio::time::timeout(Duration::from_secs(1), server_task).await;
-    drop(Arc::new(())); // silence dead-import warning if any
 }

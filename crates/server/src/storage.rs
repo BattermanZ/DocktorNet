@@ -55,7 +55,6 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
     tx.commit().await
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn list_services_for_machine(
     pool: &Pool<Sqlite>,
     machine: &str,
