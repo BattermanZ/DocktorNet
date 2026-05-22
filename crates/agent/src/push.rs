@@ -4,6 +4,8 @@ use docktornet_core::Snapshot;
 use reqwest::Client;
 use tracing::{info, warn};
 
+const MAX_ERROR_BODY_LEN: usize = 4096;
+
 #[derive(Clone)]
 pub struct PushClient {
     http: Client,
@@ -15,8 +17,10 @@ pub struct PushClient {
 pub enum PushError {
     #[error("transport: {0}")]
     Transport(#[from] reqwest::Error),
-    #[error("server returned {status}: {body}")]
+    #[error("server returned {status}")]
     Status { status: u16, body: String },
+    #[error("push attempts must be greater than zero")]
+    NoAttempts,
 }
 
 impl PushClient {
@@ -47,7 +51,7 @@ impl PushClient {
             return Ok(());
         }
 
-        let body = resp.text().await.unwrap_or_default();
+        let body = truncate_body(resp.text().await.unwrap_or_default());
         Err(PushError::Status {
             status: status.as_u16(),
             body,
@@ -59,6 +63,10 @@ impl PushClient {
         snap: &Snapshot,
         attempts: u32,
     ) -> Result<(), PushError> {
+        if attempts == 0 {
+            return Err(PushError::NoAttempts);
+        }
+
         let mut delay = Duration::from_secs(1);
         let mut last_err = None;
 
@@ -72,11 +80,14 @@ impl PushClient {
                 }
                 Err(error) => {
                     warn!(attempt, max = attempts, error = %error, "snapshot push failed");
+                    let should_retry = error.is_retryable();
                     last_err = Some(error);
 
-                    if attempt < attempts {
+                    if should_retry && attempt < attempts {
                         tokio::time::sleep(delay).await;
                         delay = (delay * 4).min(Duration::from_secs(60));
+                    } else {
+                        break;
                     }
                 }
             }
@@ -84,6 +95,28 @@ impl PushClient {
 
         Err(last_err.expect("at least one push attempt"))
     }
+}
+
+impl PushError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport(_) => true,
+            Self::Status { status, .. } => *status == 429 || (500..=599).contains(status),
+            Self::NoAttempts => false,
+        }
+    }
+}
+
+fn truncate_body(body: String) -> String {
+    if body.len() <= MAX_ERROR_BODY_LEN {
+        return body;
+    }
+
+    let mut end = MAX_ERROR_BODY_LEN;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…<truncated>", &body[..end])
 }
 
 #[cfg(test)]
@@ -149,6 +182,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_truncates_large_error_body() {
+        let body = "x".repeat(MAX_ERROR_BODY_LEN + 100);
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v1/snapshot")
+            .with_status(500)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let client = PushClient::new(server.url(), "s").unwrap();
+        let err = client.push(&snap()).await.unwrap_err();
+
+        match err {
+            PushError::Status { body, .. } => {
+                assert!(body.len() < MAX_ERROR_BODY_LEN + 100);
+                assert!(body.ends_with("…<truncated>"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn push_with_retry_rejects_zero_attempts() {
+        let client = PushClient::new("http://127.0.0.1:1", "s").unwrap();
+        let err = client.push_with_retry(&snap(), 0).await.unwrap_err();
+        assert!(matches!(err, PushError::NoAttempts));
+    }
+
+    #[tokio::test]
     async fn push_with_retry_recovers_after_one_failure() {
         let mut server = Server::new_async().await;
         let m1 = server
@@ -169,5 +232,22 @@ mod tests {
 
         m1.assert_async().await;
         m2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn push_with_retry_does_not_retry_auth_failures() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v1/snapshot")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = PushClient::new(server.url(), "wrong").unwrap();
+        let err = client.push_with_retry(&snap(), 3).await.unwrap_err();
+
+        assert!(matches!(err, PushError::Status { status: 401, .. }));
+        m.assert_async().await;
     }
 }
