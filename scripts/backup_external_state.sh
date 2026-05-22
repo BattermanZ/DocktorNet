@@ -84,7 +84,20 @@ cf_get() {
 
 cf_get "/user/tokens/verify" "token-verify.json"
 cf_get "/zones/$DOCKTORNET_CF_ZONE_ID" "zone.json"
-cf_get "/zones/$DOCKTORNET_CF_ZONE_ID/settings" "zone-settings.json"
+
+set +e
+curl -fsS "$cf_api/zones/$DOCKTORNET_CF_ZONE_ID/settings" \
+  -H "Authorization: Bearer $DOCKTORNET_CF_API_TOKEN" |
+  jq "." > "$out/cloudflare/zone-settings.json"
+status=${PIPESTATUS[0]}
+set -e
+if [[ "$status" -ne 0 ]]; then
+  if [[ "$status" -eq 22 ]]; then
+    echo "warning: Cloudflare zone settings backup skipped because the endpoint returned 403; continuing" >&2
+  else
+    exit "$status"
+  fi
+fi
 
 page=1
 all="$out/cloudflare/dns-records.jsonl"
