@@ -1,13 +1,14 @@
 mod config;
+mod loop_;
 mod push;
-mod sockets;
 mod snapshot;
+mod sockets;
 
 use anyhow::Result;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::sockets::{BollardSource, ContainerSource, list_all};
+use crate::sockets::{BollardSource, ContainerSource};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,12 +32,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    let raw = list_all(&sources).await;
-    let snap = snapshot::build(&cfg.machine_id, &raw);
     info!(
-        containers = snap.containers.len(),
-        "pushing snapshot (one-shot, loop wires next)"
+        machine_id = %cfg.machine_id.as_str(),
+        sources = sources.len(),
+        interval = ?cfg.poll_interval,
+        "agent ready"
     );
-    client.push_with_retry(&snap, 3).await?;
+    loop_::run(cfg.machine_id, sources, client, cfg.poll_interval).await;
     Ok(())
 }
