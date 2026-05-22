@@ -62,7 +62,7 @@ pub enum NpmError {
 impl NpmClient {
     pub fn new(config: NpmConfig) -> Self {
         Self {
-            base_url: config.url,
+            base_url: normalize_base_url(config.url),
             user: config.user,
             password: config.password,
             http: Client::new(),
@@ -190,7 +190,11 @@ pub fn proxy_payload(
 pub fn matching_cert_id(host: &str, certs: &[Certificate]) -> Option<i64> {
     certs
         .iter()
-        .find(|cert| cert.domain_names.iter().any(|domain| domain == host))
+        .find(|cert| {
+            cert.domain_names
+                .iter()
+                .any(|domain| domain.eq_ignore_ascii_case(host))
+        })
         .map(|cert| cert.id)
         .or_else(|| {
             certs
@@ -205,6 +209,8 @@ pub fn matching_cert_id(host: &str, certs: &[Certificate]) -> Option<i64> {
 }
 
 fn wildcard_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
     let Some(suffix) = pattern.strip_prefix("*.") else {
         return false;
     };
@@ -220,6 +226,15 @@ fn wildcard_matches(pattern: &str, host: &str) -> bool {
     !label.is_empty()
         && !label.contains('.')
         && host.split('.').count() == suffix.split('.').count() + 1
+}
+
+fn normalize_base_url(mut url: Url) -> Url {
+    if !url.path().ends_with('/') {
+        let normalized_path = format!("{}/", url.path());
+        url.set_path(&normalized_path);
+    }
+
+    url
 }
 
 #[cfg(test)]
@@ -290,6 +305,40 @@ mod tests {
         }];
 
         assert_eq!(matching_cert_id("foo.badexample.com", &certs), None);
+    }
+
+    #[test]
+    fn certificate_exact_match_is_case_insensitive() {
+        let certs = vec![Certificate {
+            id: 1,
+            domain_names: vec!["APP.EXAMPLE.COM".to_string()],
+        }];
+
+        assert_eq!(matching_cert_id("app.example.com", &certs), Some(1));
+    }
+
+    #[tokio::test]
+    async fn token_preserves_configured_base_path() {
+        let mut server = Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/npm/api/tokens")
+            .match_header("content-type", "application/json")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "identity": "admin@example.com",
+                "secret": "pw",
+            })))
+            .with_status(200)
+            .with_body(r#"{"token":"abc123"}"#)
+            .create_async()
+            .await;
+
+        let client = NpmClient::new(crate::config::NpmConfig {
+            url: Url::parse(&format!("{}/npm", server.url())).unwrap(),
+            user: "admin@example.com".to_string(),
+            password: "pw".to_string(),
+        });
+
+        assert_eq!(client.token().await.unwrap(), "abc123");
     }
 
     #[test]
