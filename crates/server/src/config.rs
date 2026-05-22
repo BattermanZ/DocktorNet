@@ -97,7 +97,15 @@ fn parse_bool(value: &str, name: &'static str) -> Result<bool, ConfigError> {
 }
 
 fn parse_url(value: String, name: &'static str) -> Result<Url, ConfigError> {
-    Url::parse(&value).map_err(|_| ConfigError::InvalidUrl { name, value })
+    let url = Url::parse(&value).map_err(|_| ConfigError::InvalidUrl {
+        name,
+        value: value.clone(),
+    })?;
+
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        _ => Err(ConfigError::InvalidUrl { name, value }),
+    }
 }
 
 #[cfg(test)]
@@ -184,5 +192,78 @@ mod tests {
 
         assert!(!c.dry_run);
         assert!(c.adopt_existing);
+    }
+
+    #[test]
+    fn rejects_invalid_bool() {
+        let err = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_DRY_RUN", "maybe"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+        ]))
+        .unwrap_err();
+
+        match err {
+            ConfigError::InvalidBool { name, value } => {
+                assert_eq!(name, "DOCKTORNET_DRY_RUN");
+                assert_eq!(value, "maybe");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_url() {
+        let err = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "not a url"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+        ]))
+        .unwrap_err();
+
+        match err {
+            ConfigError::InvalidUrl { name, value } => {
+                assert_eq!(name, "DOCKTORNET_NPM_URL");
+                assert_eq!(value, "not a url");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_http_npm_url() {
+        let err = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "file:///tmp/npm"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+        ]))
+        .unwrap_err();
+
+        match err {
+            ConfigError::InvalidUrl { name, value } => {
+                assert_eq!(name, "DOCKTORNET_NPM_URL");
+                assert_eq!(value, "file:///tmp/npm");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
