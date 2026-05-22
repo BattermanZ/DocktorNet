@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod db;
+mod storage;
 
 use anyhow::Result;
 use tracing::info;
