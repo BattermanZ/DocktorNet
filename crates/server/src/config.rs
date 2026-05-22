@@ -17,10 +17,10 @@ pub enum ConfigError {
 
 impl ServerConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_iter(std::env::vars().collect())
+        Self::from_map(std::env::vars().collect())
     }
 
-    pub fn from_iter(env: HashMap<String, String>) -> Result<Self, ConfigError> {
+    pub fn from_map(env: HashMap<String, String>) -> Result<Self, ConfigError> {
         let get = |k: &'static str| env.get(k).cloned().ok_or(ConfigError::Missing(k));
         Ok(Self {
             listen: get("DOCKTORNET_LISTEN")?,
@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn happy_path() {
-        let c = ServerConfig::from_iter(env(&[
+        let c = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
             ("DOCKTORNET_SECRET", "s"),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn missing_var() {
-        let err = ServerConfig::from_iter(env(&[])).unwrap_err();
+        let err = ServerConfig::from_map(env(&[])).unwrap_err();
         match err {
             ConfigError::Missing(v) => assert_eq!(v, "DOCKTORNET_LISTEN"),
         }

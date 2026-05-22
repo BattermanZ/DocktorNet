@@ -8,6 +8,10 @@ license.workspace      = true
 name = "docktornet-server"
 path = "src/main.rs"
 
+[lib]
+name = "docktornet_server"
+path = "src/lib.rs"
+
 [dependencies]
 docktornet-core = { path = "../core" }
 

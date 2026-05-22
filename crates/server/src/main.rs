@@ -1,11 +1,5 @@
-mod auth;
-mod config;
-mod db;
-mod handlers;
-mod routes;
-mod storage;
-
 use anyhow::Result;
+use docktornet_server::{config, db, routes};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 

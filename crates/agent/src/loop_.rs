@@ -12,6 +12,7 @@ use crate::sockets::ContainerSource;
 ///   1. lists containers from every source
 ///   2. builds a Snapshot
 ///   3. pushes it with retry
+///
 /// Errors after retry exhaust are logged and the loop continues — we never
 /// abort because of a transient server outage.
 pub async fn run(
