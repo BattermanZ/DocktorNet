@@ -1,4 +1,5 @@
 mod config;
+mod push;
 mod sockets;
 mod snapshot;
 
@@ -18,6 +19,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::AgentConfig::from_env()?;
+    let client = push::PushClient::new(&cfg.server_url, &cfg.secret)?;
+
     let mut sources: Vec<Box<dyn ContainerSource>> = Vec::new();
     for spec in &cfg.sockets {
         match BollardSource::connect(spec) {
@@ -32,7 +35,8 @@ async fn main() -> Result<()> {
     let snap = snapshot::build(&cfg.machine_id, &raw);
     info!(
         containers = snap.containers.len(),
-        "snapshot built (push not wired yet)"
+        "pushing snapshot (one-shot, loop wires next)"
     );
+    client.push_with_retry(&snap, 3).await?;
     Ok(())
 }
