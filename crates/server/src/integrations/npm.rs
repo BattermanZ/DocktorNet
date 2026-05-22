@@ -209,10 +209,17 @@ fn wildcard_matches(pattern: &str, host: &str) -> bool {
         return false;
     };
 
-    let host_labels = host.split('.').count();
-    let suffix_labels = suffix.split('.').count();
+    let Some(prefix) = host.strip_suffix(suffix) else {
+        return false;
+    };
 
-    host_labels == suffix_labels + 1 && host.ends_with(suffix)
+    let Some(label) = prefix.strip_suffix('.') else {
+        return false;
+    };
+
+    !label.is_empty()
+        && !label.contains('.')
+        && host.split('.').count() == suffix.split('.').count() + 1
 }
 
 #[cfg(test)]
@@ -273,6 +280,16 @@ mod tests {
         }];
 
         assert_eq!(matching_cert_id("app.example.com", &certs), Some(1));
+    }
+
+    #[test]
+    fn wildcard_certificate_does_not_match_different_suffix() {
+        let certs = vec![Certificate {
+            id: 1,
+            domain_names: vec!["*.example.com".to_string()],
+        }];
+
+        assert_eq!(matching_cert_id("foo.badexample.com", &certs), None);
     }
 
     #[test]
