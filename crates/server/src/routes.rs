@@ -63,6 +63,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_rejects_wrong_token() {
+        let (app, _) = make_app().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/snapshot")
+            .header("authorization", "Bearer wrongtoken")
+            .header("content-type", "application/json")
+            .body(body(&snap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn ingest_requires_bearer() {
         let (app, _) = make_app().await;
         let req = Request::builder()

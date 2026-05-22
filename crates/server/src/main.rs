@@ -24,6 +24,10 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     info!(listen = %cfg.listen, "server ready");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+        })
+        .await?;
     Ok(())
 }
