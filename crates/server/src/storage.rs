@@ -1,4 +1,4 @@
-use docktornet_core::Snapshot;
+use docktornet_core::{service_id, Snapshot};
 use sqlx::{Pool, Sqlite};
 
 #[allow(dead_code)]
@@ -8,14 +8,14 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
     let seen_ids: Vec<String> = snap
         .containers
         .iter()
-        .map(|c| format!("{}/{}", machine, c.name))
+        .map(|c| service_id(&snap.machine_id, &c.name))
         .collect();
 
     let mut tx = pool.begin().await?;
 
     // upsert each container
     for c in &snap.containers {
-        let id = format!("{}/{}", machine, c.name);
+        let id = service_id(&snap.machine_id, &c.name);
         let labels_json = serde_json::to_string(&c.labels).unwrap_or_else(|_| "{}".into());
         sqlx::query(
             r#"INSERT INTO services (id, machine_id, container, labels_json, last_seen)
