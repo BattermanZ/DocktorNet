@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use docktornet_core::{labels::GatusMonitor, sanitize_service_id};
 use serde::Serialize;
@@ -16,6 +18,8 @@ pub struct GatusEndpoint {
     pub interval: String,
     pub conditions: Vec<String>,
 }
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn service_file_path(config_dir: impl AsRef<std::path::Path>, service_id: &str) -> PathBuf {
     config_dir
@@ -43,6 +47,21 @@ pub fn render_gatus_yaml(
     serde_yaml::to_string(&file)
 }
 
+fn service_temp_file_path(target: &std::path::Path) -> PathBuf {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let pid = std::process::id();
+    let file_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "gatus.yaml".into());
+
+    target.with_file_name(format!("{file_name}.tmp-{pid}-{nanos}-{counter}"))
+}
+
 pub async fn write_service_file(
     config_dir: impl AsRef<std::path::Path>,
     service_id: &str,
@@ -53,7 +72,7 @@ pub async fn write_service_file(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let tmp = target.with_extension("yaml.tmp");
+    let tmp = service_temp_file_path(&target);
     let yaml = render_gatus_yaml(service_id, monitors)?;
     tokio::fs::write(&tmp, yaml).await?;
     tokio::fs::rename(&tmp, &target).await?;
@@ -88,10 +107,17 @@ mod tests {
         }];
 
         let yaml = render_gatus_yaml("m1/app", &monitors).unwrap();
+        let expected = concat!(
+            "endpoints:\n",
+            "- name: m1/app/0\n",
+            "  group: m1/app\n",
+            "  url: https://app.example.com\n",
+            "  interval: 30s\n",
+            "  conditions:\n",
+            "  - '[STATUS] == 200'\n",
+        );
 
-        assert!(yaml.contains("endpoints:"));
-        assert!(yaml.contains("name: m1/app/0"));
-        assert!(yaml.contains("url: https://app.example.com"));
+        assert_eq!(yaml, expected);
     }
 
     #[tokio::test]
@@ -119,5 +145,27 @@ mod tests {
 
         remove_service_file(dir.path(), service_id).await.unwrap();
         assert!(!written.exists());
+    }
+
+    #[tokio::test]
+    async fn removing_missing_service_file_is_idempotent() {
+        let dir = tempdir().unwrap();
+
+        remove_service_file(dir.path(), "m1/app").await.unwrap();
+        remove_service_file(dir.path(), "m1/app").await.unwrap();
+    }
+
+    #[test]
+    fn temp_service_file_path_is_unique_per_call() {
+        let dir = tempdir().unwrap();
+        let target = service_file_path(dir.path(), "m1/app");
+        let first = service_temp_file_path(&target);
+        let second = service_temp_file_path(&target);
+
+        assert_eq!(first.parent(), target.parent());
+        assert_eq!(second.parent(), target.parent());
+        assert_ne!(first, second);
+        assert!(first.to_string_lossy().contains(".yaml.tmp-"));
+        assert!(second.to_string_lossy().contains(".yaml.tmp-"));
     }
 }
