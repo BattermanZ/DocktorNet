@@ -86,6 +86,10 @@ fn parse_sockets(raw: &str) -> Result<Vec<SocketSpec>, String> {
         let (runtime, path) = item
             .split_once(':')
             .ok_or_else(|| format!("expected 'runtime:path', got '{item}'"))?;
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(format!("socket path for runtime '{runtime}' cannot be empty"));
+        }
         let runtime = match runtime {
             "docker" => Runtime::Docker,
             "podman" => Runtime::Podman,
@@ -186,6 +190,26 @@ mod tests {
             ("DOCKTORNET_POLL_INTERVAL", "1s"),
             ("DOCKTORNET_MACHINE_ID", "m"),
             ("DOCKTORNET_SOCKETS", ""),
+        ]))
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "DOCKTORNET_SOCKETS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_socket_path_errors_with_sockets_var() {
+        let err = AgentConfig::from_iter(env(&[
+            ("DOCKTORNET_SERVER_URL", "u"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_POLL_INTERVAL", "1s"),
+            ("DOCKTORNET_MACHINE_ID", "m"),
+            ("DOCKTORNET_SOCKETS", "docker:   "),
         ]))
         .unwrap_err();
 
