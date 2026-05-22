@@ -1,5 +1,6 @@
 mod config;
 mod sockets;
+mod snapshot;
 
 use anyhow::Result;
 use tracing::info;
@@ -27,12 +28,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let containers = list_all(&sources).await;
+    let raw = list_all(&sources).await;
+    let snap = snapshot::build(&cfg.machine_id, &raw);
     info!(
-        machine_id = %cfg.machine_id.as_str(),
-        sockets = ?cfg.sockets,
-        count = containers.len(),
-        "listed containers (loop not wired yet)"
+        containers = snap.containers.len(),
+        "snapshot built (push not wired yet)"
     );
     Ok(())
 }
