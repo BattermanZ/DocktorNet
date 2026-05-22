@@ -67,6 +67,91 @@ pub async fn list_services_for_machine(
     Ok(rows)
 }
 
+pub async fn get_npm_host(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    npm_index: i64,
+) -> sqlx::Result<Option<i64>> {
+    sqlx::query_as(
+        "SELECT npm_id FROM npm_hosts WHERE service_id = ? AND npm_index = ?",
+    )
+    .bind(service_id)
+    .bind(npm_index)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.map(|(npm_id,)| npm_id))
+}
+
+pub async fn set_npm_host(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    npm_index: i64,
+    npm_id: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO npm_hosts (service_id, npm_index, npm_id)
+           VALUES (?, ?, ?)
+           ON CONFLICT(service_id, npm_index) DO UPDATE SET
+             npm_id = excluded.npm_id"#,
+    )
+    .bind(service_id)
+    .bind(npm_index)
+    .bind(npm_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_npm_host(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    npm_index: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM npm_hosts WHERE service_id = ? AND npm_index = ?")
+        .bind(service_id)
+        .bind(npm_index)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_cf_dns_record(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_as("SELECT record_id FROM cf_dns_records WHERE service_id = ?")
+        .bind(service_id)
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.map(|(record_id,)| record_id))
+}
+
+pub async fn set_cf_dns_record(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    record_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO cf_dns_records (service_id, record_id)
+           VALUES (?, ?)
+           ON CONFLICT(service_id) DO UPDATE SET
+             record_id = excluded.record_id"#,
+    )
+    .bind(service_id)
+    .bind(record_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_cf_dns_record(pool: &Pool<Sqlite>, service_id: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM cf_dns_records WHERE service_id = ?")
+        .bind(service_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +315,46 @@ mod tests {
 
         let rows = list_services_for_machine(&p, "m1").await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tracks_npm_host_ids() {
+        let p = pool().await;
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                taken_at: 100,
+                containers: vec![entry("app", &[])],
+            },
+        )
+        .await
+        .unwrap();
+        set_npm_host(&p, "m1/app", 0, 58).await.unwrap();
+        assert_eq!(get_npm_host(&p, "m1/app", 0).await.unwrap(), Some(58));
+        delete_npm_host(&p, "m1/app", 0).await.unwrap();
+        assert_eq!(get_npm_host(&p, "m1/app", 0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn tracks_cloudflare_record_ids() {
+        let p = pool().await;
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                taken_at: 100,
+                containers: vec![entry("app", &[])],
+            },
+        )
+        .await
+        .unwrap();
+        set_cf_dns_record(&p, "m1/app", "abc").await.unwrap();
+        assert_eq!(
+            get_cf_dns_record(&p, "m1/app").await.unwrap(),
+            Some("abc".to_string())
+        );
+        delete_cf_dns_record(&p, "m1/app").await.unwrap();
+        assert_eq!(get_cf_dns_record(&p, "m1/app").await.unwrap(), None);
     }
 }
