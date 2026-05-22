@@ -1,6 +1,8 @@
 mod auth;
 mod config;
 mod db;
+mod handlers;
+mod routes;
 mod storage;
 
 use anyhow::Result;
@@ -17,7 +19,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::ServerConfig::from_env()?;
-    let _pool = db::connect(&cfg.db_path).await?;
-    info!(listen = %cfg.listen, "server starting (HTTP routes not wired yet)");
+    let pool = db::connect(&cfg.db_path).await?;
+    let app = routes::build(pool, cfg.secret);
+
+    let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
+    info!(listen = %cfg.listen, "server ready");
+    axum::serve(listener, app).await?;
     Ok(())
 }

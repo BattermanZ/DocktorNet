@@ -13,7 +13,6 @@ pub struct AuthState {
     pub secret: Arc<String>,
 }
 
-#[allow(dead_code)]
 pub async fn require_bearer(
     State(state): State<AuthState>,
     req: Request<Body>,

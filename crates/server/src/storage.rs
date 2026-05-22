@@ -1,7 +1,6 @@
-use docktornet_core::{service_id, Snapshot};
+use docktornet_core::{Snapshot, service_id};
 use sqlx::{Pool, Sqlite};
 
-#[allow(dead_code)]
 pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Result<()> {
     let now = snap.taken_at as i64;
     let machine = snap.machine_id.as_str();
@@ -56,7 +55,7 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
     tx.commit().await
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn list_services_for_machine(
     pool: &Pool<Sqlite>,
     machine: &str,
