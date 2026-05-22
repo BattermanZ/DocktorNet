@@ -14,7 +14,18 @@ async fn main() -> Result<()> {
 
     let cfg = config::ServerConfig::from_env()?;
     let pool = db::connect(&cfg.db_path).await?;
-    let app = routes::build(pool, cfg.secret);
+    let reconciler = docktornet_server::reconcile::Reconciler::new(
+        pool,
+        docktornet_server::reconcile::ReconcileOptions {
+            dry_run: cfg.dry_run,
+            adopt_existing: cfg.adopt_existing,
+            gatus_config_dir: cfg.gatus_config_dir.clone(),
+        },
+    );
+    let app = routes::build(docktornet_server::handlers::snapshot::AppState {
+        reconciler,
+        secret: std::sync::Arc::new(cfg.secret),
+    });
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     info!(listen = %cfg.listen, "server ready");

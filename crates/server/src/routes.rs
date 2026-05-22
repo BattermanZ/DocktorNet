@@ -1,28 +1,20 @@
-use std::sync::Arc;
-
 use axum::Router;
 use axum::routing::post;
 
 use crate::auth::{AuthState, require_bearer};
-use crate::db::Db;
-use crate::handlers::snapshot::{AppState, ingest};
+use crate::handlers::snapshot::{self, AppState};
 
-pub fn build(db: Db, secret: String) -> Router {
+pub fn build(state: AppState) -> Router {
     let auth_state = AuthState {
-        secret: Arc::new(secret.clone()),
+        secret: state.secret.clone(),
     };
-    let app_state = AppState {
-        db,
-        secret: auth_state.secret.clone(),
-    };
-
     Router::new()
-        .route("/api/v1/snapshot", post(ingest))
+        .route("/api/v1/snapshot", post(snapshot::ingest))
         .layer(axum::middleware::from_fn_with_state(
-            auth_state.clone(),
+            auth_state,
             require_bearer,
         ))
-        .with_state(app_state)
+        .with_state(state)
 }
 
 #[cfg(test)]
@@ -36,13 +28,25 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::db;
+    use crate::reconcile::{ReconcileOptions, Reconciler};
     use crate::storage::list_services_for_machine;
 
-    async fn make_app() -> (Router, Db) {
+    async fn make_app() -> (Router, crate::db::Db) {
         let dir = Box::leak(Box::new(tempdir().unwrap()));
         let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
-        let router = build(pool.clone(), "s3cret".into());
-        (router, pool)
+        let reconciler = Reconciler::new(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: true,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+        );
+        let state = AppState {
+            reconciler,
+            secret: std::sync::Arc::new("s3cret".into()),
+        };
+        (build(state), pool)
     }
 
     fn body(snap: &Snapshot) -> Body {
