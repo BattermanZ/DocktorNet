@@ -68,10 +68,15 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
         match parts.as_slice() {
             ["npm", idx, field] => match idx.parse::<u8>() {
                 Ok(index) => {
-                    npm_groups
-                        .entry(index)
-                        .or_default()
-                        .insert((*field).to_string(), value.clone());
+                    if is_npm_field(field) {
+                        npm_groups
+                            .entry(index)
+                            .or_default()
+                            .insert((*field).to_string(), value.clone());
+                    } else {
+                        out.warnings
+                            .push(format!("unrecognised npm.{index}.{field} field in key '{key}'"));
+                    }
                 }
                 Err(_) => out
                     .warnings
@@ -79,17 +84,28 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
             },
             ["gatus", idx, field] => match idx.parse::<u8>() {
                 Ok(index) => {
-                    gatus_groups
-                        .entry(index)
-                        .or_default()
-                        .insert((*field).to_string(), value.clone());
+                    if is_gatus_field(field) {
+                        gatus_groups
+                            .entry(index)
+                            .or_default()
+                            .insert((*field).to_string(), value.clone());
+                    } else {
+                        out.warnings.push(format!(
+                            "unrecognised gatus.{index}.{field} field in key '{key}'"
+                        ));
+                    }
                 }
                 Err(_) => out
                     .warnings
                     .push(format!("invalid gatus index in key '{key}'")),
             },
             ["cf", "dns", field] => {
-                cf_dns.insert((*field).to_string(), value.clone());
+                if is_cf_dns_field(field) {
+                    cf_dns.insert((*field).to_string(), value.clone());
+                } else {
+                    out.warnings
+                        .push(format!("unrecognised cf.dns.{field} field in key '{key}'"));
+                }
             }
             _ => out
                 .warnings
@@ -158,6 +174,13 @@ fn build_npm_host(index: u8, fields: &BTreeMap<String, String>) -> Result<NpmHos
     })
 }
 
+fn is_npm_field(field: &str) -> bool {
+    matches!(
+        field,
+        "host" | "port" | "scheme" | "ssl" | "hsts" | "http2" | "cert_id"
+    )
+}
+
 fn build_cf_dns(fields: &BTreeMap<String, String>) -> Result<CloudflareDns, String> {
     let name = fields.get("name").ok_or("missing name")?.clone();
     let target = fields.get("target").ok_or("missing target")?.clone();
@@ -170,10 +193,14 @@ fn build_cf_dns(fields: &BTreeMap<String, String>) -> Result<CloudflareDns, Stri
     })
 }
 
+fn is_cf_dns_field(field: &str) -> bool {
+    matches!(field, "name" | "target" | "proxied")
+}
+
 fn build_gatus(index: u8, fields: &BTreeMap<String, String>) -> Result<GatusMonitor, String> {
     let url = fields.get("url").ok_or("missing url")?.clone();
     let interval = fields.get("interval").ok_or("missing interval")?.clone();
-    let conditions = match fields.get("conditions") {
+    let mut conditions: Vec<String> = match fields.get("conditions") {
         Some(conditions) => conditions
             .split(',')
             .map(|condition| condition.trim().to_string())
@@ -181,6 +208,9 @@ fn build_gatus(index: u8, fields: &BTreeMap<String, String>) -> Result<GatusMoni
             .collect(),
         None => vec!["[STATUS] == 200".to_string()],
     };
+    if conditions.is_empty() {
+        conditions.push("[STATUS] == 200".to_string());
+    }
 
     Ok(GatusMonitor {
         index,
@@ -188,6 +218,10 @@ fn build_gatus(index: u8, fields: &BTreeMap<String, String>) -> Result<GatusMoni
         interval,
         conditions,
     })
+}
+
+fn is_gatus_field(field: &str) -> bool {
+    matches!(field, "url" | "interval" | "conditions")
 }
 
 fn parse_bool(value: impl AsRef<str>) -> Result<bool, String> {
@@ -333,6 +367,43 @@ mod tests {
                 "[RESPONSE_TIME] < 500".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn gatus_empty_explicit_conditions_use_default() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.0.conditions", " , ,, "),
+        ]));
+        assert_eq!(p.gatus.len(), 1);
+        assert_eq!(p.gatus[0].conditions, vec!["[STATUS] == 200"]);
+    }
+
+    #[test]
+    fn unknown_fields_under_known_integrations_warn_without_blocking_valid_fields() {
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", "a.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "true"),
+            ("docktornet.npm.0.hots", "typo"),
+            ("docktornet.cf.dns.name", "myapp"),
+            ("docktornet.cf.dns.target", "home.example.com"),
+            ("docktornet.cf.dns.proxied", "true"),
+            ("docktornet.cf.dns.proxxy", "typo"),
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.0.conditons", "typo"),
+        ]));
+
+        assert_eq!(p.npm.len(), 1);
+        assert!(p.cf_dns.is_some());
+        assert_eq!(p.gatus.len(), 1);
+        assert_eq!(p.warnings.len(), 3);
+        assert!(p.warnings.iter().any(|w| w.contains("npm.0.hots")));
+        assert!(p.warnings.iter().any(|w| w.contains("cf.dns.proxxy")));
+        assert!(p.warnings.iter().any(|w| w.contains("gatus.0.conditons")));
     }
 
     #[test]
