@@ -8,13 +8,18 @@ use crate::push::PushClient;
 use crate::snapshot;
 use crate::sockets::ContainerSource;
 
-/// Run the poll/push loop forever.
+/// Run the poll/push loop forever. Each cycle:
+///   1. lists containers from every source
+///   2. builds a Snapshot
+///   3. pushes it with retry
+/// Errors after retry exhaust are logged and the loop continues — we never
+/// abort because of a transient server outage.
 pub async fn run(
     machine: MachineId,
     sources: Vec<Box<dyn ContainerSource>>,
     client: PushClient,
     interval: Duration,
-) {
+) -> ! {
     let mut next = Instant::now();
 
     loop {
@@ -33,21 +38,3 @@ pub async fn run(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use docktornet_core::MachineId;
-
-    use crate::push::PushClient;
-    use crate::sockets::ContainerSource;
-
-    fn _signature_check(
-        m: MachineId,
-        s: Vec<Box<dyn ContainerSource>>,
-        c: PushClient,
-        d: Duration,
-    ) -> impl std::future::Future<Output = ()> {
-        super::run(m, s, c, d)
-    }
-}

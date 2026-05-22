@@ -32,6 +32,10 @@ async fn main() -> Result<()> {
         }
     }
 
+    if sources.is_empty() {
+        anyhow::bail!("no Docker/Podman sources connected — check DOCKTORNET_SOCKETS");
+    }
+
     info!(
         machine_id = %cfg.machine_id.as_str(),
         sources = sources.len(),
@@ -39,5 +43,4 @@ async fn main() -> Result<()> {
         "agent ready"
     );
     loop_::run(cfg.machine_id, sources, client, cfg.poll_interval).await;
-    Ok(())
 }
