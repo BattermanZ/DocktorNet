@@ -18,6 +18,7 @@ pub struct DnsRecordPayload {
 pub struct CloudflareClient {
     api_token: String,
     zone_id: String,
+    base_url: String,
     http: Client,
 }
 
@@ -61,11 +62,23 @@ pub struct DnsRecordListResponse {
     pub result: Vec<DnsRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct DeleteResponse {
+    pub success: bool,
+}
+
 impl CloudflareClient {
     pub fn new(config: CloudflareConfig) -> Self {
+        Self::with_base_url(config, "https://api.cloudflare.com/client/v4")
+    }
+
+    fn with_base_url(config: CloudflareConfig, base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+
         Self {
             api_token: config.api_token,
             zone_id: config.zone_id,
+            base_url,
             http: Client::new(),
         }
     }
@@ -140,18 +153,24 @@ impl CloudflareClient {
     }
 
     pub async fn delete_record(&self, id: &str) -> Result<(), CloudflareError> {
-        self.http
+        let resp = self
+            .http
             .delete(self.endpoint(&format!("zones/{}/dns_records/{id}", self.zone_id)))
             .bearer_auth(&self.api_token)
             .send()
             .await?
             .error_for_status()?;
 
-        Ok(())
+        let response = resp.json::<DeleteResponse>().await?;
+        if response.success {
+            Ok(())
+        } else {
+            Err(CloudflareError::Api)
+        }
     }
 
     fn endpoint(&self, path: &str) -> String {
-        format!("https://api.cloudflare.com/client/v4/{path}")
+        format!("{}/{}", self.base_url, path)
     }
 }
 
@@ -194,6 +213,7 @@ pub fn dns_payload(dns: &CloudflareDns, zone_name: &str) -> DnsRecordPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mockito::{Matcher, Server};
 
     #[test]
     fn builds_cname_payload() {
@@ -215,5 +235,84 @@ mod tests {
                 ttl: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn find_record_by_name_uses_injected_base_url_and_auth_headers() {
+        let mut server = Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/client/v4/zones/zone-123/dns_records")
+            .match_header("authorization", "Bearer token-abc")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("type".into(), "CNAME".into()),
+                Matcher::UrlEncoded("name".into(), "app.example.com".into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "success": true,
+                    "result": [{
+                        "id": "rec-1",
+                        "name": "app.example.com",
+                        "content": "target.example.com",
+                        "proxied": true
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "token-abc".to_string(),
+                zone_id: "zone-123".to_string(),
+            },
+            format!("{}/client/v4", server.url()),
+        );
+
+        let record = client.find_record_by_name("app.example.com").await.unwrap();
+
+        assert_eq!(
+            record,
+            Some(DnsRecord {
+                id: "rec-1".to_string(),
+                name: "app.example.com".to_string(),
+                content: "target.example.com".to_string(),
+                proxied: true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_record_returns_api_error_when_success_is_false() {
+        let mut server = Server::new_async().await;
+        let _mock = server
+            .mock("DELETE", "/client/v4/zones/zone-123/dns_records/rec-42")
+            .match_header("authorization", "Bearer token-abc")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "success": false,
+                    "errors": [],
+                    "messages": [],
+                    "result": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "token-abc".to_string(),
+                zone_id: "zone-123".to_string(),
+            },
+            format!("{}/client/v4", server.url()),
+        );
+
+        let err = client.delete_record("rec-42").await.unwrap_err();
+
+        assert!(matches!(err, CloudflareError::Api));
     }
 }
