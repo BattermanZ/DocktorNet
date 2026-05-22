@@ -21,8 +21,8 @@ pub struct ReconcileOptions {
 pub enum ReconcileError {
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
-    #[error("gatus file error: {0}")]
-    Gatus(#[from] anyhow::Error),
+    #[error("external integration error: {0}")]
+    External(#[from] anyhow::Error),
 }
 
 impl Reconciler {

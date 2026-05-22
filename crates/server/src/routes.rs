@@ -31,8 +31,8 @@ mod tests {
     use crate::reconcile::{ReconcileOptions, Reconciler};
     use crate::storage::list_services_for_machine;
 
-    async fn make_app() -> (Router, crate::db::Db) {
-        let dir = Box::leak(Box::new(tempdir().unwrap()));
+    async fn make_app() -> (Router, crate::db::Db, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
         let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
         let reconciler = Reconciler::new(
             pool.clone(),
@@ -46,7 +46,7 @@ mod tests {
             reconciler,
             secret: std::sync::Arc::new("s3cret".into()),
         };
-        (build(state), pool)
+        (build(state), pool, dir)
     }
 
     fn body(snap: &Snapshot) -> Body {
@@ -68,7 +68,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_rejects_wrong_token() {
-        let (app, _) = make_app().await;
+        let (app, _, _dir) = make_app().await;
         let req = Request::builder()
             .method("POST")
             .uri("/api/v1/snapshot")
@@ -82,7 +82,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_requires_bearer() {
-        let (app, _) = make_app().await;
+        let (app, _, _dir) = make_app().await;
         let req = Request::builder()
             .method("POST")
             .uri("/api/v1/snapshot")
@@ -95,7 +95,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_persists_snapshot() {
-        let (app, pool) = make_app().await;
+        let (app, pool, _dir) = make_app().await;
         let req = Request::builder()
             .method("POST")
             .uri("/api/v1/snapshot")
