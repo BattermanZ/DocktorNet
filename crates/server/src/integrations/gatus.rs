@@ -22,9 +22,11 @@ pub struct GatusEndpoint {
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn service_file_path(config_dir: impl AsRef<std::path::Path>, service_id: &str) -> PathBuf {
-    config_dir
-        .as_ref()
-        .join(format!("{}.yaml", sanitize_service_id(service_id)))
+    config_dir.as_ref().join(format!(
+        "{}--{:016x}.yaml",
+        sanitize_service_id(service_id),
+        stable_service_hash(service_id)
+    ))
 }
 
 pub fn render_gatus_yaml(
@@ -60,6 +62,15 @@ fn service_temp_file_path(target: &std::path::Path) -> PathBuf {
         .unwrap_or_else(|| "gatus.yaml".into());
 
     target.with_file_name(format!("{file_name}.tmp-{pid}-{nanos}-{counter}"))
+}
+
+fn stable_service_hash(service_id: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    service_id.as_bytes().iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
 }
 
 pub async fn write_service_file(
@@ -134,7 +145,11 @@ mod tests {
         let path = service_file_path(dir.path(), service_id);
         assert_eq!(
             path,
-            PathBuf::from(dir.path()).join(format!("{}.yaml", sanitize_service_id(service_id)))
+            PathBuf::from(dir.path()).join(format!(
+                "{}--{:016x}.yaml",
+                sanitize_service_id(service_id),
+                stable_service_hash(service_id)
+            ))
         );
 
         let written = write_service_file(dir.path(), service_id, &monitors)
@@ -167,5 +182,37 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.to_string_lossy().contains(".yaml.tmp-"));
         assert!(second.to_string_lossy().contains(".yaml.tmp-"));
+    }
+
+    #[test]
+    fn service_file_path_disambiguates_sanitized_collisions() {
+        let dir = tempdir().unwrap();
+        let hyphen = service_file_path(dir.path(), "m1/my-app");
+        let underscore = service_file_path(dir.path(), "m1/my_app");
+        let dot = service_file_path(dir.path(), "m1/my.app");
+
+        assert_ne!(hyphen, underscore);
+        assert_ne!(hyphen, dot);
+        assert_ne!(underscore, dot);
+        assert!(
+            hyphen
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("m1__my_app--")
+        );
+        assert!(
+            underscore
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("m1__my_app--")
+        );
+        assert!(
+            dot.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("m1__my_app--")
+        );
     }
 }
