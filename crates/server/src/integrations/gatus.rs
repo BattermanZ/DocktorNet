@@ -91,7 +91,7 @@ mod tests {
 
         assert!(yaml.contains("endpoints:"));
         assert!(yaml.contains("name: m1/app/0"));
-        assert!(yaml.contains("https://app.example.com"));
+        assert!(yaml.contains("url: https://app.example.com"));
     }
 
     #[tokio::test]
