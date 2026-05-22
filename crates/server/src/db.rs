@@ -36,8 +36,20 @@ mod tests {
         let path = dir.path().join("test.db");
         let pool = connect(&path).await.unwrap();
 
-        // Migration ran iff the `services` table exists.
+        // Migration ran iff the core tables exist.
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM services")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 0);
+
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM npm_hosts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 0);
+
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cf_dns_records")
             .fetch_one(&pool)
             .await
             .unwrap();
