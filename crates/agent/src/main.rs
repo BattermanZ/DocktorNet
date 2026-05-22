@@ -1,8 +1,11 @@
 mod config;
+mod sockets;
 
 use anyhow::Result;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+use crate::sockets::{BollardSource, ContainerSource, list_all};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -14,10 +17,22 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::AgentConfig::from_env()?;
+    let mut sources: Vec<Box<dyn ContainerSource>> = Vec::new();
+    for spec in &cfg.sockets {
+        match BollardSource::connect(spec) {
+            Ok(source) => sources.push(Box::new(source)),
+            Err(error) => {
+                tracing::error!(socket = %spec.path, %error, "failed to connect, skipping");
+            }
+        }
+    }
+
+    let containers = list_all(&sources).await;
     info!(
         machine_id = %cfg.machine_id.as_str(),
         sockets = ?cfg.sockets,
-        "agent starting (config only — loop not wired yet)"
+        count = containers.len(),
+        "listed containers (loop not wired yet)"
     );
     Ok(())
 }
