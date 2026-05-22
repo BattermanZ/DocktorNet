@@ -85,18 +85,29 @@ cf_get() {
 cf_get "/user/tokens/verify" "token-verify.json"
 cf_get "/zones/$DOCKTORNET_CF_ZONE_ID" "zone.json"
 
-set +e
-curl -fsS "$cf_api/zones/$DOCKTORNET_CF_ZONE_ID/settings" \
-  -H "Authorization: Bearer $DOCKTORNET_CF_API_TOKEN" |
-  jq "." > "$out/cloudflare/zone-settings.json"
-status=${PIPESTATUS[0]}
-set -e
-if [[ "$status" -ne 0 ]]; then
-  if [[ "$status" -eq 22 ]]; then
-    echo "warning: Cloudflare zone settings backup skipped because the endpoint returned 403; continuing" >&2
-  else
-    exit "$status"
-  fi
+zone_settings_tmp="$out/cloudflare/zone-settings.json.tmp"
+zone_settings_code="$(
+  curl -sS -w '%{http_code}' \
+    -o "$zone_settings_tmp" \
+    "$cf_api/zones/$DOCKTORNET_CF_ZONE_ID/settings" \
+    -H "Authorization: Bearer $DOCKTORNET_CF_API_TOKEN"
+)"
+zone_settings_status=$?
+if [[ "$zone_settings_status" -ne 0 ]]; then
+  rm -f "$zone_settings_tmp"
+  exit "$zone_settings_status"
+fi
+
+if [[ "$zone_settings_code" == 2* ]]; then
+  jq "." "$zone_settings_tmp" > "$out/cloudflare/zone-settings.json"
+  rm -f "$zone_settings_tmp"
+elif [[ "$zone_settings_code" == "403" ]]; then
+  rm -f "$zone_settings_tmp"
+  echo "warning: Cloudflare zone settings backup skipped because the endpoint returned 403; continuing" >&2
+else
+  rm -f "$zone_settings_tmp"
+  echo "Cloudflare zone settings backup failed with HTTP $zone_settings_code" >&2
+  exit 1
 fi
 
 page=1
