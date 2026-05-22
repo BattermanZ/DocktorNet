@@ -6,7 +6,7 @@
 
 **Architecture:** Rust workspace with three crates (`core`, `agent`, `server`). Async via Tokio. `bollard` for Docker/Podman socket talk (they share the same Engine API). `axum` for the server HTTP listener. `sqlx` for SQLite. `reqwest` for the agent's outbound HTTP. Bearer-token auth between agent and server. Configuration via `.env` files and `dotenvy`.
 
-**Tech Stack:** Rust (edition 2024, MSRV 1.85), tokio, axum 0.8, reqwest 0.12, sqlx 0.8 (sqlite), bollard 0.18, serde + serde_json, tracing, thiserror, anyhow, dotenvy, humantime-serde, mockito (test-only), tempfile (test-only).
+**Tech Stack:** Rust (edition 2024, latest stable), tokio, axum 0.8, reqwest 0.12, sqlx 0.8 (sqlite), bollard 0.18, serde + serde_json, tracing, thiserror, anyhow, dotenvy, humantime-serde, mockito (test-only), tempfile (test-only).
 
 **Branch:** `development` (already created). Each task ends with a commit to `development`; both remotes get pushed at the end of each natural milestone (called out in dedicated tasks).
 
@@ -29,7 +29,7 @@
 ```
 docktornet/
 ├── Cargo.toml                         # workspace root
-├── rust-toolchain.toml                # pinned stable
+├── rust-toolchain.toml                # latest stable toolchain
 ├── .env.example                       # documentation
 ├── Justfile                           # common commands
 ├── crates/
@@ -96,8 +96,7 @@ members = [
 
 [workspace.package]
 edition      = "2024"
-rust-version = "1.85"
-license      = "MIT"
+license      = "AGPL-3.0-or-later"
 authors      = ["BattermanZ"]
 repository   = "https://github.com/BattermanZ/DocktorNet"
 
@@ -148,7 +147,6 @@ profile    = "minimal"
 name         = "docktornet-core"
 version      = "0.1.0"
 edition.workspace      = true
-rust-version.workspace = true
 license.workspace      = true
 
 [lib]
@@ -203,7 +201,6 @@ Use `Write` for each with the placeholder comment as the only content.
 name         = "docktornet-agent"
 version      = "0.1.0"
 edition.workspace      = true
-rust-version.workspace = true
 license.workspace      = true
 
 [[bin]]
@@ -248,7 +245,6 @@ fn main() {
 name         = "docktornet-server"
 version      = "0.1.0"
 edition.workspace      = true
-rust-version.workspace = true
 license.workspace      = true
 
 [[bin]]
@@ -322,12 +318,12 @@ run-server:
 
 ```env
 # --- Server ---
-DOCKTORNET_LISTEN=0.0.0.0:8080
+DOCKTORNET_LISTEN=0.0.0.0:5363
 DOCKTORNET_SECRET=changeme-please
 DOCKTORNET_DB_PATH=./data/docktornet.db
 
 # --- Agent ---
-DOCKTORNET_SERVER_URL=http://127.0.0.1:8080
+DOCKTORNET_SERVER_URL=http://127.0.0.1:5363
 # DOCKTORNET_SECRET=changeme-please       # share with server
 DOCKTORNET_POLL_INTERVAL=30s
 DOCKTORNET_MACHINE_ID=batterdock
@@ -1005,13 +1001,13 @@ mod tests {
     #[test]
     fn happy_path_loads_all_fields() {
         let c = AgentConfig::from_iter(env(&[
-            ("DOCKTORNET_SERVER_URL", "http://127.0.0.1:8080"),
+            ("DOCKTORNET_SERVER_URL", "http://127.0.0.1:5363"),
             ("DOCKTORNET_SECRET", "s3cret"),
             ("DOCKTORNET_POLL_INTERVAL", "30s"),
             ("DOCKTORNET_MACHINE_ID", "batterdock"),
             ("DOCKTORNET_SOCKETS", "docker:/var/run/docker.sock,podman:/run/user/1000/podman/podman.sock"),
         ])).unwrap();
-        assert_eq!(c.server_url, "http://127.0.0.1:8080");
+        assert_eq!(c.server_url, "http://127.0.0.1:5363");
         assert_eq!(c.secret, "s3cret");
         assert_eq!(c.poll_interval, Duration::from_secs(30));
         assert_eq!(c.machine_id.as_str(), "batterdock");
@@ -1093,7 +1089,7 @@ Expected: 4 tests pass.
 - [ ] **Step 4.4: Run agent binary with sample env to smoke-test**
 
 ```bash
-DOCKTORNET_SERVER_URL=http://127.0.0.1:8080 \
+DOCKTORNET_SERVER_URL=http://127.0.0.1:5363 \
 DOCKTORNET_SECRET=s \
 DOCKTORNET_POLL_INTERVAL=30s \
 DOCKTORNET_MACHINE_ID=test \
@@ -1297,7 +1293,7 @@ Expected: 2 tests pass.
 - [ ] **Step 5.5: Run the binary against a real socket to verify**
 
 ```bash
-DOCKTORNET_SERVER_URL=http://127.0.0.1:8080 \
+DOCKTORNET_SERVER_URL=http://127.0.0.1:5363 \
 DOCKTORNET_SECRET=s \
 DOCKTORNET_POLL_INTERVAL=30s \
 DOCKTORNET_MACHINE_ID=$(hostname) \
@@ -1449,7 +1445,7 @@ async fn main() -> Result<()> {
 - [ ] **Step 6.4: Run the binary smoke test**
 
 ```bash
-DOCKTORNET_SERVER_URL=http://127.0.0.1:8080 \
+DOCKTORNET_SERVER_URL=http://127.0.0.1:5363 \
 DOCKTORNET_SECRET=s \
 DOCKTORNET_POLL_INTERVAL=30s \
 DOCKTORNET_MACHINE_ID=$(hostname) \
@@ -1837,7 +1833,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    pub listen: String,        // e.g. "0.0.0.0:8080"
+    pub listen: String,        // e.g. "0.0.0.0:5363"
     pub secret: String,
     pub db_path: PathBuf,
 }
@@ -1874,11 +1870,11 @@ mod tests {
     #[test]
     fn happy_path() {
         let c = ServerConfig::from_iter(env(&[
-            ("DOCKTORNET_LISTEN",  "0.0.0.0:8080"),
+            ("DOCKTORNET_LISTEN",  "0.0.0.0:5363"),
             ("DOCKTORNET_SECRET",  "s"),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
         ])).unwrap();
-        assert_eq!(c.listen, "0.0.0.0:8080");
+        assert_eq!(c.listen, "0.0.0.0:5363");
         assert_eq!(c.db_path, PathBuf::from("/data/x.db"));
     }
 
@@ -2536,7 +2532,7 @@ Expected: all tests (including config, db, auth, storage, routes) pass.
 In one terminal:
 
 ```bash
-DOCKTORNET_LISTEN=127.0.0.1:8080 \
+DOCKTORNET_LISTEN=127.0.0.1:5363 \
 DOCKTORNET_SECRET=s3cret \
 DOCKTORNET_DB_PATH=/tmp/docktornet-smoke.db \
 cargo run -p docktornet-server
@@ -2545,7 +2541,7 @@ cargo run -p docktornet-server
 In another terminal:
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:8080/api/v1/snapshot \
+curl -fsS -X POST http://127.0.0.1:5363/api/v1/snapshot \
   -H "Authorization: Bearer s3cret" \
   -H "Content-Type: application/json" \
   -d '{"machine_id":"smoke","taken_at":1,"containers":[]}'
@@ -2560,7 +2556,7 @@ sqlite3 /tmp/docktornet-smoke.db 'SELECT * FROM services;'
 Expected: no rows (we sent an empty snapshot). Re-run curl with one container and re-check:
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:8080/api/v1/snapshot \
+curl -fsS -X POST http://127.0.0.1:5363/api/v1/snapshot \
   -H "Authorization: Bearer s3cret" -H "Content-Type: application/json" \
   -d '{"machine_id":"smoke","taken_at":2,"containers":[{"name":"hello","labels":{"docktornet.x":"y"}}]}'
 sqlite3 /tmp/docktornet-smoke.db 'SELECT id, last_seen FROM services;'
@@ -2738,19 +2734,19 @@ git commit -m "test(server): add end-to-end snapshot push test
 - [ ] **Step 15.1: Stand up the server locally**
 
 ```bash
-DOCKTORNET_LISTEN=127.0.0.1:8080 \
+DOCKTORNET_LISTEN=127.0.0.1:5363 \
 DOCKTORNET_SECRET=s3cret \
 DOCKTORNET_DB_PATH=$PWD/data/docktornet.db \
 cargo run -p docktornet-server &
 SERVER_PID=$!
 ```
 
-Expected: log line `server ready listen=127.0.0.1:8080`.
+Expected: log line `server ready listen=127.0.0.1:5363`.
 
 - [ ] **Step 15.2: Stand up the agent locally** in a second terminal
 
 ```bash
-DOCKTORNET_SERVER_URL=http://127.0.0.1:8080 \
+DOCKTORNET_SERVER_URL=http://127.0.0.1:5363 \
 DOCKTORNET_SECRET=s3cret \
 DOCKTORNET_POLL_INTERVAL=5s \
 DOCKTORNET_MACHINE_ID=$(hostname) \
