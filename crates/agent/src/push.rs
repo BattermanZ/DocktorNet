@@ -51,7 +51,7 @@ impl PushClient {
             return Ok(());
         }
 
-        let body = truncate_body(resp.text().await.unwrap_or_default());
+        let body = read_error_body(resp).await;
         Err(PushError::Status {
             status: status.as_u16(),
             body,
@@ -119,6 +119,17 @@ fn truncate_body(body: String) -> String {
     format!("{}…<truncated>", &body[..end])
 }
 
+async fn read_error_body(resp: reqwest::Response) -> String {
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_ERROR_BODY_LEN as u64)
+    {
+        return "<response body too large>".to_string();
+    }
+
+    truncate_body(resp.text().await.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -182,7 +193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_truncates_large_error_body() {
+    async fn push_rejects_declared_large_error_body() {
         let body = "x".repeat(MAX_ERROR_BODY_LEN + 100);
         let mut server = Server::new_async().await;
         let _m = server
@@ -197,11 +208,31 @@ mod tests {
 
         match err {
             PushError::Status { body, .. } => {
-                assert!(body.len() < MAX_ERROR_BODY_LEN + 100);
-                assert!(body.ends_with("…<truncated>"));
+                assert_eq!(body, "<response body too large>");
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_error_display_does_not_include_body() {
+        let err = PushError::Status {
+            status: 500,
+            body: "secret diagnostic".into(),
+        };
+
+        let rendered = err.to_string();
+        assert_eq!(rendered, "server returned 500");
+        assert!(!rendered.contains("secret diagnostic"));
+    }
+
+    #[test]
+    fn truncate_body_preserves_utf8_boundaries() {
+        let body = format!("{}é", "x".repeat(MAX_ERROR_BODY_LEN));
+        let truncated = truncate_body(body);
+
+        assert!(truncated.ends_with("…<truncated>"));
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
 
     #[tokio::test]
