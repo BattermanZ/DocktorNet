@@ -18,6 +18,7 @@ docktornet-core = { path = "../core" }
 tokio       = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
+serde_yaml  = { workspace = true }
 thiserror   = { workspace = true }
 anyhow      = { workspace = true }
 tracing     = { workspace = true }
@@ -25,6 +26,8 @@ tracing-subscriber = { workspace = true }
 dotenvy     = { workspace = true }
 humantime-serde = { workspace = true }
 axum        = { workspace = true }
+reqwest     = { workspace = true }
+url         = { workspace = true }
 sqlx        = { workspace = true }
 
 [dev-dependencies]
