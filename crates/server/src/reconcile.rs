@@ -8,6 +8,7 @@ use crate::db::Db;
 pub struct Reconciler {
     db: Db,
     options: ReconcileOptions,
+    npm: Option<crate::integrations::npm::NpmClient>,
     cloudflare: Option<crate::integrations::cloudflare::CloudflareClient>,
 }
 
@@ -31,20 +32,69 @@ impl Reconciler {
         Self {
             db,
             options,
+            npm: None,
             cloudflare: None,
         }
     }
 
-    pub fn with_cloudflare(
+    pub fn with_clients(
         db: Db,
         options: ReconcileOptions,
+        npm: crate::integrations::npm::NpmClient,
         cloudflare: crate::integrations::cloudflare::CloudflareClient,
     ) -> Self {
         Self {
             db,
             options,
+            npm: Some(npm),
             cloudflare: Some(cloudflare),
         }
+    }
+
+    async fn reconcile_npm(
+        &self,
+        service_id: &str,
+        host: &docktornet_core::labels::NpmHost,
+        forward_host: &str,
+    ) -> Result<(), ReconcileError> {
+        let Some(client) = &self.npm else {
+            tracing::warn!(
+                service_id,
+                index = host.index,
+                "NPM labels present but NPM client is not configured"
+            );
+            return Ok(());
+        };
+        let token = client
+            .token()
+            .await
+            .map_err(|err| ReconcileError::External(err.into()))?;
+        let certs = client
+            .certificates(&token)
+            .await
+            .map_err(|err| ReconcileError::External(err.into()))?;
+        let cert_id = host
+            .cert_id
+            .map(i64::from)
+            .or_else(|| crate::integrations::npm::matching_cert_id(&host.host, &certs));
+        let payload = crate::integrations::npm::proxy_payload(host, forward_host, cert_id);
+
+        if let Some(id) =
+            crate::storage::get_npm_host(&self.db, service_id, host.index.into()).await?
+        {
+            client
+                .update_proxy_host(&token, id, &payload)
+                .await
+                .map_err(|err| ReconcileError::External(err.into()))?;
+            return Ok(());
+        }
+
+        let created = client
+            .create_proxy_host(&token, &payload)
+            .await
+            .map_err(|err| ReconcileError::External(err.into()))?;
+        crate::storage::set_npm_host(&self.db, service_id, host.index.into(), created.id).await?;
+        Ok(())
     }
 
     async fn reconcile_cloudflare(
@@ -142,6 +192,12 @@ impl Reconciler {
                     &service.service_id,
                 )
                 .await?;
+            }
+
+            let forward_host = "127.0.0.1";
+            for npm_host in &service.labels.npm {
+                self.reconcile_npm(&service.service_id, npm_host, forward_host)
+                    .await?;
             }
 
             if let Some(dns) = &service.labels.cf_dns {
