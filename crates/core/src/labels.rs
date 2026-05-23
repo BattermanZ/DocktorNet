@@ -221,11 +221,21 @@ fn build_gatus(index: u8, fields: &BTreeMap<String, String>) -> Result<GatusMoni
         None => true,
     };
 
-    Ok(GatusMonitor { index, url, interval, conditions, group, telegram })
+    Ok(GatusMonitor {
+        index,
+        url,
+        interval,
+        conditions,
+        group,
+        telegram,
+    })
 }
 
 fn is_gatus_field(field: &str) -> bool {
-    matches!(field, "url" | "interval" | "conditions" | "group" | "telegram")
+    matches!(
+        field,
+        "url" | "interval" | "conditions" | "group" | "telegram"
+    )
 }
 
 fn parse_bool(value: impl AsRef<str>) -> Result<bool, String> {

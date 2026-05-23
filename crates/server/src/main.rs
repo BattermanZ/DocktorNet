@@ -31,14 +31,29 @@ async fn main() -> Result<()> {
         npm,
         cloudflare,
     );
-    let app = routes::build(docktornet_server::handlers::snapshot::AppState {
+    let app_state = docktornet_server::handlers::snapshot::AppState {
         reconciler,
         secret: std::sync::Arc::new(cfg.secret),
         flapping: std::sync::Arc::new(FlappingTracker::new(Duration::from_secs(300))),
-    });
+    };
+    let reconciler_for_resync = app_state.reconciler.clone();
+    let app = routes::build(app_state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     info!(listen = %cfg.listen, "server ready");
+
+    let resync_interval = cfg.full_resync_interval;
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(resync_interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if let Err(err) = reconciler_for_resync.full_resync().await {
+                tracing::warn!(error = %err, "full resync failed; will retry next cycle");
+            }
+        }
+    });
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

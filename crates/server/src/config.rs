@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use url::Url;
 
@@ -12,6 +13,7 @@ pub struct ServerConfig {
     pub dry_run: bool,
     pub adopt_existing: bool,
     pub gatus_config_dir: PathBuf,
+    pub full_resync_interval: Duration,
     pub npm: NpmConfig,
     pub cloudflare: CloudflareConfig,
 }
@@ -37,6 +39,8 @@ pub enum ConfigError {
     InvalidBool { name: &'static str, value: String },
     #[error("invalid url for '{name}': '{value}'")]
     InvalidUrl { name: &'static str, value: String },
+    #[error("invalid duration for '{name}': '{value}'")]
+    InvalidDuration { name: &'static str, value: String },
 }
 
 impl ServerConfig {
@@ -53,6 +57,15 @@ impl ServerConfig {
             "DOCKTORNET_ADOPT_EXISTING",
             false,
         )?;
+        let full_resync_interval = match env.get("DOCKTORNET_FULL_RESYNC_INTERVAL") {
+            Some(value) => {
+                humantime::parse_duration(value).map_err(|_| ConfigError::InvalidDuration {
+                    name: "DOCKTORNET_FULL_RESYNC_INTERVAL",
+                    value: value.clone(),
+                })?
+            }
+            None => Duration::from_secs(3600),
+        };
 
         Ok(Self {
             listen: required("DOCKTORNET_LISTEN")?,
@@ -61,6 +74,7 @@ impl ServerConfig {
             dry_run,
             adopt_existing,
             gatus_config_dir: PathBuf::from(required("DOCKTORNET_GATUS_CONFIG_DIR")?),
+            full_resync_interval,
             npm: NpmConfig {
                 url: parse_url(required("DOCKTORNET_NPM_URL")?, "DOCKTORNET_NPM_URL")?,
                 user: required("DOCKTORNET_NPM_USER")?,
@@ -238,6 +252,65 @@ mod tests {
             ConfigError::InvalidUrl { name, value } => {
                 assert_eq!(name, "DOCKTORNET_NPM_URL");
                 assert_eq!(value, "not a url");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_resync_interval_defaults_to_one_hour() {
+        let c = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+        ]))
+        .unwrap();
+        assert_eq!(c.full_resync_interval, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn full_resync_interval_parses_humantime() {
+        let c = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+            ("DOCKTORNET_FULL_RESYNC_INTERVAL", "15m"),
+        ]))
+        .unwrap();
+        assert_eq!(c.full_resync_interval, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn rejects_invalid_full_resync_interval() {
+        let err = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+            ("DOCKTORNET_FULL_RESYNC_INTERVAL", "soonish"),
+        ]))
+        .unwrap_err();
+        match err {
+            ConfigError::InvalidDuration { name, value } => {
+                assert_eq!(name, "DOCKTORNET_FULL_RESYNC_INTERVAL");
+                assert_eq!(value, "soonish");
             }
             other => panic!("unexpected error: {other:?}"),
         }
