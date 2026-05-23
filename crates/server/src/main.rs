@@ -1,4 +1,8 @@
+use std::net::SocketAddr;
+use std::time::Duration;
+
 use anyhow::Result;
+use docktornet_server::flapping::FlappingTracker;
 use docktornet_server::{config, db, routes};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -30,14 +34,18 @@ async fn main() -> Result<()> {
     let app = routes::build(docktornet_server::handlers::snapshot::AppState {
         reconciler,
         secret: std::sync::Arc::new(cfg.secret),
+        flapping: std::sync::Arc::new(FlappingTracker::new(Duration::from_secs(300))),
     });
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     info!(listen = %cfg.listen, "server ready");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        tokio::signal::ctrl_c().await.ok();
+    })
+    .await?;
     Ok(())
 }

@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use docktornet_core::{ContainerEntry, MachineId, Snapshot};
+use docktornet_server::flapping::FlappingTracker;
 use reqwest::Client;
 use tempfile::tempdir;
 
@@ -22,12 +24,18 @@ async fn agent_push_lands_in_sqlite_via_real_http() {
     let app = docktornet_server::routes::build(docktornet_server::handlers::snapshot::AppState {
         reconciler,
         secret: std::sync::Arc::new("s3cret".into()),
+        flapping: std::sync::Arc::new(FlappingTracker::new(Duration::from_secs(300))),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server_task = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let mut labels = BTreeMap::new();

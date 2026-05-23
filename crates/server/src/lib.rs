@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod flapping;
 pub mod handlers;
 pub mod integrations;
 pub mod reconcile;

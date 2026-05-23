@@ -24,10 +24,14 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use docktornet_core::{ContainerEntry, MachineId, Snapshot};
     use std::collections::BTreeMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::tempdir;
     use tower::ServiceExt;
 
     use crate::db;
+    use crate::flapping::FlappingTracker;
     use crate::reconcile::{ReconcileOptions, Reconciler};
     use crate::storage::list_services_for_machine;
 
@@ -44,7 +48,8 @@ mod tests {
         );
         let state = AppState {
             reconciler,
-            secret: std::sync::Arc::new("s3cret".into()),
+            secret: Arc::new("s3cret".into()),
+            flapping: Arc::new(FlappingTracker::new(Duration::from_secs(300))),
         };
         (build(state), pool, dir)
     }
@@ -56,6 +61,7 @@ mod tests {
     fn snap() -> Snapshot {
         let mut labels = BTreeMap::new();
         labels.insert("docktornet.gatus.0.url".into(), "u".into());
+        labels.insert("docktornet.gatus.0.interval".into(), "30s".into());
         Snapshot {
             machine_id: MachineId::new("m1"),
             taken_at: 1,
@@ -66,44 +72,47 @@ mod tests {
         }
     }
 
+    fn req(method: &str, token: Option<&str>, snap: &Snapshot) -> Request<Body> {
+        let mut b = Request::builder()
+            .method(method)
+            .uri("/api/v1/snapshot")
+            .header("content-type", "application/json");
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        let mut request = b.body(body(snap)).unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo::<SocketAddr>(
+                "127.0.0.1:9999".parse().unwrap(),
+            ));
+        request
+    }
+
     #[tokio::test]
     async fn ingest_rejects_wrong_token() {
         let (app, _, _dir) = make_app().await;
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/snapshot")
-            .header("authorization", "Bearer wrongtoken")
-            .header("content-type", "application/json")
-            .body(body(&snap()))
+        let resp = app
+            .oneshot(req("POST", Some("wrongtoken"), &snap()))
+            .await
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn ingest_requires_bearer() {
         let (app, _, _dir) = make_app().await;
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/snapshot")
-            .header("content-type", "application/json")
-            .body(body(&snap()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.oneshot(req("POST", None, &snap())).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn ingest_persists_snapshot() {
         let (app, pool, _dir) = make_app().await;
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/snapshot")
-            .header("authorization", "Bearer s3cret")
-            .header("content-type", "application/json")
-            .body(body(&snap()))
+        let resp = app
+            .oneshot(req("POST", Some("s3cret"), &snap()))
+            .await
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         let rows = list_services_for_machine(&pool, "m1").await.unwrap();
