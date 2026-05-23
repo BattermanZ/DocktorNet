@@ -17,6 +17,16 @@ pub struct GatusEndpoint {
     pub url: String,
     pub interval: String,
     pub conditions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alerts: Vec<GatusAlert>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatusAlert {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(rename = "send-on-resolved")]
+    pub send_on_resolved: bool,
 }
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -38,10 +48,21 @@ pub fn render_gatus_yaml(
             .iter()
             .map(|monitor| GatusEndpoint {
                 name: format!("{service_id}/{}", monitor.index),
-                group: service_id.to_string(),
+                group: monitor
+                    .group
+                    .clone()
+                    .unwrap_or_else(|| service_id.to_string()),
                 url: monitor.url.clone(),
                 interval: monitor.interval.clone(),
                 conditions: monitor.conditions.clone(),
+                alerts: if monitor.telegram {
+                    vec![GatusAlert {
+                        kind: "telegram".to_string(),
+                        send_on_resolved: true,
+                    }]
+                } else {
+                    Vec::new()
+                },
             })
             .collect(),
     };
@@ -109,12 +130,14 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn renders_expected_yaml() {
+    fn renders_expected_yaml_with_default_group_and_telegram_alert() {
         let monitors = vec![GatusMonitor {
             index: 0,
             url: "https://app.example.com".to_string(),
             interval: "30s".to_string(),
             conditions: vec!["[STATUS] == 200".to_string()],
+            group: None,
+            telegram: true,
         }];
 
         let yaml = render_gatus_yaml("m1/app", &monitors).unwrap();
@@ -126,9 +149,44 @@ mod tests {
             "  interval: 30s\n",
             "  conditions:\n",
             "  - '[STATUS] == 200'\n",
+            "  alerts:\n",
+            "  - type: telegram\n",
+            "    send-on-resolved: true\n",
         );
 
         assert_eq!(yaml, expected);
+    }
+
+    #[test]
+    fn renders_group_override_when_set() {
+        let monitors = vec![GatusMonitor {
+            index: 0,
+            url: "https://app.example.com".to_string(),
+            interval: "30s".to_string(),
+            conditions: vec!["[STATUS] == 200".to_string()],
+            group: Some("media".to_string()),
+            telegram: true,
+        }];
+
+        let yaml = render_gatus_yaml("m1/app", &monitors).unwrap();
+        assert!(yaml.contains("group: media\n"));
+        assert!(!yaml.contains("group: m1/app\n"));
+    }
+
+    #[test]
+    fn omits_alerts_block_when_telegram_is_false() {
+        let monitors = vec![GatusMonitor {
+            index: 0,
+            url: "https://app.example.com".to_string(),
+            interval: "30s".to_string(),
+            conditions: vec!["[STATUS] == 200".to_string()],
+            group: None,
+            telegram: false,
+        }];
+
+        let yaml = render_gatus_yaml("m1/app", &monitors).unwrap();
+        assert!(!yaml.contains("alerts"));
+        assert!(!yaml.contains("telegram"));
     }
 
     #[tokio::test]
@@ -140,6 +198,8 @@ mod tests {
             url: "https://app.example.com".to_string(),
             interval: "30s".to_string(),
             conditions: vec!["[STATUS] == 200".to_string()],
+            group: None,
+            telegram: true,
         }];
 
         let path = service_file_path(dir.path(), service_id);
