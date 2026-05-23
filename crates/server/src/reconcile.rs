@@ -1,6 +1,8 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use docktornet_core::Snapshot;
+use tokio::sync::Mutex;
 
 use crate::db::Db;
 
@@ -10,6 +12,7 @@ pub struct Reconciler {
     options: ReconcileOptions,
     npm: Option<crate::integrations::npm::NpmClient>,
     cloudflare: Option<crate::integrations::cloudflare::CloudflareClient>,
+    lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +37,7 @@ impl Reconciler {
             options,
             npm: None,
             cloudflare: None,
+            lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -48,6 +52,7 @@ impl Reconciler {
             options,
             npm: Some(npm),
             cloudflare: Some(cloudflare),
+            lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -147,6 +152,7 @@ impl Reconciler {
     }
 
     pub async fn reconcile_snapshot(&self, snap: &Snapshot) -> Result<(), ReconcileError> {
+        let _guard = self.lock.lock().await;
         let intended =
             crate::integrations::intended::intended_services(&snap.machine_id, &snap.containers);
         let current_ids = intended
