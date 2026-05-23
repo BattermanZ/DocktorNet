@@ -15,9 +15,8 @@ async fn main() -> Result<()> {
     let cfg = config::ServerConfig::from_env()?;
     let pool = db::connect(&cfg.db_path).await?;
     let npm = docktornet_server::integrations::npm::NpmClient::new(cfg.npm.clone());
-    let cloudflare = docktornet_server::integrations::cloudflare::CloudflareClient::new(
-        cfg.cloudflare.clone(),
-    );
+    let cloudflare =
+        docktornet_server::integrations::cloudflare::CloudflareClient::new(cfg.cloudflare.clone());
     let reconciler = docktornet_server::reconcile::Reconciler::with_clients(
         pool,
         docktornet_server::reconcile::ReconcileOptions {

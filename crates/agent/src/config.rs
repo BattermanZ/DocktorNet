@@ -88,7 +88,9 @@ fn parse_sockets(raw: &str) -> Result<Vec<SocketSpec>, String> {
             .ok_or_else(|| format!("expected 'runtime:path', got '{item}'"))?;
         let path = path.trim();
         if path.is_empty() {
-            return Err(format!("socket path for runtime '{runtime}' cannot be empty"));
+            return Err(format!(
+                "socket path for runtime '{runtime}' cannot be empty"
+            ));
         }
         let runtime = match runtime {
             "docker" => Runtime::Docker,

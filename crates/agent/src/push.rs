@@ -25,9 +25,7 @@ pub enum PushError {
 
 impl PushClient {
     pub fn new(base: impl Into<String>, secret: impl Into<String>) -> anyhow::Result<Self> {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
+        let http = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
         Ok(Self {
             http,
@@ -58,11 +56,7 @@ impl PushClient {
         })
     }
 
-    pub async fn push_with_retry(
-        &self,
-        snap: &Snapshot,
-        attempts: u32,
-    ) -> Result<(), PushError> {
+    pub async fn push_with_retry(&self, snap: &Snapshot, attempts: u32) -> Result<(), PushError> {
         if attempts == 0 {
             return Err(PushError::NoAttempts);
         }

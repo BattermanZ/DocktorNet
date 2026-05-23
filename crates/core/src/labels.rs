@@ -74,8 +74,9 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
                             .or_default()
                             .insert((*field).to_string(), value.clone());
                     } else {
-                        out.warnings
-                            .push(format!("unrecognised npm.{index}.{field} field in key '{key}'"));
+                        out.warnings.push(format!(
+                            "unrecognised npm.{index}.{field} field in key '{key}'"
+                        ));
                     }
                 }
                 Err(_) => out

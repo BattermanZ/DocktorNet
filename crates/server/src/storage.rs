@@ -97,14 +97,12 @@ pub async fn get_npm_host(
     service_id: &str,
     npm_index: i64,
 ) -> sqlx::Result<Option<i64>> {
-    sqlx::query_as(
-        "SELECT npm_id FROM npm_hosts WHERE service_id = ? AND npm_index = ?",
-    )
-    .bind(service_id)
-    .bind(npm_index)
-    .fetch_optional(pool)
-    .await
-    .map(|row| row.map(|(npm_id,)| npm_id))
+    sqlx::query_as("SELECT npm_id FROM npm_hosts WHERE service_id = ? AND npm_index = ?")
+        .bind(service_id)
+        .bind(npm_index)
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.map(|(npm_id,)| npm_id))
 }
 
 pub async fn set_npm_host(

@@ -8,7 +8,9 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn agent_push_lands_in_sqlite_via_real_http() {
     let dir = tempdir().unwrap();
-    let pool = docktornet_server::db::connect(&dir.path().join("e2e.db")).await.unwrap();
+    let pool = docktornet_server::db::connect(&dir.path().join("e2e.db"))
+        .await
+        .unwrap();
     let reconciler = docktornet_server::reconcile::Reconciler::new(
         pool.clone(),
         docktornet_server::reconcile::ReconcileOptions {
@@ -33,7 +35,10 @@ async fn agent_push_lands_in_sqlite_via_real_http() {
     let snap = Snapshot {
         machine_id: MachineId::new("e2e-host"),
         taken_at: 42,
-        containers: vec![ContainerEntry { name: "demo".into(), labels }],
+        containers: vec![ContainerEntry {
+            name: "demo".into(),
+            labels,
+        }],
     };
 
     let http = Client::new();

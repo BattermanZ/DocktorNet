@@ -1,6 +1,6 @@
-pub mod snapshot;
-pub mod labels;
 pub mod ids;
+pub mod labels;
+pub mod snapshot;
 
-pub use ids::{service_id, sanitize_service_id, MachineId};
+pub use ids::{MachineId, sanitize_service_id, service_id};
 pub use snapshot::{ContainerEntry, Snapshot};

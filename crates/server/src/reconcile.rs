@@ -147,17 +147,15 @@ impl Reconciler {
     }
 
     pub async fn reconcile_snapshot(&self, snap: &Snapshot) -> Result<(), ReconcileError> {
-        let intended = crate::integrations::intended::intended_services(&snap.machine_id, &snap.containers);
+        let intended =
+            crate::integrations::intended::intended_services(&snap.machine_id, &snap.containers);
         let current_ids = intended
             .iter()
             .map(|service| service.service_id.clone())
             .collect::<Vec<_>>();
-        let removed = crate::storage::removed_service_ids(
-            &self.db,
-            snap.machine_id.as_str(),
-            &current_ids,
-        )
-        .await?;
+        let removed =
+            crate::storage::removed_service_ids(&self.db, snap.machine_id.as_str(), &current_ids)
+                .await?;
 
         crate::storage::upsert_snapshot(&self.db, snap).await?;
 
@@ -242,17 +240,25 @@ mod tests {
         );
 
         let mut labels = BTreeMap::new();
-        labels.insert("docktornet.gatus.0.url".to_string(), "https://example.com".to_string());
+        labels.insert(
+            "docktornet.gatus.0.url".to_string(),
+            "https://example.com".to_string(),
+        );
         labels.insert("docktornet.gatus.0.interval".to_string(), "30s".to_string());
         let snap = Snapshot {
             machine_id: MachineId::new("m1"),
             taken_at: 1,
-            containers: vec![ContainerEntry { name: "app".to_string(), labels }],
+            containers: vec![ContainerEntry {
+                name: "app".to_string(),
+                labels,
+            }],
         };
 
         reconciler.reconcile_snapshot(&snap).await.unwrap();
 
-        let rows = storage::list_services_for_machine(&pool, "m1").await.unwrap();
+        let rows = storage::list_services_for_machine(&pool, "m1")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!dir.path().join("gatus").exists());
     }
