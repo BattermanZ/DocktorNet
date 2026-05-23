@@ -37,3 +37,9 @@ docktornet-backups/
 
 # Logs
 *.log
+
+# Smoke test - generated gatus configs (reconciler output)
+smoke-data/gatus-config/smokebox__*.yaml
+
+# Smoke compose (contains environment-specific hostnames)
+deploy/smoke.compose.yaml
