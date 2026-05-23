@@ -14,13 +14,17 @@ async fn main() -> Result<()> {
 
     let cfg = config::ServerConfig::from_env()?;
     let pool = db::connect(&cfg.db_path).await?;
-    let reconciler = docktornet_server::reconcile::Reconciler::new(
+    let cloudflare = docktornet_server::integrations::cloudflare::CloudflareClient::new(
+        cfg.cloudflare.clone(),
+    );
+    let reconciler = docktornet_server::reconcile::Reconciler::with_cloudflare(
         pool,
         docktornet_server::reconcile::ReconcileOptions {
             dry_run: cfg.dry_run,
             adopt_existing: cfg.adopt_existing,
             gatus_config_dir: cfg.gatus_config_dir.clone(),
         },
+        cloudflare,
     );
     let app = routes::build(docktornet_server::handlers::snapshot::AppState {
         reconciler,

@@ -8,6 +8,7 @@ use crate::db::Db;
 pub struct Reconciler {
     db: Db,
     options: ReconcileOptions,
+    cloudflare: Option<crate::integrations::cloudflare::CloudflareClient>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,7 +28,72 @@ pub enum ReconcileError {
 
 impl Reconciler {
     pub fn new(db: Db, options: ReconcileOptions) -> Self {
-        Self { db, options }
+        Self {
+            db,
+            options,
+            cloudflare: None,
+        }
+    }
+
+    pub fn with_cloudflare(
+        db: Db,
+        options: ReconcileOptions,
+        cloudflare: crate::integrations::cloudflare::CloudflareClient,
+    ) -> Self {
+        Self {
+            db,
+            options,
+            cloudflare: Some(cloudflare),
+        }
+    }
+
+    async fn reconcile_cloudflare(
+        &self,
+        service_id: &str,
+        dns: &docktornet_core::labels::CloudflareDns,
+    ) -> Result<(), ReconcileError> {
+        let Some(client) = &self.cloudflare else {
+            tracing::warn!(
+                service_id,
+                "Cloudflare DNS labels present but Cloudflare client is not configured"
+            );
+            return Ok(());
+        };
+        let zone = client
+            .zone()
+            .await
+            .map_err(|err| ReconcileError::External(err.into()))?;
+        let payload = crate::integrations::cloudflare::dns_payload(dns, &zone.name);
+        let existing_id = crate::storage::get_cf_dns_record(&self.db, service_id).await?;
+
+        if let Some(id) = existing_id {
+            client
+                .update_record(&id, &payload)
+                .await
+                .map_err(|err| ReconcileError::External(err.into()))?;
+            return Ok(());
+        }
+
+        match client.create_record(&payload).await {
+            Ok(record) => {
+                crate::storage::set_cf_dns_record(&self.db, service_id, &record.id).await?;
+                Ok(())
+            }
+            Err(err) if self.options.adopt_existing => {
+                let record = client
+                    .find_record_by_name(&payload.name)
+                    .await
+                    .map_err(|e| ReconcileError::External(e.into()))?
+                    .ok_or_else(|| ReconcileError::External(anyhow::anyhow!(err)))?;
+                client
+                    .update_record(&record.id, &payload)
+                    .await
+                    .map_err(|e| ReconcileError::External(e.into()))?;
+                crate::storage::set_cf_dns_record(&self.db, service_id, &record.id).await?;
+                Ok(())
+            }
+            Err(err) => Err(ReconcileError::External(err.into())),
+        }
     }
 
     pub async fn reconcile_snapshot(&self, snap: &Snapshot) -> Result<(), ReconcileError> {
@@ -76,6 +142,20 @@ impl Reconciler {
                     &service.service_id,
                 )
                 .await?;
+            }
+
+            if let Some(dns) = &service.labels.cf_dns {
+                self.reconcile_cloudflare(&service.service_id, dns).await?;
+            } else if let Some(record_id) =
+                crate::storage::get_cf_dns_record(&self.db, &service.service_id).await?
+            {
+                if let Some(client) = &self.cloudflare {
+                    client
+                        .delete_record(&record_id)
+                        .await
+                        .map_err(|err| ReconcileError::External(err.into()))?;
+                }
+                crate::storage::delete_cf_dns_record(&self.db, &service.service_id).await?;
             }
         }
 
