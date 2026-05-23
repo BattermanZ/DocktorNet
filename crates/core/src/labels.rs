@@ -45,6 +45,8 @@ pub struct GatusMonitor {
     pub url: String,
     pub interval: String,
     pub conditions: Vec<String>,
+    pub group: Option<String>,
+    pub telegram: bool,
 }
 
 pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
@@ -213,16 +215,17 @@ fn build_gatus(index: u8, fields: &BTreeMap<String, String>) -> Result<GatusMoni
         conditions.push("[STATUS] == 200".to_string());
     }
 
-    Ok(GatusMonitor {
-        index,
-        url,
-        interval,
-        conditions,
-    })
+    let group = fields.get("group").cloned().filter(|g| !g.is_empty());
+    let telegram = match fields.get("telegram") {
+        Some(value) => parse_bool(value)?,
+        None => true,
+    };
+
+    Ok(GatusMonitor { index, url, interval, conditions, group, telegram })
 }
 
 fn is_gatus_field(field: &str) -> bool {
-    matches!(field, "url" | "interval" | "conditions")
+    matches!(field, "url" | "interval" | "conditions" | "group" | "telegram")
 }
 
 fn parse_bool(value: impl AsRef<str>) -> Result<bool, String> {
@@ -415,5 +418,49 @@ mod tests {
         assert!(p.gatus.is_empty());
         assert_eq!(p.warnings.len(), 1);
         assert!(p.warnings[0].contains("docktornet.unknown"));
+    }
+
+    #[test]
+    fn gatus_telegram_defaults_to_true_when_absent() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+        ]));
+        assert_eq!(p.gatus.len(), 1);
+        assert!(p.gatus[0].telegram);
+        assert_eq!(p.gatus[0].group, None);
+    }
+
+    #[test]
+    fn gatus_telegram_false_is_respected() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.0.telegram", "false"),
+        ]));
+        assert_eq!(p.gatus.len(), 1);
+        assert!(!p.gatus[0].telegram);
+    }
+
+    #[test]
+    fn gatus_group_is_pass_through_when_set() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.0.group", "media"),
+        ]));
+        assert_eq!(p.gatus[0].group, Some("media".to_string()));
+    }
+
+    #[test]
+    fn gatus_invalid_telegram_emits_warning_and_skips() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.0.telegram", "maybe"),
+        ]));
+        assert!(p.gatus.is_empty());
+        assert_eq!(p.warnings.len(), 1);
+        assert!(p.warnings[0].contains("gatus.0"));
     }
 }
