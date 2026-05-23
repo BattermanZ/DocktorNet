@@ -72,6 +72,10 @@ impl CloudflareClient {
         Self::with_base_url(config, "https://api.cloudflare.com/client/v4")
     }
 
+    pub fn with_base(config: CloudflareConfig, base_url: impl Into<String>) -> Self {
+        Self::with_base_url(config, base_url)
+    }
+
     fn with_base_url(config: CloudflareConfig, base_url: impl Into<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
 
@@ -150,6 +154,21 @@ impl CloudflareClient {
 
         let response = resp.json::<DnsRecordResponse>().await?;
         response.result_if_success()
+    }
+
+    pub async fn get_record(&self, id: &str) -> Result<Option<DnsRecord>, CloudflareError> {
+        let resp = self
+            .http
+            .get(self.endpoint(&format!("zones/{}/dns_records/{id}", self.zone_id)))
+            .bearer_auth(&self.api_token)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp.error_for_status()?;
+        let response = resp.json::<DnsRecordResponse>().await?;
+        Ok(Some(response.result_if_success()?))
     }
 
     pub async fn delete_record(&self, id: &str) -> Result<(), CloudflareError> {
@@ -314,5 +333,26 @@ mod tests {
         let err = client.delete_record("rec-42").await.unwrap_err();
 
         assert!(matches!(err, CloudflareError::Api));
+    }
+
+    #[tokio::test]
+    async fn get_record_returns_none_on_404() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("GET", "/client/v4/zones/zone-id/dns_records/recX")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = CloudflareClient::with_base(
+            CloudflareConfig {
+                api_token: "t".to_string(),
+                zone_id: "zone-id".to_string(),
+            },
+            format!("{}/client/v4", server.url()),
+        );
+        let got = client.get_record("recX").await.unwrap();
+        m.assert_async().await;
+        assert!(got.is_none());
     }
 }

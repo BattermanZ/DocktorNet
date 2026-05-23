@@ -39,6 +39,13 @@ pub struct ProxyHostResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ProxyHost {
+    pub id: i64,
+    #[serde(default)]
+    pub certificate_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct TokenResponse {
     pub token: Option<String>,
 }
@@ -130,6 +137,24 @@ impl NpmClient {
             .error_for_status()?;
 
         Ok(resp.json::<ProxyHostResponse>().await?)
+    }
+
+    pub async fn get_proxy_host(
+        &self,
+        token: &str,
+        id: i64,
+    ) -> Result<Option<ProxyHost>, NpmError> {
+        let resp = self
+            .http
+            .get(self.endpoint(&format!("api/nginx/proxy-hosts/{id}")))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp.error_for_status()?;
+        Ok(Some(resp.json::<ProxyHost>().await?))
     }
 
     pub async fn delete_proxy_host(&self, token: &str, id: i64) -> Result<(), NpmError> {
@@ -413,5 +438,45 @@ mod tests {
 
         assert_eq!(response.id, 7);
         assert_eq!(response.domain_names, vec!["app.example.com".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_proxy_host_returns_none_on_404() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("GET", "/api/nginx/proxy-hosts/42")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = NpmClient::new(crate::config::NpmConfig {
+            url: Url::parse(&server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let got = client.get_proxy_host("tok", 42).await.unwrap();
+        m.assert_async().await;
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_proxy_host_returns_some_with_cert_id() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("GET", "/api/nginx/proxy-hosts/7")
+            .with_status(200)
+            .with_body(r#"{"id":7,"certificate_id":12}"#)
+            .create_async()
+            .await;
+
+        let client = NpmClient::new(crate::config::NpmConfig {
+            url: Url::parse(&server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let got = client.get_proxy_host("tok", 7).await.unwrap().unwrap();
+        m.assert_async().await;
+        assert_eq!(got.id, 7);
+        assert_eq!(got.certificate_id, Some(12));
     }
 }
