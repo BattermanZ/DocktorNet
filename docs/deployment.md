@@ -30,6 +30,7 @@ Both binaries read the same `.env` file. Keys irrelevant to a given role are ign
 | `DOCKTORNET_DRY_RUN` | optional (`true`) | — |
 | `DOCKTORNET_ADOPT_EXISTING` | optional (`false`) | — |
 | `DOCKTORNET_NPM_*` | required | — |
+| `DOCKTORNET_NPM_FORWARD_HOST` | required | — |
 | `DOCKTORNET_CF_*` | required | — |
 | `DOCKTORNET_SERVER_URL` | — | required |
 | `DOCKTORNET_POLL_INTERVAL` | — | required |

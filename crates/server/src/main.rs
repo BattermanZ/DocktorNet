@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
             dry_run: cfg.dry_run,
             adopt_existing: cfg.adopt_existing,
             gatus_config_dir: cfg.gatus_config_dir.clone(),
+            npm_forward_host: cfg.npm_forward_host.clone(),
         },
         npm,
         cloudflare,

@@ -27,6 +27,7 @@ pub struct ReconcileOptions {
     pub dry_run: bool,
     pub adopt_existing: bool,
     pub gatus_config_dir: PathBuf,
+    pub npm_forward_host: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -263,7 +264,11 @@ impl Reconciler {
             .cert_id
             .map(i64::from)
             .or_else(|| crate::integrations::npm::matching_cert_id(&host.host, &certs));
-        let payload = crate::integrations::npm::proxy_payload(host, "127.0.0.1", desired_cert);
+        let payload = crate::integrations::npm::proxy_payload(
+            host,
+            &self.options.npm_forward_host,
+            desired_cert,
+        );
 
         match existing {
             None => {
@@ -416,10 +421,13 @@ impl Reconciler {
                 .await?;
             }
 
-            let forward_host = "127.0.0.1";
             for npm_host in &service.labels.npm {
-                self.reconcile_npm(&service.service_id, npm_host, forward_host)
-                    .await?;
+                self.reconcile_npm(
+                    &service.service_id,
+                    npm_host,
+                    &self.options.npm_forward_host,
+                )
+                .await?;
             }
 
             if let Some(dns) = &service.labels.cf_dns {
@@ -460,6 +468,7 @@ mod tests {
                 dry_run: true,
                 adopt_existing: false,
                 gatus_config_dir: dir.path().join("gatus"),
+                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
 
@@ -498,6 +507,7 @@ mod tests {
                 dry_run: false,
                 adopt_existing: false,
                 gatus_config_dir: gatus_dir.clone(),
+                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
 
@@ -539,6 +549,7 @@ mod tests {
                 dry_run: false,
                 adopt_existing: false,
                 gatus_config_dir: gatus_dir.clone(),
+                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
 
@@ -576,6 +587,7 @@ mod tests {
                 dry_run: false,
                 adopt_existing: false,
                 gatus_config_dir: gatus_dir.clone(),
+                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
         let mut labels = BTreeMap::new();
@@ -602,6 +614,7 @@ mod tests {
                 dry_run: true,
                 adopt_existing: false,
                 gatus_config_dir: gatus_dir,
+                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
         let report = dryrun.full_resync().await.unwrap();
@@ -620,6 +633,7 @@ mod tests {
                 dry_run: false,
                 adopt_existing: false,
                 gatus_config_dir: gatus_dir.clone(),
+                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
 
