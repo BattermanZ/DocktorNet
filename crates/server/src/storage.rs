@@ -67,6 +67,31 @@ pub async fn list_services_for_machine(
     Ok(rows)
 }
 
+pub async fn removed_service_ids(
+    pool: &Pool<Sqlite>,
+    machine: &str,
+    current_ids: &[String],
+) -> sqlx::Result<Vec<String>> {
+    if current_ids.is_empty() {
+        return sqlx::query_scalar("SELECT id FROM services WHERE machine_id = ? ORDER BY id")
+            .bind(machine)
+            .fetch_all(pool)
+            .await;
+    }
+
+    let placeholders = std::iter::repeat_n("?", current_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id FROM services WHERE machine_id = ? AND id NOT IN ({placeholders}) ORDER BY id"
+    );
+    let mut q = sqlx::query_scalar(&sql).bind(machine);
+    for id in current_ids {
+        q = q.bind(id);
+    }
+    q.fetch_all(pool).await
+}
+
 pub async fn get_npm_host(
     pool: &Pool<Sqlite>,
     service_id: &str,
@@ -315,6 +340,33 @@ mod tests {
 
         let rows = list_services_for_machine(&p, "m1").await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn returns_removed_services_for_machine() {
+        let p = pool().await;
+        let m = MachineId::new("m1");
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: m.clone(),
+                taken_at: 100,
+                containers: vec![entry(
+                    "a",
+                    &[
+                        ("docktornet.gatus.0.url", "https://a"),
+                        ("docktornet.gatus.0.interval", "30s"),
+                    ],
+                )],
+            },
+        )
+        .await
+        .unwrap();
+
+        let removed = removed_service_ids(&p, "m1", &["m1/b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(removed, vec!["m1/a"]);
     }
 
     #[tokio::test]
