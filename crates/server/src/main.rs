@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+const FLAPPING_WINDOW: Duration = Duration::from_secs(300);
+
 use anyhow::Result;
 use docktornet_server::flapping::FlappingTracker;
 use docktornet_server::{config, db, routes};
@@ -34,7 +36,7 @@ async fn main() -> Result<()> {
     let app_state = docktornet_server::handlers::snapshot::AppState {
         reconciler,
         secret: std::sync::Arc::new(cfg.secret),
-        flapping: std::sync::Arc::new(FlappingTracker::new(Duration::from_secs(300))),
+        flapping: std::sync::Arc::new(FlappingTracker::new(FLAPPING_WINDOW)),
     };
     let reconciler_for_resync = app_state.reconciler.clone();
     let app = routes::build(app_state);

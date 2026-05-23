@@ -173,8 +173,16 @@ impl Reconciler {
 
         let services = crate::storage::list_all_services(&self.db).await?;
         for (service_id, labels_json) in services {
-            let raw: std::collections::BTreeMap<String, String> =
-                serde_json::from_str(&labels_json).unwrap_or_default();
+            let raw: std::collections::BTreeMap<String, String> = match serde_json::from_str(
+                &labels_json,
+            ) {
+                Ok(map) => map,
+                Err(err) => {
+                    tracing::warn!(service_id, error = %err, "skipping service with malformed labels_json");
+                    report.failed += 1;
+                    continue;
+                }
+            };
             let parsed = docktornet_core::labels::parse(&raw);
 
             for host in &parsed.npm {

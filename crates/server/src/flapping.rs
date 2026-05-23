@@ -23,8 +23,7 @@ impl FlappingTracker {
     /// same machine within the window, else `None`.
     pub fn observe(&self, machine_id: &MachineId, ip: IpAddr, now: Instant) -> Option<IpAddr> {
         let mut map = self.last_seen.lock().expect("flapping mutex poisoned");
-        let prev = map.get(machine_id).cloned();
-        map.insert(machine_id.clone(), (ip, now));
+        let prev = map.insert(machine_id.clone(), (ip, now));
         match prev {
             Some((prev_ip, prev_seen))
                 if prev_ip != ip && now.duration_since(prev_seen) < self.window =>

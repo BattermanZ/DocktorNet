@@ -72,11 +72,7 @@ impl CloudflareClient {
         Self::with_base_url(config, "https://api.cloudflare.com/client/v4")
     }
 
-    pub fn with_base(config: CloudflareConfig, base_url: impl Into<String>) -> Self {
-        Self::with_base_url(config, base_url)
-    }
-
-    fn with_base_url(config: CloudflareConfig, base_url: impl Into<String>) -> Self {
+    pub fn with_base_url(config: CloudflareConfig, base_url: impl Into<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
 
         Self {
@@ -344,7 +340,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = CloudflareClient::with_base(
+        let client = CloudflareClient::with_base_url(
             CloudflareConfig {
                 api_token: "t".to_string(),
                 zone_id: "zone-id".to_string(),

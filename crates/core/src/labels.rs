@@ -438,6 +438,25 @@ mod tests {
         ]));
         assert_eq!(p.gatus.len(), 1);
         assert!(p.gatus[0].telegram);
+    }
+
+    #[test]
+    fn gatus_group_defaults_to_none_when_absent() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+        ]));
+        assert_eq!(p.gatus.len(), 1);
+        assert_eq!(p.gatus[0].group, None);
+    }
+
+    #[test]
+    fn gatus_empty_group_is_treated_as_none() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.0.group", ""),
+        ]));
         assert_eq!(p.gatus[0].group, None);
     }
 
