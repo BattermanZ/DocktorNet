@@ -67,6 +67,12 @@ pub async fn list_services_for_machine(
     Ok(rows)
 }
 
+pub async fn list_all_services(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as("SELECT id, labels_json FROM services ORDER BY id")
+        .fetch_all(pool)
+        .await
+}
+
 pub async fn removed_service_ids(
     pool: &Pool<Sqlite>,
     machine: &str,
@@ -384,6 +390,34 @@ mod tests {
         assert_eq!(get_npm_host(&p, "m1/app", 0).await.unwrap(), Some(58));
         delete_npm_host(&p, "m1/app", 0).await.unwrap();
         assert_eq!(get_npm_host(&p, "m1/app", 0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn list_all_services_returns_every_machine() {
+        let p = pool().await;
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                taken_at: 1,
+                containers: vec![entry("a", &[("docktornet.x", "1")])],
+            },
+        )
+        .await
+        .unwrap();
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m2"),
+                taken_at: 1,
+                containers: vec![entry("b", &[("docktornet.y", "2")])],
+            },
+        )
+        .await
+        .unwrap();
+        let all = list_all_services(&p).await.unwrap();
+        let ids: Vec<String> = all.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec!["m1/a", "m2/b"]);
     }
 
     #[tokio::test]
