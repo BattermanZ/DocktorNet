@@ -1,0 +1,21 @@
+services:
+  docktornet-server:
+    image: ghcr.io/battermanz/docktornet-server:latest
+    restart: unless-stopped
+    env_file: ../.env
+    user: "65532:65532"
+    volumes:
+      - ./data:/data
+      - /etc/gatus/config.d:/etc/gatus/config.d
+    ports:
+      - "5363:5363"
+
+  docktornet-agent:
+    image: ghcr.io/battermanz/docktornet-agent:latest
+    restart: unless-stopped
+    env_file: ../.env
+    user: "65532:${DOCKER_GID:-988}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - docktornet-server
