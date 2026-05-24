@@ -68,7 +68,14 @@ sudo chown -R 65532:65532 /etc/gatus/config.d
 
 The agent only needs **read** access to the docker/podman socket. Setting the container's secondary group to the docker gid is enough — no chmod required.
 
-## Gatus base configuration
+## Gatus configuration
+
+Gatus must be configured to load from a directory rather than a single file, so it picks up the per-service files docktornet writes. Set `GATUS_CONFIG_FILE` to the config directory in your Gatus compose service:
+
+```yaml
+environment:
+  - GATUS_CONFIG_FILE=/config
+```
 
 Docktornet only writes per-service files. The base Gatus config (web/storage/alerting) must be defined by the operator in a non-managed file in the same directory, e.g. `/etc/gatus/config.d/00-base.yaml`:
 

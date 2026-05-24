@@ -1,6 +1,6 @@
 services:
   docktornet-server:
-    image: ghcr.io/battermanz/docktornet-server:latest
+    image: 192.168.31.233:5000/docktornet-server:latest
     restart: unless-stopped
     env_file: ../.env
     user: "65532:65532"
@@ -11,7 +11,7 @@ services:
       - "5363:5363"
 
   docktornet-agent:
-    image: ghcr.io/battermanz/docktornet-agent:latest
+    image: g192.168.31.233:5000/docktornet-agent:latest
     restart: unless-stopped
     env_file: ../.env
     user: "65532:${DOCKER_GID:-988}"
