@@ -28,34 +28,65 @@ Boolean fields accept `true`/`1`/`yes` or `false`/`0`/`no`.
 `<index>` is an integer (`0`, `1`, …) so a single container can publish
 multiple proxy hosts.
 
-| Label | Required | Type | Default | Notes |
-|-------|----------|------|---------|-------|
-| `docktornet.npm.<index>.host` | yes | string | — | Public hostname (FQDN). |
-| `docktornet.npm.<index>.port` | yes | u16 | — | Upstream port. |
-| `docktornet.npm.<index>.scheme` | yes | `http` \| `https` | — | Upstream scheme. |
-| `docktornet.npm.<index>.ssl` | yes | bool | — | Enable SSL on the proxy host. |
-| `docktornet.npm.<index>.hsts` | no | bool | unset | Enable HSTS. |
-| `docktornet.npm.<index>.http2` | no | bool | unset | Enable HTTP/2 support. |
-| `docktornet.npm.<index>.cert_id` | no | u32 | unset | Existing NPM certificate ID. |
+| Label | Required | Type | Default | Example | Notes |
+|-------|----------|------|---------|---------|-------|
+| `docktornet.npm.<index>.host` | yes | string | — | `flowsync.example.com` | Public hostname (FQDN). |
+| `docktornet.npm.<index>.port` | yes | u16 | — | `8080` | Upstream port. |
+| `docktornet.npm.<index>.scheme` | yes | `http` \| `https` | — | `http` | Upstream scheme. |
+| `docktornet.npm.<index>.ssl` | yes | bool | — | `true` | Enable SSL on the proxy host. |
+| `docktornet.npm.<index>.hsts` | no | bool | `true` when `ssl` is on | `false` | Enable HSTS. Forced off when `ssl` is off. |
+| `docktornet.npm.<index>.http2` | no | bool | `true` when `ssl` is on | `true` | Enable HTTP/2 support. Forced off when `ssl` is off. |
+| `docktornet.npm.<index>.cert_id` | no | u32 | unset | `7` | Existing NPM certificate ID. |
 
 ### Cloudflare DNS (`docktornet.cf.dns.*`)
 
 A single DNS record per container (not indexed).
 
-| Label | Required | Type | Default | Notes |
-|-------|----------|------|---------|-------|
-| `docktornet.cf.dns.name` | yes | string | — | Record name. |
-| `docktornet.cf.dns.target` | yes | string | — | Record target. |
-| `docktornet.cf.dns.proxied` | yes | bool | — | Whether the record is proxied through Cloudflare. |
+| Label | Required | Type | Default | Example | Notes |
+|-------|----------|------|---------|---------|-------|
+| `docktornet.cf.dns.name` | yes | string | — | `flowsync` | Record name (zone is appended automatically). |
+| `docktornet.cf.dns.target` | yes | string | — | `home.example.com` | CNAME target (must be a full domain). |
+| `docktornet.cf.dns.proxied` | yes | bool | — | `true` | Whether the record is proxied through Cloudflare. |
 
 ### Gatus monitors (`docktornet.gatus.<index>.*`)
 
 `<index>` is an integer so a single container can define multiple monitors.
 
-| Label | Required | Type | Default | Notes |
-|-------|----------|------|---------|-------|
-| `docktornet.gatus.<index>.url` | yes | string | — | Endpoint to monitor. |
-| `docktornet.gatus.<index>.interval` | yes | string | — | Check interval (e.g. `30s`). |
-| `docktornet.gatus.<index>.conditions` | no | string | `[STATUS] == 200` | Comma-separated condition list. |
-| `docktornet.gatus.<index>.group` | no | string | none | Gatus group name. |
-| `docktornet.gatus.<index>.telegram` | no | bool | `true` | Send Telegram alerts. |
+| Label | Required | Type | Default | Example | Notes |
+|-------|----------|------|---------|---------|-------|
+| `docktornet.gatus.<index>.url` | yes | string | — | `https://flowsync.example.com` | Endpoint to monitor. |
+| `docktornet.gatus.<index>.interval` | yes | string | — | `30s` | Check interval. |
+| `docktornet.gatus.<index>.conditions` | no | string | `[STATUS] == 200` | `[STATUS] == 200, [RESPONSE_TIME] < 500` | Comma-separated condition list. |
+| `docktornet.gatus.<index>.group` | no | string | none | `media` | Gatus group name. |
+| `docktornet.gatus.<index>.telegram` | no | bool | `true` | `false` | Send Telegram alerts. |
+
+### Example
+
+A minimal `compose.yml` fragment for a container that publishes one proxy
+host, one DNS record, and three monitors (public, internal, and direct IP):
+
+```yaml
+services:
+  flowsync:
+    image: example/flowsync:latest
+    labels:
+      # Nginx Proxy Manager
+      docktornet.npm.0.host: flowsync.example.com
+      docktornet.npm.0.port: "8080"
+      docktornet.npm.0.scheme: http
+      docktornet.npm.0.ssl: "true"
+
+      # Cloudflare DNS
+      docktornet.cf.dns.name: flowsync
+      docktornet.cf.dns.target: home.example.com
+      docktornet.cf.dns.proxied: "true"
+
+      # Gatus monitors
+      docktornet.gatus.0.url: https://flowsync.example.com
+      docktornet.gatus.0.interval: 30s
+      docktornet.gatus.1.url: https://flowsync.home.local
+      docktornet.gatus.1.interval: 30s
+      docktornet.gatus.2.url: http://192.168.1.42:8080
+      docktornet.gatus.2.interval: 60s
+      docktornet.gatus.2.telegram: "false"
+```
