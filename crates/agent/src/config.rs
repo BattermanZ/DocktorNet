@@ -11,6 +11,7 @@ pub struct AgentConfig {
     pub secret: String,
     pub poll_interval: Duration,
     pub machine_id: MachineId,
+    pub forward_host: String,
     pub sockets: Vec<SocketSpec>,
 }
 
@@ -40,7 +41,7 @@ struct DurationStr(#[serde(with = "humantime_serde")] Duration);
 impl AgentConfig {
     /// Load from the current process environment. Reads (in order):
     ///   DOCKTORNET_SERVER_URL, DOCKTORNET_SECRET, DOCKTORNET_POLL_INTERVAL,
-    ///   DOCKTORNET_MACHINE_ID, DOCKTORNET_SOCKETS
+    ///   DOCKTORNET_MACHINE_ID, DOCKTORNET_FORWARD_HOST, DOCKTORNET_SOCKETS
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_iter(std::env::vars().collect::<HashMap<_, _>>())
     }
@@ -63,6 +64,8 @@ impl AgentConfig {
 
         let machine_id = MachineId::new(get("DOCKTORNET_MACHINE_ID")?);
 
+        let forward_host = get("DOCKTORNET_FORWARD_HOST")?;
+
         let sockets_raw = get("DOCKTORNET_SOCKETS")?;
         let sockets = parse_sockets(&sockets_raw).map_err(|msg| ConfigError::Invalid {
             var: "DOCKTORNET_SOCKETS",
@@ -74,6 +77,7 @@ impl AgentConfig {
             secret,
             poll_interval,
             machine_id,
+            forward_host,
             sockets,
         })
     }
@@ -129,6 +133,7 @@ mod tests {
             ("DOCKTORNET_SECRET", "s3cret"),
             ("DOCKTORNET_POLL_INTERVAL", "30s"),
             ("DOCKTORNET_MACHINE_ID", "batterdock"),
+            ("DOCKTORNET_FORWARD_HOST", "10.0.0.10"),
             (
                 "DOCKTORNET_SOCKETS",
                 "docker:/var/run/docker.sock,podman:/run/user/1000/podman/podman.sock",
@@ -140,6 +145,7 @@ mod tests {
         assert_eq!(c.secret, "s3cret");
         assert_eq!(c.poll_interval, Duration::from_secs(30));
         assert_eq!(c.machine_id.as_str(), "batterdock");
+        assert_eq!(c.forward_host, "10.0.0.10");
         assert_eq!(c.sockets.len(), 2);
         assert_eq!(
             c.sockets[0],
@@ -168,12 +174,30 @@ mod tests {
     }
 
     #[test]
+    fn missing_forward_host_errors() {
+        let err = AgentConfig::from_iter(env(&[
+            ("DOCKTORNET_SERVER_URL", "u"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_POLL_INTERVAL", "1s"),
+            ("DOCKTORNET_MACHINE_ID", "m"),
+            ("DOCKTORNET_SOCKETS", "docker:/x"),
+        ]))
+        .unwrap_err();
+
+        match err {
+            ConfigError::Missing(v) => assert_eq!(v, "DOCKTORNET_FORWARD_HOST"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_runtime_errors_with_sockets_var() {
         let err = AgentConfig::from_iter(env(&[
             ("DOCKTORNET_SERVER_URL", "u"),
             ("DOCKTORNET_SECRET", "s"),
             ("DOCKTORNET_POLL_INTERVAL", "1s"),
             ("DOCKTORNET_MACHINE_ID", "m"),
+            ("DOCKTORNET_FORWARD_HOST", "10.0.0.10"),
             ("DOCKTORNET_SOCKETS", "wasm:/x"),
         ]))
         .unwrap_err();
@@ -191,6 +215,7 @@ mod tests {
             ("DOCKTORNET_SECRET", "s"),
             ("DOCKTORNET_POLL_INTERVAL", "1s"),
             ("DOCKTORNET_MACHINE_ID", "m"),
+            ("DOCKTORNET_FORWARD_HOST", "10.0.0.10"),
             ("DOCKTORNET_SOCKETS", ""),
         ]))
         .unwrap_err();
@@ -211,6 +236,7 @@ mod tests {
             ("DOCKTORNET_SECRET", "s"),
             ("DOCKTORNET_POLL_INTERVAL", "1s"),
             ("DOCKTORNET_MACHINE_ID", "m"),
+            ("DOCKTORNET_FORWARD_HOST", "10.0.0.10"),
             ("DOCKTORNET_SOCKETS", "docker:   "),
         ]))
         .unwrap_err();

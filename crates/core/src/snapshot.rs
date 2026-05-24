@@ -17,6 +17,8 @@ pub struct ContainerEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub machine_id: MachineId,
+    /// This machine's address that NPM should forward proxied traffic to.
+    pub forward_host: String,
     pub taken_at: u64,
     pub containers: Vec<ContainerEntry>,
 }
@@ -32,6 +34,7 @@ mod tests {
 
         let snap = Snapshot {
             machine_id: MachineId::new("batterdock"),
+            forward_host: "10.0.0.10".into(),
             taken_at: 1716300000,
             containers: vec![ContainerEntry {
                 name: "myapp".into(),
@@ -48,6 +51,7 @@ mod tests {
     fn empty_snapshot_is_valid() {
         let snap = Snapshot {
             machine_id: MachineId::new("batterdock"),
+            forward_host: "10.0.0.10".into(),
             taken_at: 1716300000,
             containers: vec![],
         };

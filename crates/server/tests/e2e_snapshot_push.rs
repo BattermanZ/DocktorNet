@@ -19,7 +19,6 @@ async fn agent_push_lands_in_sqlite_via_real_http() {
             dry_run: true,
             adopt_existing: false,
             gatus_config_dir: dir.path().join("gatus"),
-            npm_forward_host: "127.0.0.1".to_string(),
         },
     );
     let app = docktornet_server::routes::build(docktornet_server::handlers::snapshot::AppState {
@@ -43,6 +42,7 @@ async fn agent_push_lands_in_sqlite_via_real_http() {
     labels.insert("docktornet.gatus.0.url".into(), "https://x".into());
     let snap = Snapshot {
         machine_id: MachineId::new("e2e-host"),
+        forward_host: "10.0.0.10".into(),
         taken_at: 42,
         containers: vec![ContainerEntry {
             name: "demo".into(),

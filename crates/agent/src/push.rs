@@ -136,6 +136,7 @@ mod tests {
     fn snap() -> Snapshot {
         Snapshot {
             machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.10".into(),
             taken_at: 1,
             containers: vec![ContainerEntry {
                 name: "a".into(),

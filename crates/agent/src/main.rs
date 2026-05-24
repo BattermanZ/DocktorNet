@@ -42,5 +42,12 @@ async fn main() -> Result<()> {
         interval = ?cfg.poll_interval,
         "agent ready"
     );
-    loop_::run(cfg.machine_id, sources, client, cfg.poll_interval).await;
+    loop_::run(
+        cfg.machine_id,
+        cfg.forward_host,
+        sources,
+        client,
+        cfg.poll_interval,
+    )
+    .await;
 }

@@ -44,7 +44,6 @@ mod tests {
                 dry_run: true,
                 adopt_existing: false,
                 gatus_config_dir: dir.path().join("gatus"),
-                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
         let state = AppState {
@@ -65,6 +64,7 @@ mod tests {
         labels.insert("docktornet.gatus.0.interval".into(), "30s".into());
         Snapshot {
             machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.10".into(),
             taken_at: 1,
             containers: vec![ContainerEntry {
                 name: "a".into(),

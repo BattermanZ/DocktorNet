@@ -8,7 +8,7 @@ use crate::sockets::RawContainer;
 /// Build a Snapshot from the raw container list, keeping only containers that
 /// declare at least one label starting with `docktornet.`. Labels without the
 /// prefix are dropped to keep payloads small.
-pub fn build(machine_id: &MachineId, raw: &[RawContainer]) -> Snapshot {
+pub fn build(machine_id: &MachineId, forward_host: &str, raw: &[RawContainer]) -> Snapshot {
     let taken_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -37,6 +37,7 @@ pub fn build(machine_id: &MachineId, raw: &[RawContainer]) -> Snapshot {
 
     Snapshot {
         machine_id: machine_id.clone(),
+        forward_host: forward_host.to_string(),
         taken_at,
         containers,
     }
@@ -60,6 +61,7 @@ mod tests {
     fn keeps_only_docktornet_prefixed_labels_and_drops_unlabelled_containers() {
         let snap = build(
             &MachineId::new("m1"),
+            "10.0.0.10",
             &[
                 rc(
                     "withlabel",
@@ -83,6 +85,7 @@ mod tests {
     fn containers_sorted_by_name_for_stable_diffs() {
         let snap = build(
             &MachineId::new("m1"),
+            "10.0.0.10",
             &[
                 rc("zebra", &[("docktornet.x", "1")]),
                 rc("apple", &[("docktornet.x", "1")]),

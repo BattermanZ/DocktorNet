@@ -12,6 +12,21 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
 
     let mut tx = pool.begin().await?;
 
+    // upsert the machine row so its forward host is available to the DB-only
+    // resync path; kept in the same transaction as the services it owns.
+    sqlx::query(
+        r#"INSERT INTO machines (machine_id, forward_host, last_seen)
+           VALUES (?, ?, ?)
+           ON CONFLICT(machine_id) DO UPDATE SET
+             forward_host = excluded.forward_host,
+             last_seen    = excluded.last_seen"#,
+    )
+    .bind(machine)
+    .bind(&snap.forward_host)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
     // upsert each container
     for c in &snap.containers {
         let id = service_id(&snap.machine_id, &c.name);
@@ -67,10 +82,16 @@ pub async fn list_services_for_machine(
     Ok(rows)
 }
 
-pub async fn list_all_services(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, String)>> {
-    sqlx::query_as("SELECT id, labels_json FROM services ORDER BY id")
-        .fetch_all(pool)
-        .await
+pub async fn list_all_services(
+    pool: &Pool<Sqlite>,
+) -> sqlx::Result<Vec<(String, String, String)>> {
+    sqlx::query_as(
+        "SELECT s.id, s.labels_json, m.forward_host \
+         FROM services s JOIN machines m ON s.machine_id = m.machine_id \
+         ORDER BY s.id",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn removed_service_ids(
@@ -211,6 +232,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
@@ -233,6 +255,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: m.clone(),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
@@ -243,6 +266,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: m,
+                forward_host: "10.0.0.10".into(),
                 taken_at: 200,
                 containers: vec![entry("a", &[("docktornet.x", "2")])],
             },
@@ -262,6 +286,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: m.clone(),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 containers: vec![
                     entry("a", &[("docktornet.x", "1")]),
@@ -275,6 +300,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: m,
+                forward_host: "10.0.0.10".into(),
                 taken_at: 200,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
@@ -297,6 +323,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: m.clone(),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
@@ -307,6 +334,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: m,
+                forward_host: "10.0.0.10".into(),
                 taken_at: 200,
                 containers: vec![],
             },
@@ -325,6 +353,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
@@ -335,6 +364,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: MachineId::new("m2"),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 containers: vec![],
             },
@@ -354,6 +384,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: m.clone(),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 containers: vec![entry(
                     "a",
@@ -380,6 +411,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 containers: vec![entry("app", &[])],
             },
@@ -399,6 +431,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 1,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
@@ -409,6 +442,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: MachineId::new("m2"),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 1,
                 containers: vec![entry("b", &[("docktornet.y", "2")])],
             },
@@ -416,8 +450,10 @@ mod tests {
         .await
         .unwrap();
         let all = list_all_services(&p).await.unwrap();
-        let ids: Vec<String> = all.into_iter().map(|(id, _)| id).collect();
+        let ids: Vec<String> = all.iter().map(|(id, _, _)| id.clone()).collect();
         assert_eq!(ids, vec!["m1/a", "m2/b"]);
+        let hosts: Vec<String> = all.into_iter().map(|(_, _, fh)| fh).collect();
+        assert_eq!(hosts, vec!["10.0.0.10", "10.0.0.10"]);
     }
 
     #[tokio::test]
@@ -427,6 +463,7 @@ mod tests {
             &p,
             &Snapshot {
                 machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 containers: vec![entry("app", &[])],
             },

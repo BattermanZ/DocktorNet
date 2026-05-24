@@ -27,7 +27,6 @@ pub struct ReconcileOptions {
     pub dry_run: bool,
     pub adopt_existing: bool,
     pub gatus_config_dir: PathBuf,
-    pub npm_forward_host: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -173,7 +172,7 @@ impl Reconciler {
         let mut report = ResyncReport::default();
 
         let services = crate::storage::list_all_services(&self.db).await?;
-        for (service_id, labels_json) in services {
+        for (service_id, labels_json, forward_host) in services {
             let raw: std::collections::BTreeMap<String, String> = match serde_json::from_str(
                 &labels_json,
             ) {
@@ -187,7 +186,7 @@ impl Reconciler {
             let parsed = docktornet_core::labels::parse(&raw);
 
             for host in &parsed.npm {
-                if let Err(err) = self.resync_npm_host(&service_id, host).await {
+                if let Err(err) = self.resync_npm_host(&service_id, host, &forward_host).await {
                     tracing::warn!(service_id, index = host.index, error = %err, "npm resync failed");
                     report.failed += 1;
                 } else {
@@ -234,6 +233,7 @@ impl Reconciler {
         &self,
         service_id: &str,
         host: &docktornet_core::labels::NpmHost,
+        forward_host: &str,
     ) -> Result<(), ReconcileError> {
         let Some(client) = &self.npm else {
             return Ok(());
@@ -264,11 +264,8 @@ impl Reconciler {
             .cert_id
             .map(i64::from)
             .or_else(|| crate::integrations::npm::matching_cert_id(&host.host, &certs));
-        let payload = crate::integrations::npm::proxy_payload(
-            host,
-            &self.options.npm_forward_host,
-            desired_cert,
-        );
+        let payload =
+            crate::integrations::npm::proxy_payload(host, forward_host, desired_cert);
 
         match existing {
             None => {
@@ -422,12 +419,8 @@ impl Reconciler {
             }
 
             for npm_host in &service.labels.npm {
-                self.reconcile_npm(
-                    &service.service_id,
-                    npm_host,
-                    &self.options.npm_forward_host,
-                )
-                .await?;
+                self.reconcile_npm(&service.service_id, npm_host, &snap.forward_host)
+                    .await?;
             }
 
             if let Some(dns) = &service.labels.cf_dns {
@@ -468,7 +461,6 @@ mod tests {
                 dry_run: true,
                 adopt_existing: false,
                 gatus_config_dir: dir.path().join("gatus"),
-                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
 
@@ -480,6 +472,7 @@ mod tests {
         labels.insert("docktornet.gatus.0.interval".to_string(), "30s".to_string());
         let snap = Snapshot {
             machine_id: MachineId::new("m1"),
+            forward_host: "127.0.0.1".into(),
             taken_at: 1,
             containers: vec![ContainerEntry {
                 name: "app".to_string(),
@@ -507,7 +500,6 @@ mod tests {
                 dry_run: false,
                 adopt_existing: false,
                 gatus_config_dir: gatus_dir.clone(),
-                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
 
@@ -518,6 +510,7 @@ mod tests {
         reconciler
             .reconcile_snapshot(&Snapshot {
                 machine_id: MachineId::new("m1"),
+                forward_host: "127.0.0.1".into(),
                 taken_at: 1,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
@@ -549,7 +542,6 @@ mod tests {
                 dry_run: false,
                 adopt_existing: false,
                 gatus_config_dir: gatus_dir.clone(),
-                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
 
@@ -559,6 +551,7 @@ mod tests {
         reconciler
             .reconcile_snapshot(&Snapshot {
                 machine_id: MachineId::new("m1"),
+                forward_host: "127.0.0.1".into(),
                 taken_at: 1,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
@@ -587,7 +580,6 @@ mod tests {
                 dry_run: false,
                 adopt_existing: false,
                 gatus_config_dir: gatus_dir.clone(),
-                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
         let mut labels = BTreeMap::new();
@@ -596,6 +588,7 @@ mod tests {
         writer
             .reconcile_snapshot(&Snapshot {
                 machine_id: MachineId::new("m1"),
+                forward_host: "127.0.0.1".into(),
                 taken_at: 1,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
@@ -614,7 +607,6 @@ mod tests {
                 dry_run: true,
                 adopt_existing: false,
                 gatus_config_dir: gatus_dir,
-                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
         let report = dryrun.full_resync().await.unwrap();
@@ -633,7 +625,6 @@ mod tests {
                 dry_run: false,
                 adopt_existing: false,
                 gatus_config_dir: gatus_dir.clone(),
-                npm_forward_host: "127.0.0.1".to_string(),
             },
         );
 
@@ -647,6 +638,7 @@ mod tests {
         reconciler
             .reconcile_snapshot(&Snapshot {
                 machine_id: MachineId::new("m1"),
+                forward_host: "127.0.0.1".into(),
                 taken_at: 1,
                 containers: vec![ContainerEntry {
                     name: "app".to_string(),
@@ -661,11 +653,118 @@ mod tests {
         reconciler
             .reconcile_snapshot(&Snapshot {
                 machine_id: MachineId::new("m1"),
+                forward_host: "127.0.0.1".into(),
                 taken_at: 2,
                 containers: vec![],
             })
             .await
             .unwrap();
         assert!(!service_file.exists());
+    }
+
+    #[tokio::test]
+    async fn npm_forwards_to_each_machines_own_address() {
+        use mockito::Matcher;
+
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // One expectation per machine, matching its own forward_host.
+        let create_a = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "forward_host": "10.0.0.1" }),
+            ))
+            .with_status(200)
+            .with_body(r#"{"id":1,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let create_b = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "forward_host": "10.0.0.2" }),
+            ))
+            .with_status(200)
+            .with_body(r#"{"id":2,"domain_names":["b.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let npm = crate::integrations::npm::NpmClient::new(crate::config::NpmConfig {
+            url: url::Url::parse(&npm_server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let cf = crate::integrations::cloudflare::CloudflareClient::new(
+            crate::config::CloudflareConfig {
+                api_token: "t".into(),
+                zone_id: "z".into(),
+            },
+        );
+
+        let reconciler = Reconciler::with_clients(
+            pool,
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        let npm_labels = |host: &str| {
+            let mut labels = BTreeMap::new();
+            labels.insert("docktornet.npm.0.host".to_string(), host.to_string());
+            labels.insert("docktornet.npm.0.port".to_string(), "3000".to_string());
+            labels.insert("docktornet.npm.0.scheme".to_string(), "http".to_string());
+            labels.insert("docktornet.npm.0.ssl".to_string(), "false".to_string());
+            labels
+        };
+
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 1,
+                containers: vec![ContainerEntry {
+                    name: "app".into(),
+                    labels: npm_labels("a.example.com"),
+                }],
+            })
+            .await
+            .unwrap();
+
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m2"),
+                forward_host: "10.0.0.2".into(),
+                taken_at: 1,
+                containers: vec![ContainerEntry {
+                    name: "app".into(),
+                    labels: npm_labels("b.example.com"),
+                }],
+            })
+            .await
+            .unwrap();
+
+        create_a.assert_async().await;
+        create_b.assert_async().await;
     }
 }

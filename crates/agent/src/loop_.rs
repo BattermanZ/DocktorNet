@@ -17,6 +17,7 @@ use crate::sockets::ContainerSource;
 /// abort because of a transient server outage.
 pub async fn run(
     machine: MachineId,
+    forward_host: String,
     sources: Vec<Box<dyn ContainerSource>>,
     client: PushClient,
     interval: Duration,
@@ -25,7 +26,7 @@ pub async fn run(
 
     loop {
         let raw = crate::sockets::list_all(&sources).await;
-        let snap = snapshot::build(&machine, &raw);
+        let snap = snapshot::build(&machine, &forward_host, &raw);
 
         match client.push_with_retry(&snap, 3).await {
             Ok(()) => info!(containers = snap.containers.len(), "snapshot pushed"),
