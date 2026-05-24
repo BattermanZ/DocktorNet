@@ -18,6 +18,10 @@ pub struct RawContainer {
 #[async_trait]
 pub trait ContainerSource: Send + Sync {
     async fn list(&self) -> anyhow::Result<Vec<RawContainer>>;
+
+    /// Human-readable identifier (e.g. `Podman:/run/user/1001/podman/podman.sock`)
+    /// used in logs so a failing source can be told apart from the others.
+    fn label(&self) -> &str;
 }
 
 /// Production implementation using bollard against a Unix socket.
@@ -62,6 +66,10 @@ impl ContainerSource for BollardSource {
 
         Ok(out)
     }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
 }
 
 /// Merge results from every configured source. Duplicate container names from
@@ -72,7 +80,9 @@ pub async fn list_all(sources: &[Box<dyn ContainerSource>]) -> Vec<RawContainer>
     for source in sources {
         match source.list().await {
             Ok(mut containers) => out.append(&mut containers),
-            Err(error) => warn!(%error, "source failed to list containers"),
+            Err(error) => {
+                warn!(source = %source.label(), %error, "source failed to list containers")
+            }
         }
     }
 
@@ -91,6 +101,10 @@ mod tests {
     impl ContainerSource for Fake {
         async fn list(&self) -> anyhow::Result<Vec<RawContainer>> {
             Ok(self.items.clone())
+        }
+
+        fn label(&self) -> &str {
+            "Fake"
         }
     }
 
@@ -130,6 +144,10 @@ mod tests {
     impl ContainerSource for Boom {
         async fn list(&self) -> anyhow::Result<Vec<RawContainer>> {
             anyhow::bail!("boom")
+        }
+
+        fn label(&self) -> &str {
+            "Boom"
         }
     }
 
