@@ -139,6 +139,31 @@ impl NpmClient {
         Ok(resp.json::<ProxyHostResponse>().await?)
     }
 
+    /// Find an existing proxy host whose `domain_names` include `domain`
+    /// (case-insensitive). NPM has no server-side filter, so list and match
+    /// locally. Used to adopt a host that already exists when our DB has no
+    /// mapping for it.
+    pub async fn find_proxy_host_by_domain(
+        &self,
+        token: &str,
+        domain: &str,
+    ) -> Result<Option<ProxyHostResponse>, NpmError> {
+        let resp = self
+            .http
+            .get(self.endpoint("api/nginx/proxy-hosts"))
+            .bearer_auth(token)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let hosts = resp.json::<Vec<ProxyHostResponse>>().await?;
+        Ok(hosts.into_iter().find(|host| {
+            host.domain_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(domain))
+        }))
+    }
+
     pub async fn get_proxy_host(
         &self,
         token: &str,
@@ -438,6 +463,56 @@ mod tests {
 
         assert_eq!(response.id, 7);
         assert_eq!(response.domain_names, vec!["app.example.com".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn find_proxy_host_by_domain_matches_case_insensitively() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .match_header("authorization", "Bearer tok")
+            .with_status(200)
+            .with_body(
+                r#"[{"id":3,"domain_names":["other.example.com"]},
+                    {"id":61,"domain_names":["APP.EXAMPLE.COM"]}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = NpmClient::new(crate::config::NpmConfig {
+            url: Url::parse(&server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let got = client
+            .find_proxy_host_by_domain("tok", "app.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        m.assert_async().await;
+        assert_eq!(got.id, 61);
+    }
+
+    #[tokio::test]
+    async fn find_proxy_host_by_domain_returns_none_when_absent() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"[{"id":3,"domain_names":["other.example.com"]}]"#)
+            .create_async()
+            .await;
+
+        let client = NpmClient::new(crate::config::NpmConfig {
+            url: Url::parse(&server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let got = client
+            .find_proxy_host_by_domain("tok", "missing.example.com")
+            .await
+            .unwrap();
+        assert!(got.is_none());
     }
 
     #[tokio::test]

@@ -110,12 +110,28 @@ impl Reconciler {
             return Ok(());
         }
 
-        let created = client
-            .create_proxy_host(&token, &payload)
-            .await
-            .map_err(|err| ReconcileError::External(err.into()))?;
-        crate::storage::set_npm_host(&self.db, service_id, host.index.into(), created.id).await?;
-        Ok(())
+        match client.create_proxy_host(&token, &payload).await {
+            Ok(created) => {
+                crate::storage::set_npm_host(&self.db, service_id, host.index.into(), created.id)
+                    .await?;
+                Ok(())
+            }
+            Err(err) if self.options.adopt_existing => {
+                let existing = client
+                    .find_proxy_host_by_domain(&token, &host.host)
+                    .await
+                    .map_err(|e| ReconcileError::External(e.into()))?
+                    .ok_or_else(|| ReconcileError::External(err.into()))?;
+                client
+                    .update_proxy_host(&token, existing.id, &payload)
+                    .await
+                    .map_err(|e| ReconcileError::External(e.into()))?;
+                crate::storage::set_npm_host(&self.db, service_id, host.index.into(), existing.id)
+                    .await?;
+                Ok(())
+            }
+            Err(err) => Err(ReconcileError::External(err.into())),
+        }
     }
 
     async fn reconcile_cloudflare(
@@ -264,8 +280,7 @@ impl Reconciler {
             .cert_id
             .map(i64::from)
             .or_else(|| crate::integrations::npm::matching_cert_id(&host.host, &certs));
-        let payload =
-            crate::integrations::npm::proxy_payload(host, forward_host, desired_cert);
+        let payload = crate::integrations::npm::proxy_payload(host, forward_host, desired_cert);
 
         match existing {
             None => {
@@ -766,5 +781,102 @@ mod tests {
 
         create_a.assert_async().await;
         create_b.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn npm_adopts_existing_host_when_create_conflicts() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // Create conflicts because the host already exists in NPM.
+        let create = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(400)
+            .with_body(r#"{"error":{"message":"domain already in use"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // Adoption lists, finds id 61, and updates it.
+        let list = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"[{"id":61,"domain_names":["a.example.com"]}]"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/61")
+            .with_status(200)
+            .with_body(r#"{"id":61,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let npm = crate::integrations::npm::NpmClient::new(crate::config::NpmConfig {
+            url: url::Url::parse(&npm_server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let cf = crate::integrations::cloudflare::CloudflareClient::new(
+            crate::config::CloudflareConfig {
+                api_token: "t".into(),
+                zone_id: "z".into(),
+            },
+        );
+
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: true,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "docktornet.npm.0.host".to_string(),
+            "a.example.com".to_string(),
+        );
+        labels.insert("docktornet.npm.0.port".to_string(), "3000".to_string());
+        labels.insert("docktornet.npm.0.scheme".to_string(), "http".to_string());
+        labels.insert("docktornet.npm.0.ssl".to_string(), "false".to_string());
+
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 1,
+                containers: vec![ContainerEntry {
+                    name: "app".into(),
+                    labels,
+                }],
+            })
+            .await
+            .unwrap();
+
+        create.assert_async().await;
+        list.assert_async().await;
+        update.assert_async().await;
+
+        let stored = storage::get_npm_host(&pool, "m1/app", 0).await.unwrap();
+        assert_eq!(stored, Some(61));
     }
 }

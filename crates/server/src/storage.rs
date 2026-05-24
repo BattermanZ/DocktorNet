@@ -82,9 +82,7 @@ pub async fn list_services_for_machine(
     Ok(rows)
 }
 
-pub async fn list_all_services(
-    pool: &Pool<Sqlite>,
-) -> sqlx::Result<Vec<(String, String, String)>> {
+pub async fn list_all_services(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, String, String)>> {
     sqlx::query_as(
         "SELECT s.id, s.labels_json, m.forward_host \
          FROM services s JOIN machines m ON s.machine_id = m.machine_id \
