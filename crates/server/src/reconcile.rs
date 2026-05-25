@@ -47,6 +47,10 @@ fn cf_record_matches(
 }
 
 impl Reconciler {
+    pub fn pool(&self) -> &Db {
+        &self.db
+    }
+
     pub fn new(db: Db, options: ReconcileOptions) -> Self {
         Self {
             db,
@@ -103,6 +107,7 @@ impl Reconciler {
         if let Some(id) =
             crate::storage::get_npm_host(&self.db, service_id, host.index.into()).await?
         {
+            tracing::info!(service_id, npm_id = id, "npm host updated");
             client
                 .update_proxy_host(&token, id, &payload)
                 .await
@@ -112,6 +117,7 @@ impl Reconciler {
 
         match client.create_proxy_host(&token, &payload).await {
             Ok(created) => {
+                tracing::info!(service_id, npm_id = created.id, "npm host created");
                 crate::storage::set_npm_host(&self.db, service_id, host.index.into(), created.id)
                     .await?;
                 Ok(())
@@ -122,6 +128,7 @@ impl Reconciler {
                     .await
                     .map_err(|e| ReconcileError::External(e.into()))?
                     .ok_or_else(|| ReconcileError::External(err.into()))?;
+                tracing::info!(service_id, npm_id = existing.id, "npm host adopted");
                 client
                     .update_proxy_host(&token, existing.id, &payload)
                     .await
@@ -154,6 +161,7 @@ impl Reconciler {
         let existing_id = crate::storage::get_cf_dns_record(&self.db, service_id).await?;
 
         if let Some(id) = existing_id {
+            tracing::info!(service_id, record_id = %id, "cf record updated");
             client
                 .update_record(&id, &payload)
                 .await
@@ -163,6 +171,7 @@ impl Reconciler {
 
         match client.create_record(&payload).await {
             Ok(record) => {
+                tracing::info!(service_id, record_id = %record.id, "cf record created");
                 crate::storage::set_cf_dns_record(&self.db, service_id, &record.id).await?;
                 Ok(())
             }
@@ -172,6 +181,7 @@ impl Reconciler {
                     .await
                     .map_err(|e| ReconcileError::External(e.into()))?
                     .ok_or_else(|| ReconcileError::External(anyhow::anyhow!(err)))?;
+                tracing::info!(service_id, record_id = %record.id, "cf record adopted");
                 client
                     .update_record(&record.id, &payload)
                     .await
@@ -260,7 +270,7 @@ impl Reconciler {
             return Ok(());
         };
         if self.options.dry_run {
-            tracing::info!(service_id, npm_id, "dry-run: would verify npm host");
+            tracing::debug!(service_id, npm_id, "dry-run: would verify npm host");
             return Ok(());
         }
 
@@ -321,7 +331,7 @@ impl Reconciler {
             return Ok(());
         };
         if self.options.dry_run {
-            tracing::info!(service_id, record_id = %record_id, "dry-run: would verify cf record");
+            tracing::debug!(service_id, record_id = %record_id, "dry-run: would verify cf record");
             return Ok(());
         }
 
@@ -372,7 +382,7 @@ impl Reconciler {
             return Ok(false);
         }
         if self.options.dry_run {
-            tracing::info!(service_id, path = %target.display(), "dry-run: would rewrite gatus file");
+            tracing::debug!(service_id, path = %target.display(), "dry-run: would rewrite gatus file");
             return Ok(false);
         }
         tracing::info!(service_id, path = %target.display(), "gatus file drifted, rewriting");
@@ -401,7 +411,7 @@ impl Reconciler {
         crate::storage::upsert_snapshot(&self.db, snap).await?;
 
         if self.options.dry_run {
-            tracing::info!(
+            tracing::debug!(
                 removed = removed.len(),
                 current = current_ids.len(),
                 "dry-run: would reconcile snapshot"
@@ -410,6 +420,7 @@ impl Reconciler {
         }
 
         for service_id in removed {
+            tracing::info!(service_id = %service_id, "service removed");
             crate::integrations::gatus::remove_service_file(
                 &self.options.gatus_config_dir,
                 &service_id,
@@ -419,6 +430,7 @@ impl Reconciler {
 
         for service in intended {
             if !service.labels.gatus.is_empty() {
+                tracing::debug!(service_id = %service.service_id, "gatus file written");
                 crate::integrations::gatus::write_service_file(
                     &self.options.gatus_config_dir,
                     &service.service_id,
@@ -443,6 +455,7 @@ impl Reconciler {
             } else if let Some(record_id) =
                 crate::storage::get_cf_dns_record(&self.db, &service.service_id).await?
             {
+                tracing::info!(service_id = %service.service_id, record_id = %record_id, "cf record deleted");
                 if let Some(client) = &self.cloudflare {
                     client
                         .delete_record(&record_id)

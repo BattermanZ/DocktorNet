@@ -6,7 +6,7 @@ use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use docktornet_core::Snapshot;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::flapping::FlappingTracker;
 use crate::reconcile::Reconciler;
@@ -34,7 +34,7 @@ pub async fn ingest(
             "machine id seen from multiple source IPs within window"
         );
     }
-    info!(machine = %snap.machine_id.as_str(), containers = snap.containers.len(), "snapshot received");
+    tracing::debug!(machine = %snap.machine_id.as_str(), containers = snap.containers.len(), "snapshot received");
     match state.reconciler.reconcile_snapshot(&snap).await {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(e) => {
