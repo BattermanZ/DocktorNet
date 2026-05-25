@@ -430,13 +430,25 @@ impl Reconciler {
 
         for service in intended {
             if !service.labels.gatus.is_empty() {
-                tracing::debug!(service_id = %service.service_id, "gatus file written");
-                crate::integrations::gatus::write_service_file(
+                let target = crate::integrations::gatus::service_file_path(
                     &self.options.gatus_config_dir,
+                    &service.service_id,
+                );
+                let intended_yaml = crate::integrations::gatus::render_gatus_yaml(
                     &service.service_id,
                     &service.labels.gatus,
                 )
-                .await?;
+                .map_err(|e| ReconcileError::External(e.into()))?;
+                let current = tokio::fs::read_to_string(&target).await.ok();
+                if current.as_deref() != Some(intended_yaml.as_str()) {
+                    tracing::info!(service_id = %service.service_id, path = %target.display(), "gatus file written");
+                    crate::integrations::gatus::write_service_file(
+                        &self.options.gatus_config_dir,
+                        &service.service_id,
+                        &service.labels.gatus,
+                    )
+                    .await?;
+                }
             } else {
                 crate::integrations::gatus::remove_service_file(
                     &self.options.gatus_config_dir,
