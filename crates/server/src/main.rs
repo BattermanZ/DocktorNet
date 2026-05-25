@@ -9,6 +9,23 @@ use docktornet_server::{config, db, routes};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+    let sigterm = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    tokio::select! {
+        () = ctrl_c => {},
+        _ = sigterm => {},
+    }
+    info!("shutdown signal received");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -60,9 +77,7 @@ async fn main() -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async {
-        tokio::signal::ctrl_c().await.ok();
-    })
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
 }

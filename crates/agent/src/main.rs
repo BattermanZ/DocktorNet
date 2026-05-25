@@ -50,4 +50,5 @@ async fn main() -> Result<()> {
         cfg.poll_interval,
     )
     .await;
+    Ok(())
 }

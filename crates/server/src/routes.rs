@@ -1,19 +1,22 @@
 use axum::Router;
-use axum::routing::post;
+use axum::routing::{get, post};
 
 use crate::auth::{AuthState, require_bearer};
-use crate::handlers::snapshot::{self, AppState};
+use crate::handlers::{health, snapshot::{self, AppState}};
 
 pub fn build(state: AppState) -> Router {
     let auth_state = AuthState {
         secret: state.secret.clone(),
     };
-    Router::new()
+    let authed = Router::new()
         .route("/api/v1/snapshot", post(snapshot::ingest))
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
             require_bearer,
-        ))
+        ));
+    Router::new()
+        .route("/healthz", get(health::healthz))
+        .merge(authed)
         .with_state(state)
 }
 
@@ -119,5 +122,41 @@ mod tests {
         let rows = list_services_for_machine(&pool, "m1").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "m1/a");
+    }
+
+    #[tokio::test]
+    async fn healthz_is_public_and_returns_200() {
+        let (app, _pool, _dir) = make_app().await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_lists_agents_after_snapshot_push() {
+        // Use an app that has seen the snapshot so we can verify "m1" appears in the response.
+        let (app, _pool, _dir) = make_app().await;
+
+        // Push a snapshot for machine "m1".
+        let push = req("POST", Some("s3cret"), &snap());
+        app.clone().oneshot(push).await.unwrap();
+
+        // Now fetch /healthz and assert the body contains "m1".
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(get_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+        assert!(body_str.contains("m1"), "body should contain machine id m1: {body_str}");
     }
 }

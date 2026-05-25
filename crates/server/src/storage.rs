@@ -70,6 +70,14 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
     tx.commit().await
 }
 
+pub async fn list_machines(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, String, i64)>> {
+    sqlx::query_as(
+        "SELECT machine_id, forward_host, last_seen FROM machines ORDER BY machine_id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn list_services_for_machine(
     pool: &Pool<Sqlite>,
     machine: &str,
@@ -420,6 +428,42 @@ mod tests {
         assert_eq!(get_npm_host(&p, "m1/app", 0).await.unwrap(), Some(58));
         delete_npm_host(&p, "m1/app", 0).await.unwrap();
         assert_eq!(get_npm_host(&p, "m1/app", 0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn list_machines_returns_every_machine() {
+        let p = pool().await;
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 100,
+                containers: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m2"),
+                forward_host: "10.0.0.2".into(),
+                taken_at: 200,
+                containers: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        let machines = list_machines(&p).await.unwrap();
+        assert_eq!(machines.len(), 2);
+        assert_eq!(machines[0].0, "m1");
+        assert_eq!(machines[0].1, "10.0.0.1");
+        assert_eq!(machines[0].2, 100);
+        assert_eq!(machines[1].0, "m2");
+        assert_eq!(machines[1].1, "10.0.0.2");
+        assert_eq!(machines[1].2, 200);
     }
 
     #[tokio::test]
