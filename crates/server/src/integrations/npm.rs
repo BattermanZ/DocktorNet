@@ -43,6 +43,50 @@ pub struct ProxyHost {
     pub id: i64,
     #[serde(default)]
     pub certificate_id: Option<i64>,
+    #[serde(default)]
+    pub domain_names: Vec<String>,
+    #[serde(default)]
+    pub forward_scheme: String,
+    #[serde(default)]
+    pub forward_host: String,
+    #[serde(default)]
+    pub forward_port: u16,
+    #[serde(default, deserialize_with = "de_bool")]
+    pub ssl_forced: bool,
+    #[serde(default, deserialize_with = "de_bool")]
+    pub http2_support: bool,
+    #[serde(default, deserialize_with = "de_bool")]
+    pub hsts_enabled: bool,
+}
+
+impl ProxyHost {
+    /// True when NPM's stored state already matches the payload we would push.
+    /// Only the fields we derive from labels are compared; flags we always set
+    /// to a constant (caching, block_exploits, etc.) can't drift, so skipping
+    /// them avoids false mismatches from NPM normalizing its response.
+    pub fn matches_payload(&self, payload: &ProxyHostPayload) -> bool {
+        self.certificate_id.unwrap_or_default() == payload.certificate_id
+            && self.domain_names == payload.domain_names
+            && self.forward_scheme == payload.forward_scheme
+            && self.forward_host == payload.forward_host
+            && self.forward_port == payload.forward_port
+            && self.ssl_forced == payload.ssl_forced
+            && self.http2_support == payload.http2_support
+            && self.hsts_enabled == payload.hsts_enabled
+    }
+}
+
+/// NPM serializes boolean columns as integers (0/1) in some versions and as
+/// JSON booleans in others; accept either.
+fn de_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::Bool(b) => Ok(b),
+        Value::Number(n) => Ok(n.as_i64().unwrap_or(0) != 0),
+        _ => Ok(false),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -107,11 +107,22 @@ impl Reconciler {
         if let Some(id) =
             crate::storage::get_npm_host(&self.db, service_id, host.index.into()).await?
         {
-            tracing::info!(service_id, npm_id = id, "npm host updated");
-            client
-                .update_proxy_host(&token, id, &payload)
+            let existing = client
+                .get_proxy_host(&token, id)
                 .await
                 .map_err(|err| ReconcileError::External(err.into()))?;
+            match existing {
+                Some(found) if found.matches_payload(&payload) => {
+                    tracing::debug!(service_id, npm_id = id, "npm host already in sync");
+                }
+                _ => {
+                    tracing::info!(service_id, npm_id = id, "npm host updated");
+                    client
+                        .update_proxy_host(&token, id, &payload)
+                        .await
+                        .map_err(|err| ReconcileError::External(err.into()))?;
+                }
+            }
             return Ok(());
         }
 
@@ -806,6 +817,104 @@ mod tests {
 
         create_a.assert_async().await;
         create_b.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn npm_skips_update_when_host_already_in_sync() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // First snapshot creates the host.
+        let create = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // Second snapshot fetches the host; stored state matches the payload,
+        // so no PUT should ever be issued.
+        let get = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(
+                r#"{"id":50,"domain_names":["a.example.com"],"forward_scheme":"http",
+                    "forward_host":"10.0.0.1","forward_port":3000,"certificate_id":0,
+                    "ssl_forced":0,"http2_support":0,"hsts_enabled":0}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let npm = crate::integrations::npm::NpmClient::new(crate::config::NpmConfig {
+            url: url::Url::parse(&npm_server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let cf = crate::integrations::cloudflare::CloudflareClient::new(
+            crate::config::CloudflareConfig {
+                api_token: "t".into(),
+                zone_id: "z".into(),
+            },
+        );
+
+        let reconciler = Reconciler::with_clients(
+            pool,
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        let npm_labels = || {
+            let mut labels = BTreeMap::new();
+            labels.insert("docktornet.npm.0.host".to_string(), "a.example.com".to_string());
+            labels.insert("docktornet.npm.0.port".to_string(), "3000".to_string());
+            labels.insert("docktornet.npm.0.scheme".to_string(), "http".to_string());
+            labels.insert("docktornet.npm.0.ssl".to_string(), "false".to_string());
+            labels
+        };
+        let snap = |taken_at| Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at,
+            containers: vec![ContainerEntry {
+                name: "app".into(),
+                labels: npm_labels(),
+            }],
+        };
+
+        reconciler.reconcile_snapshot(&snap(1)).await.unwrap();
+        reconciler.reconcile_snapshot(&snap(2)).await.unwrap();
+
+        create.assert_async().await;
+        get.assert_async().await;
+        update.assert_async().await;
     }
 
     #[tokio::test]
