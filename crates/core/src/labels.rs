@@ -21,7 +21,10 @@ pub struct NpmHost {
     pub scheme: NpmScheme,
     pub ssl: bool,
     pub hsts: Option<bool>,
+    pub hsts_subdomains: Option<bool>,
     pub http2: Option<bool>,
+    pub block_exploits: Option<bool>,
+    pub websockets: Option<bool>,
     pub cert_id: Option<u32>,
 }
 
@@ -158,7 +161,10 @@ fn build_npm_host(index: u8, fields: &BTreeMap<String, String>) -> Result<NpmHos
     };
     let ssl = parse_bool(fields.get("ssl").ok_or("missing ssl")?)?;
     let hsts = fields.get("hsts").map(parse_bool).transpose()?;
+    let hsts_subdomains = fields.get("hsts_subdomains").map(parse_bool).transpose()?;
     let http2 = fields.get("http2").map(parse_bool).transpose()?;
+    let block_exploits = fields.get("block_exploits").map(parse_bool).transpose()?;
+    let websockets = fields.get("websockets").map(parse_bool).transpose()?;
     let cert_id = fields
         .get("cert_id")
         .map(|cert_id| cert_id.parse::<u32>())
@@ -172,7 +178,10 @@ fn build_npm_host(index: u8, fields: &BTreeMap<String, String>) -> Result<NpmHos
         scheme,
         ssl,
         hsts,
+        hsts_subdomains,
         http2,
+        block_exploits,
+        websockets,
         cert_id,
     })
 }
@@ -180,7 +189,16 @@ fn build_npm_host(index: u8, fields: &BTreeMap<String, String>) -> Result<NpmHos
 fn is_npm_field(field: &str) -> bool {
     matches!(
         field,
-        "host" | "port" | "scheme" | "ssl" | "hsts" | "http2" | "cert_id"
+        "host"
+            | "port"
+            | "scheme"
+            | "ssl"
+            | "hsts"
+            | "hsts_subdomains"
+            | "http2"
+            | "block_exploits"
+            | "websockets"
+            | "cert_id"
     )
 }
 
@@ -282,6 +300,9 @@ mod tests {
         assert_eq!(h.scheme, NpmScheme::Http);
         assert!(h.ssl);
         assert_eq!(h.hsts, None);
+        assert_eq!(h.hsts_subdomains, None);
+        assert_eq!(h.block_exploits, None);
+        assert_eq!(h.websockets, None);
         assert_eq!(h.cert_id, None);
         assert!(p.warnings.is_empty());
     }
@@ -322,12 +343,18 @@ mod tests {
             ("docktornet.npm.0.scheme", "http"),
             ("docktornet.npm.0.ssl", "true"),
             ("docktornet.npm.0.hsts", "false"),
+            ("docktornet.npm.0.hsts_subdomains", "false"),
             ("docktornet.npm.0.http2", "false"),
+            ("docktornet.npm.0.block_exploits", "false"),
+            ("docktornet.npm.0.websockets", "false"),
             ("docktornet.npm.0.cert_id", "42"),
         ]));
         assert_eq!(p.npm.len(), 1);
         assert_eq!(p.npm[0].hsts, Some(false));
+        assert_eq!(p.npm[0].hsts_subdomains, Some(false));
         assert_eq!(p.npm[0].http2, Some(false));
+        assert_eq!(p.npm[0].block_exploits, Some(false));
+        assert_eq!(p.npm[0].websockets, Some(false));
         assert_eq!(p.npm[0].cert_id, Some(42));
     }
 

@@ -57,13 +57,19 @@ pub struct ProxyHost {
     pub http2_support: bool,
     #[serde(default, deserialize_with = "de_bool")]
     pub hsts_enabled: bool,
+    #[serde(default, deserialize_with = "de_bool")]
+    pub hsts_subdomains: bool,
+    #[serde(default, deserialize_with = "de_bool")]
+    pub block_exploits: bool,
+    #[serde(default, deserialize_with = "de_bool")]
+    pub allow_websocket_upgrade: bool,
 }
 
 impl ProxyHost {
     /// True when NPM's stored state already matches the payload we would push.
     /// Only the fields we derive from labels are compared; flags we always set
-    /// to a constant (caching, block_exploits, etc.) can't drift, so skipping
-    /// them avoids false mismatches from NPM normalizing its response.
+    /// to a constant (caching) can't drift, so skipping them avoids false
+    /// mismatches from NPM normalizing its response.
     pub fn matches_payload(&self, payload: &ProxyHostPayload) -> bool {
         self.certificate_id.unwrap_or_default() == payload.certificate_id
             && self.domain_names == payload.domain_names
@@ -73,6 +79,9 @@ impl ProxyHost {
             && self.ssl_forced == payload.ssl_forced
             && self.http2_support == payload.http2_support
             && self.hsts_enabled == payload.hsts_enabled
+            && self.hsts_subdomains == payload.hsts_subdomains
+            && self.block_exploits == payload.block_exploits
+            && self.allow_websocket_upgrade == payload.allow_websocket_upgrade
     }
 }
 
@@ -253,6 +262,7 @@ pub fn proxy_payload(
     let cert_id = cert_id.unwrap_or_default();
     let ssl_enabled = host.ssl && cert_id > 0;
     let hsts_enabled = ssl_enabled && host.hsts.unwrap_or(true);
+    let hsts_subdomains = hsts_enabled && host.hsts_subdomains.unwrap_or(true);
     let http2_support = ssl_enabled && host.http2.unwrap_or(true);
 
     ProxyHostPayload {
@@ -267,11 +277,11 @@ pub fn proxy_payload(
         certificate_id: cert_id,
         ssl_forced: ssl_enabled,
         caching_enabled: false,
-        block_exploits: false,
-        allow_websocket_upgrade: false,
+        block_exploits: host.block_exploits.unwrap_or(true),
+        allow_websocket_upgrade: host.websockets.unwrap_or(true),
         http2_support,
         hsts_enabled,
-        hsts_subdomains: false,
+        hsts_subdomains,
         advanced_config: String::new(),
         locations: vec![],
         meta: serde_json::json!({
@@ -346,7 +356,10 @@ mod tests {
             scheme: NpmScheme::Http,
             ssl: true,
             hsts: Some(true),
+            hsts_subdomains: Some(true),
             http2: Some(true),
+            block_exploits: Some(true),
+            websockets: Some(true),
             cert_id: Some(42),
         }
     }
@@ -366,11 +379,11 @@ mod tests {
                 certificate_id: 42,
                 ssl_forced: true,
                 caching_enabled: false,
-                block_exploits: false,
-                allow_websocket_upgrade: false,
+                block_exploits: true,
+                allow_websocket_upgrade: true,
                 http2_support: true,
                 hsts_enabled: true,
-                hsts_subdomains: false,
+                hsts_subdomains: true,
                 advanced_config: String::new(),
                 locations: vec![],
                 meta: serde_json::json!({
@@ -489,7 +502,10 @@ mod tests {
                 "certificate_id": 42,
                 "ssl_forced": true,
                 "http2_support": true,
-                "hsts_enabled": true
+                "hsts_enabled": true,
+                "hsts_subdomains": true,
+                "block_exploits": true,
+                "allow_websocket_upgrade": true
             })))
             .with_status(200)
             .with_body(r#"{"id":7,"domain_names":["app.example.com"]}"#)

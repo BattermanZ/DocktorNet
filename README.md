@@ -35,7 +35,10 @@ multiple proxy hosts.
 | `docktornet.npm.<index>.scheme` | yes | `http` \| `https` | — | `http` | Upstream scheme. |
 | `docktornet.npm.<index>.ssl` | yes | bool | — | `true` | Enable SSL on the proxy host. |
 | `docktornet.npm.<index>.hsts` | no | bool | `true` when `ssl` is on | `false` | Enable HSTS. Forced off when `ssl` is off. |
+| `docktornet.npm.<index>.hsts_subdomains` | no | bool | `true` when HSTS is on | `false` | Apply HSTS to subdomains. Forced off when HSTS is off. |
 | `docktornet.npm.<index>.http2` | no | bool | `true` when `ssl` is on | `true` | Enable HTTP/2 support. Forced off when `ssl` is off. |
+| `docktornet.npm.<index>.block_exploits` | no | bool | `true` | `false` | Block common exploits. |
+| `docktornet.npm.<index>.websockets` | no | bool | `true` | `false` | Enable Websocket support. |
 | `docktornet.npm.<index>.cert_id` | no | u32 | unset | `7` | Existing NPM certificate ID. |
 
 ### Cloudflare DNS (`docktornet.cf.dns.*`)

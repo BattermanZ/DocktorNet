@@ -855,7 +855,8 @@ mod tests {
             .with_body(
                 r#"{"id":50,"domain_names":["a.example.com"],"forward_scheme":"http",
                     "forward_host":"10.0.0.1","forward_port":3000,"certificate_id":0,
-                    "ssl_forced":0,"http2_support":0,"hsts_enabled":0}"#,
+                    "ssl_forced":0,"http2_support":0,"hsts_enabled":0,
+                    "hsts_subdomains":0,"block_exploits":1,"allow_websocket_upgrade":1}"#,
             )
             .expect(1)
             .create_async()
