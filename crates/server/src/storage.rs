@@ -100,6 +100,25 @@ pub async fn list_all_services(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String,
     .await
 }
 
+pub async fn get_services_last_seen(
+    pool: &Pool<Sqlite>,
+    service_ids: &[String],
+) -> sqlx::Result<Vec<(String, i64)>> {
+    if service_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders = std::iter::repeat_n("?", service_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql =
+        format!("SELECT id, last_seen FROM services WHERE id IN ({placeholders}) ORDER BY id");
+    let mut q = sqlx::query_as::<_, (String, i64)>(&sql);
+    for id in service_ids {
+        q = q.bind(id.as_str());
+    }
+    q.fetch_all(pool).await
+}
+
 pub async fn removed_service_ids(
     pool: &Pool<Sqlite>,
     machine: &str,
@@ -496,6 +515,34 @@ mod tests {
         assert_eq!(ids, vec!["m1/a", "m2/b"]);
         let hosts: Vec<String> = all.into_iter().map(|(_, _, fh)| fh).collect();
         assert_eq!(hosts, vec!["10.0.0.10", "10.0.0.10"]);
+    }
+
+    #[tokio::test]
+    async fn get_services_last_seen_returns_timestamps() {
+        let p = pool().await;
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.10".into(),
+                taken_at: 42,
+                containers: vec![entry("app", &[])],
+            },
+        )
+        .await
+        .unwrap();
+
+        let rows = get_services_last_seen(&p, &["m1/app".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![("m1/app".to_string(), 42_i64)]);
+    }
+
+    #[tokio::test]
+    async fn get_services_last_seen_returns_empty_for_empty_input() {
+        let p = pool().await;
+        let rows = get_services_last_seen(&p, &[]).await.unwrap();
+        assert!(rows.is_empty());
     }
 
     #[tokio::test]

@@ -112,6 +112,24 @@ pub async fn write_service_file(
     Ok(target)
 }
 
+/// Returns true if the path looks like a file written by `write_service_file`.
+/// The naming pattern is `{sanitized_id}--{16 lowercase hex chars}.yaml`.
+/// Files that do not match (e.g. `00-base.yaml`) are left untouched.
+pub fn is_managed_service_file(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".yaml") else {
+        return false;
+    };
+    if let Some(pos) = stem.rfind("--") {
+        let hash = &stem[pos + 2..];
+        hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    } else {
+        false
+    }
+}
+
 pub async fn remove_service_file(
     config_dir: impl AsRef<std::path::Path>,
     service_id: &str,
@@ -228,6 +246,25 @@ mod tests {
 
         remove_service_file(dir.path(), "m1/app").await.unwrap();
         remove_service_file(dir.path(), "m1/app").await.unwrap();
+    }
+
+    #[test]
+    fn is_managed_service_file_matches_docktornet_filenames() {
+        let dir = tempdir().unwrap();
+        let managed = service_file_path(dir.path(), "m1/app");
+        assert!(is_managed_service_file(&managed));
+    }
+
+    #[test]
+    fn is_managed_service_file_rejects_base_config() {
+        let path = std::path::Path::new("/gatus/config/00-base.yaml");
+        assert!(!is_managed_service_file(path));
+    }
+
+    #[test]
+    fn is_managed_service_file_rejects_short_hash() {
+        let path = std::path::Path::new("/gatus/config/m1__app--abc.yaml");
+        assert!(!is_managed_service_file(path));
     }
 
     #[test]

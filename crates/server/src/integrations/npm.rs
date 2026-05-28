@@ -119,13 +119,26 @@ pub enum NpmError {
     MissingToken,
 }
 
+/// Per-request timeout for NPM API calls.  Without it a hung NPM (as opposed to
+/// a refused connection) would block a reconcile indefinitely, holding the
+/// reconcile lock and stalling every machine's updates.
+const NPM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl NpmClient {
     pub fn new(config: NpmConfig) -> Self {
+        Self::with_timeout(config, NPM_REQUEST_TIMEOUT)
+    }
+
+    pub fn with_timeout(config: NpmConfig, timeout: std::time::Duration) -> Self {
+        let http = Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("failed to build NPM HTTP client");
         Self {
             base_url: normalize_base_url(config.url),
             user: config.user,
             password: config.password,
-            http: Client::new(),
+            http,
         }
     }
 
@@ -462,6 +475,45 @@ mod tests {
         ];
 
         assert_eq!(matching_cert_id("app.example.com", &certs), Some(2));
+    }
+
+    #[tokio::test]
+    async fn requests_time_out_against_an_unresponsive_server() {
+        use std::time::{Duration, Instant};
+
+        // A listener that accepts connections but never sends a response, so
+        // the request hangs until the client's timeout fires (as opposed to a
+        // fast connection-refused when nothing is listening).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let client = NpmClient::with_timeout(
+            crate::config::NpmConfig {
+                url: Url::parse(&format!("http://{addr}")).unwrap(),
+                user: "u".into(),
+                password: "p".into(),
+            },
+            Duration::from_millis(150),
+        );
+
+        let start = Instant::now();
+        let err = client.token().await.unwrap_err();
+        let elapsed = start.elapsed();
+
+        match err {
+            NpmError::Http(e) => assert!(e.is_timeout(), "expected a timeout error, got: {e}"),
+            other => panic!("expected http timeout error, got: {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should time out promptly, took {elapsed:?}"
+        );
     }
 
     #[tokio::test]

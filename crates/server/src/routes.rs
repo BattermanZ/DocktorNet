@@ -125,6 +125,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_acks_before_external_reconcile_and_survives_its_failure() {
+        // A reconciler wired to an NPM server that fails every proxy-host
+        // create. Because reconcile is deferred to a background task, the push
+        // must still be acknowledged (204) and the snapshot persisted; the
+        // external failure only affects the background task.
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .expect_at_least(0)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(0)
+            .create_async()
+            .await;
+        let _create = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(500)
+            .with_body("boom")
+            .expect_at_least(0)
+            .create_async()
+            .await;
+
+        let npm = crate::integrations::npm::NpmClient::new(crate::config::NpmConfig {
+            url: url::Url::parse(&npm_server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let cf = crate::integrations::cloudflare::CloudflareClient::new(
+            crate::config::CloudflareConfig {
+                api_token: "t".into(),
+                zone_id: "z".into(),
+            },
+        );
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+        let state = AppState {
+            reconciler,
+            secret: Arc::new("s3cret".into()),
+            flapping: Arc::new(FlappingTracker::new(Duration::from_secs(300))),
+        };
+        let app = build(state);
+
+        let mut labels = BTreeMap::new();
+        labels.insert("docktornet.npm.0.host".into(), "a.example.com".into());
+        labels.insert("docktornet.npm.0.port".into(), "3000".into());
+        labels.insert("docktornet.npm.0.scheme".into(), "http".into());
+        labels.insert("docktornet.npm.0.ssl".into(), "false".into());
+        let snap = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.10".into(),
+            taken_at: 1,
+            containers: vec![ContainerEntry {
+                name: "app".into(),
+                labels,
+            }],
+        };
+
+        let resp = app.oneshot(req("POST", Some("s3cret"), &snap)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Snapshot is durably persisted before the ack, even though the
+        // background NPM reconcile will fail.
+        let rows = list_services_for_machine(&pool, "m1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
     async fn healthz_is_public_and_returns_200() {
         let (app, _pool, _dir) = make_app().await;
         let request = Request::builder()
