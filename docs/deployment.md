@@ -86,9 +86,23 @@ storage:
   type: sqlite
   path: /data/gatus.db
 alerting:
-  telegram:
-    token: "<bot token>"
-    id: "<chat id>"
+  custom:
+    url: "https://api.telegram.org/bot${GATUS_TELEGRAM_TOKEN}/sendMessage"
+    method: "POST"
+    headers:
+      Content-Type: application/json
+    body: |
+      {
+        "chat_id": "${GATUS_TELEGRAM_CHAT_ID}",
+        "parse_mode": "Markdown",
+        "text": "[ALERT_TRIGGERED_OR_RESOLVED] *[ENDPOINT_NAME]*\n🔗 [ENDPOINT_URL]"
+      }
+    placeholders:
+      ALERT_TRIGGERED_OR_RESOLVED:
+        TRIGGERED: "🔴 DOWN —"
+        RESOLVED: "🟢 BACK UP —"
+    default-alert:
+      send-on-resolved: true
 ```
 
-`alerting.telegram` is **required** if any service has `docktornet.gatus.N.telegram=true` (the default). Without it, Gatus startup fails when it encounters the per-service alert references.
+`alerting.custom` is **required** if any service has `docktornet.gatus.N.telegram=true` (the default), because docktornet emits `type: custom` alert references. **The `alerting.custom` block must exist before the new docktornet binary runs** — Gatus validates each endpoint's alert type against a configured provider at config load, so a missing `alerting.custom` block makes Gatus fail to load once per-service files reference it. The env vars `GATUS_TELEGRAM_TOKEN` and `GATUS_TELEGRAM_CHAT_ID` must be available to the Gatus container.

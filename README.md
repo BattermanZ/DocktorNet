@@ -60,8 +60,9 @@ A single DNS record per container (not indexed).
 | `docktornet.gatus.<index>.url` | yes | string | — | `https://flowsync.example.com` | Endpoint to monitor. |
 | `docktornet.gatus.<index>.interval` | yes | string | — | `30s` | Check interval. |
 | `docktornet.gatus.<index>.conditions` | no | string | `[STATUS] == 200` | `[STATUS] == 200, [RESPONSE_TIME] < 500` | Comma-separated condition list. |
-| `docktornet.gatus.<index>.group` | no | string | none | `media` | Gatus group name. |
-| `docktornet.gatus.<index>.telegram` | no | bool | `true` | `false` | Send Telegram alerts. |
+| `docktornet.gatus.<index>.group` | no | string | host/machine id | `media` | Gatus dashboard group. Defaults to the machine this container runs on. |
+| `docktornet.gatus.<index>.name` | no | string | container name | `Homepage` | Display name shown in alerts/dashboard. Defaults to the container name; colliding defaults get a ` <index>` suffix. |
+| `docktornet.gatus.<index>.telegram` | no | bool | `true` | `false` | Emit a Gatus `custom` alert (used for Telegram). |
 
 ### Example
 
