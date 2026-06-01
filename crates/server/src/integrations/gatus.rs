@@ -43,21 +43,52 @@ pub fn render_gatus_yaml(
     service_id: &str,
     monitors: &[GatusMonitor],
 ) -> Result<String, serde_yaml::Error> {
+    // service_id is `{machine}/{container}`; fall back to the whole id if there
+    // is no slash. The container half is the default endpoint name; the machine
+    // half is the default group.
+    let (machine, container) = service_id.split_once('/').unwrap_or((service_id, service_id));
+
+    // Pass 1: resolve each monitor's display name (explicit name label, else the
+    // bare stack/container name).
+    let mut names: Vec<String> = monitors
+        .iter()
+        .map(|monitor| {
+            monitor
+                .name
+                .clone()
+                .unwrap_or_else(|| container.to_string())
+        })
+        .collect();
+
+    // Pass 2: any name shared by 2+ monitors gets " {index}" appended so endpoint
+    // names stay unique within the file. The raw monitor index keeps the suffix
+    // stable across restarts and label reordering.
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for name in &names {
+        *counts.entry(name.clone()).or_insert(0) += 1;
+    }
+    for (monitor, name) in monitors.iter().zip(names.iter_mut()) {
+        if counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
+            *name = format!("{name} {}", monitor.index);
+        }
+    }
+
     let file = GatusFile {
         endpoints: monitors
             .iter()
-            .map(|monitor| GatusEndpoint {
-                name: format!("{service_id}/{}", monitor.index),
+            .zip(names)
+            .map(|(monitor, name)| GatusEndpoint {
+                name,
                 group: monitor
                     .group
                     .clone()
-                    .unwrap_or_else(|| service_id.to_string()),
+                    .unwrap_or_else(|| machine.to_string()),
                 url: monitor.url.clone(),
                 interval: monitor.interval.clone(),
                 conditions: monitor.conditions.clone(),
                 alerts: if monitor.telegram {
                     vec![GatusAlert {
-                        kind: "telegram".to_string(),
+                        kind: "custom".to_string(),
                         send_on_resolved: true,
                     }]
                 } else {
@@ -148,27 +179,28 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn renders_expected_yaml_with_default_group_and_telegram_alert() {
+    fn renders_expected_yaml_with_host_group_and_custom_alert() {
         let monitors = vec![GatusMonitor {
             index: 0,
             url: "https://app.example.com".to_string(),
             interval: "30s".to_string(),
             conditions: vec!["[STATUS] == 200".to_string()],
             group: None,
+            name: None,
             telegram: true,
         }];
 
         let yaml = render_gatus_yaml("m1/app", &monitors).unwrap();
         let expected = concat!(
             "endpoints:\n",
-            "- name: m1/app/0\n",
-            "  group: m1/app\n",
+            "- name: app\n",
+            "  group: m1\n",
             "  url: https://app.example.com\n",
             "  interval: 30s\n",
             "  conditions:\n",
             "  - '[STATUS] == 200'\n",
             "  alerts:\n",
-            "  - type: telegram\n",
+            "  - type: custom\n",
             "    send-on-resolved: true\n",
         );
 
@@ -183,12 +215,13 @@ mod tests {
             interval: "30s".to_string(),
             conditions: vec!["[STATUS] == 200".to_string()],
             group: Some("media".to_string()),
+            name: None,
             telegram: true,
         }];
 
         let yaml = render_gatus_yaml("m1/app", &monitors).unwrap();
         assert!(yaml.contains("group: media\n"));
-        assert!(!yaml.contains("group: m1/app\n"));
+        assert!(!yaml.contains("group: m1\n"));
     }
 
     #[test]
@@ -199,6 +232,7 @@ mod tests {
             interval: "30s".to_string(),
             conditions: vec!["[STATUS] == 200".to_string()],
             group: None,
+            name: None,
             telegram: false,
         }];
 
@@ -217,6 +251,7 @@ mod tests {
             interval: "30s".to_string(),
             conditions: vec!["[STATUS] == 200".to_string()],
             group: None,
+            name: None,
             telegram: true,
         }];
 
@@ -279,6 +314,96 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.to_string_lossy().contains(".yaml.tmp-"));
         assert!(second.to_string_lossy().contains(".yaml.tmp-"));
+    }
+
+    #[test]
+    fn uses_name_label_verbatim_when_set() {
+        let monitors = vec![GatusMonitor {
+            index: 0,
+            url: "https://app.example.com".to_string(),
+            interval: "30s".to_string(),
+            conditions: vec!["[STATUS] == 200".to_string()],
+            group: None,
+            name: Some("Homepage".to_string()),
+            telegram: true,
+        }];
+
+        let yaml = render_gatus_yaml("m1/app", &monitors).unwrap();
+        assert!(yaml.contains("- name: Homepage\n"));
+    }
+
+    #[test]
+    fn disambiguates_colliding_default_names_with_index_suffix() {
+        let monitors = vec![
+            GatusMonitor {
+                index: 0,
+                url: "https://lan.example.com".to_string(),
+                interval: "30s".to_string(),
+                conditions: vec!["[STATUS] == 200".to_string()],
+                group: None,
+                name: None,
+                telegram: true,
+            },
+            GatusMonitor {
+                index: 1,
+                url: "https://public.example.com".to_string(),
+                interval: "30s".to_string(),
+                conditions: vec!["[STATUS] == 200".to_string()],
+                group: None,
+                name: None,
+                telegram: true,
+            },
+        ];
+
+        let yaml = render_gatus_yaml("m1/app", &monitors).unwrap();
+        assert!(yaml.contains("- name: app 0\n"));
+        assert!(yaml.contains("- name: app 1\n"));
+        assert!(!yaml.contains("- name: app\n"));
+    }
+
+    #[test]
+    fn single_monitor_has_no_index_suffix() {
+        let monitors = vec![GatusMonitor {
+            index: 0,
+            url: "https://app.example.com".to_string(),
+            interval: "30s".to_string(),
+            conditions: vec!["[STATUS] == 200".to_string()],
+            group: None,
+            name: None,
+            telegram: true,
+        }];
+
+        let yaml = render_gatus_yaml("m1/app", &monitors).unwrap();
+        assert!(yaml.contains("- name: app\n"));
+        assert!(!yaml.contains("app 0"));
+    }
+
+    #[test]
+    fn disambiguates_identical_explicit_names() {
+        let monitors = vec![
+            GatusMonitor {
+                index: 0,
+                url: "https://a.example.com".to_string(),
+                interval: "30s".to_string(),
+                conditions: vec!["[STATUS] == 200".to_string()],
+                group: None,
+                name: Some("web".to_string()),
+                telegram: true,
+            },
+            GatusMonitor {
+                index: 1,
+                url: "https://b.example.com".to_string(),
+                interval: "30s".to_string(),
+                conditions: vec!["[STATUS] == 200".to_string()],
+                group: None,
+                name: Some("web".to_string()),
+                telegram: true,
+            },
+        ];
+
+        let yaml = render_gatus_yaml("m1/app", &monitors).unwrap();
+        assert!(yaml.contains("- name: web 0\n"));
+        assert!(yaml.contains("- name: web 1\n"));
     }
 
     #[test]
