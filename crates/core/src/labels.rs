@@ -49,6 +49,7 @@ pub struct GatusMonitor {
     pub interval: String,
     pub conditions: Vec<String>,
     pub group: Option<String>,
+    pub name: Option<String>,
     pub telegram: bool,
 }
 
@@ -234,6 +235,7 @@ fn build_gatus(index: u8, fields: &BTreeMap<String, String>) -> Result<GatusMoni
     }
 
     let group = fields.get("group").cloned().filter(|g| !g.is_empty());
+    let name = fields.get("name").cloned().filter(|n| !n.is_empty());
     let telegram = match fields.get("telegram") {
         Some(value) => parse_bool(value)?,
         None => true,
@@ -245,6 +247,7 @@ fn build_gatus(index: u8, fields: &BTreeMap<String, String>) -> Result<GatusMoni
         interval,
         conditions,
         group,
+        name,
         telegram,
     })
 }
@@ -252,7 +255,7 @@ fn build_gatus(index: u8, fields: &BTreeMap<String, String>) -> Result<GatusMoni
 fn is_gatus_field(field: &str) -> bool {
     matches!(
         field,
-        "url" | "interval" | "conditions" | "group" | "telegram"
+        "url" | "interval" | "conditions" | "group" | "name" | "telegram"
     )
 }
 
@@ -518,5 +521,34 @@ mod tests {
         assert!(p.gatus.is_empty());
         assert_eq!(p.warnings.len(), 1);
         assert!(p.warnings[0].contains("gatus.0"));
+    }
+
+    #[test]
+    fn gatus_name_parsed_when_set() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.0.name", "Homepage"),
+        ]));
+        assert_eq!(p.gatus[0].name, Some("Homepage".to_string()));
+    }
+
+    #[test]
+    fn gatus_name_defaults_to_none_when_absent() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+        ]));
+        assert_eq!(p.gatus[0].name, None);
+    }
+
+    #[test]
+    fn gatus_empty_name_is_treated_as_none() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.0.name", ""),
+        ]));
+        assert_eq!(p.gatus[0].name, None);
     }
 }
