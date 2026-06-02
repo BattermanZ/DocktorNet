@@ -1,0 +1,6 @@
+target/
+docktornet-backups/
+data/
+.env
+*.db
+.git/

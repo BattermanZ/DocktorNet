@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/agent",
+    "crates/server",
+]
+
+[workspace.package]
+edition      = "2024"
+license      = "AGPL-3.0-or-later"
+authors      = ["BattermanZ"]
+repository   = "https://github.com/BattermanZ/DocktorNet"
+
+[workspace.dependencies]
+# async
+tokio            = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+# serialization
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+serde_yaml       = "0.9"
+# error handling
+thiserror        = "2"
+anyhow           = "1"
+# logging
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# config
+dotenvy          = "0.15"
+humantime-serde  = "1"
+url              = "2"
+# http
+axum             = "0.8"
+reqwest          = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# db
+sqlx             = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+# docker / podman
+bollard          = "0.18"
+
+# test-only (declared here so versions are shared)
+mockito          = "1"
+tempfile         = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

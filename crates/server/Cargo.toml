@@ -1,0 +1,41 @@
+[package]
+name         = "docktornet-server"
+version      = "1.0.0"
+edition.workspace      = true
+license.workspace      = true
+
+[[bin]]
+name = "docktornet-server"
+path = "src/main.rs"
+
+[lib]
+name = "docktornet_server"
+path = "src/lib.rs"
+
+[dependencies]
+docktornet-core = { path = "../core" }
+
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+serde_yaml  = { workspace = true }
+thiserror   = { workspace = true }
+anyhow      = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy     = { workspace = true }
+humantime-serde = { workspace = true }
+humantime   = "2"
+axum        = { workspace = true }
+reqwest     = { workspace = true }
+url         = { workspace = true }
+sqlx        = { workspace = true }
+
+[dev-dependencies]
+reqwest  = { workspace = true }
+mockito  = { workspace = true }
+tempfile = { workspace = true }
+tower    = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

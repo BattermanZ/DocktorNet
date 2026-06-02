@@ -1,0 +1,27 @@
+services:
+  docktornet-server:
+    container_name: docktornet-server
+    image: 192.168.31.233:5000/docktornet-server:latest
+    restart: unless-stopped
+    env_file: .env
+    user: "65532:65532"
+    volumes:
+      - ./data:/data
+      - /etc/gatus/config.d:/etc/gatus/config.d
+    ports:
+      - "5363:5363"
+
+  docktornet-agent:
+    container_name: docktornet-agent
+    image: 192.168.31.233:5000/docktornet-agent:latest
+    restart: unless-stopped
+    env_file: .env
+    user: "65532:65532"
+    group_add:
+      - "${DOCKER_GID:-988}"
+      - "${PODMAN_GID:-1001}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /run/user/1001/podman/podman.sock:/run/user/1001/podman/podman.sock:ro
+    depends_on:
+      - docktornet-server

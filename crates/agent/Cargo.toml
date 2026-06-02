@@ -1,0 +1,32 @@
+[package]
+name         = "docktornet-agent"
+version      = "1.0.0"
+edition.workspace      = true
+license.workspace      = true
+
+[[bin]]
+name = "docktornet-agent"
+path = "src/main.rs"
+
+[dependencies]
+docktornet-core = { path = "../core" }
+
+async-trait = "0.1"
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+anyhow      = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy     = { workspace = true }
+humantime-serde = { workspace = true }
+reqwest     = { workspace = true }
+bollard     = { workspace = true }
+
+[dev-dependencies]
+mockito  = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
