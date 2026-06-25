@@ -19,8 +19,7 @@ pub struct HealthResponse {
 }
 
 pub async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
-    let server_time =
-        humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
+    let server_time = humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
 
     let (status, agents) = match crate::storage::list_machines(state.reconciler.pool()).await {
         Ok(rows) => {
@@ -30,8 +29,7 @@ pub async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
                     machine_id,
                     forward_host,
                     last_seen: humantime::format_rfc3339_seconds(
-                        std::time::UNIX_EPOCH
-                            + std::time::Duration::from_secs(last_seen as u64),
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(last_seen as u64),
                     )
                     .to_string(),
                 })

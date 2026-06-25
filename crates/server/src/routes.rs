@@ -2,7 +2,10 @@ use axum::Router;
 use axum::routing::{get, post};
 
 use crate::auth::{AuthState, require_bearer};
-use crate::handlers::{health, snapshot::{self, AppState}};
+use crate::handlers::{
+    health,
+    snapshot::{self, AppState},
+};
 
 pub fn build(state: AppState) -> Router {
     let auth_state = AuthState {
@@ -199,7 +202,10 @@ mod tests {
             }],
         };
 
-        let resp = app.oneshot(req("POST", Some("s3cret"), &snap)).await.unwrap();
+        let resp = app
+            .oneshot(req("POST", Some("s3cret"), &snap))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         // Snapshot is durably persisted before the ack, even though the
@@ -241,6 +247,9 @@ mod tests {
             .await
             .unwrap();
         let body_str = std::str::from_utf8(&body_bytes).unwrap();
-        assert!(body_str.contains("m1"), "body should contain machine id m1: {body_str}");
+        assert!(
+            body_str.contains("m1"),
+            "body should contain machine id m1: {body_str}"
+        );
     }
 }

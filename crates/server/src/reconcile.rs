@@ -28,6 +28,17 @@ pub struct Reconciler {
     last_reconciled: Arc<Mutex<HashMap<String, u64>>>,
 }
 
+/// A service that has just left a machine's snapshot, along with the data a
+/// deferred external reconcile needs.  `npm_hosts` is captured *before*
+/// `upsert_snapshot` runs, because its cascade deletes the `npm_hosts` rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedService {
+    pub service_id: String,
+    pub last_seen: i64,
+    /// `(npm_index, npm_id)` for every NPM proxy host the service owned.
+    pub npm_hosts: Vec<(i64, i64)>,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ResyncReport {
     pub verified: usize,
@@ -69,15 +80,16 @@ fn cf_record_matches(
 /// Stable hash of the parts of a snapshot that drive the external reconcile:
 /// the machine's forward host and every opted-in container's docktornet labels.
 /// Used to skip re-reconciling a snapshot whose intent is unchanged.
-fn snapshot_intent_hash(
-    forward_host: &str,
-    containers: &[docktornet_core::ContainerEntry],
-) -> u64 {
+fn snapshot_intent_hash(forward_host: &str, containers: &[docktornet_core::ContainerEntry]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     forward_host.hash(&mut hasher);
     for container in containers {
-        if !container.labels.keys().any(|k| k.starts_with("docktornet.")) {
+        if !container
+            .labels
+            .keys()
+            .any(|k| k.starts_with("docktornet."))
+        {
             continue;
         }
         container.name.hash(&mut hasher);
@@ -177,47 +189,46 @@ impl Reconciler {
 
         // Resolve the NPM host id: an existing mapping, a fresh create, or an
         // adoption of a host that already exists in NPM.
-        let npm_id = match crate::storage::get_npm_host(&self.db, service_id, host.index.into())
-            .await?
-        {
-            Some(id) => id,
-            None => match client.create_proxy_host(token, &payload).await {
-                Ok(created) => {
-                    tracing::info!(service_id, npm_id = created.id, "npm host created");
-                    crate::storage::set_npm_host(
-                        &self.db,
-                        service_id,
-                        host.index.into(),
-                        created.id,
-                    )
-                    .await?;
-                    // A freshly created host already matches the payload.
-                    return Ok(());
-                }
-                Err(err) if self.options.adopt_existing => {
-                    let existing = client
-                        .find_proxy_host_by_domain(token, &host.host)
-                        .await
-                        .map_err(|e| ReconcileError::External(e.into()))?
-                        .ok_or_else(|| ReconcileError::External(err.into()))?;
-                    tracing::info!(service_id, npm_id = existing.id, "npm host adopted");
-                    // Persist the mapping before any further call.  If a later
-                    // step fails (e.g. NPM overloaded), the next reconcile takes
-                    // the get/update path instead of re-adopting — which would
-                    // otherwise loop forever, each adoption triggering an nginx
-                    // reload and keeping NPM pegged.
-                    crate::storage::set_npm_host(
-                        &self.db,
-                        service_id,
-                        host.index.into(),
-                        existing.id,
-                    )
-                    .await?;
-                    existing.id
-                }
-                Err(err) => return Err(ReconcileError::External(err.into())),
-            },
-        };
+        let npm_id =
+            match crate::storage::get_npm_host(&self.db, service_id, host.index.into()).await? {
+                Some(id) => id,
+                None => match client.create_proxy_host(token, &payload).await {
+                    Ok(created) => {
+                        tracing::info!(service_id, npm_id = created.id, "npm host created");
+                        crate::storage::set_npm_host(
+                            &self.db,
+                            service_id,
+                            host.index.into(),
+                            created.id,
+                        )
+                        .await?;
+                        // A freshly created host already matches the payload.
+                        return Ok(());
+                    }
+                    Err(err) if self.options.adopt_existing => {
+                        let existing = client
+                            .find_proxy_host_by_domain(token, &host.host)
+                            .await
+                            .map_err(|e| ReconcileError::External(e.into()))?
+                            .ok_or_else(|| ReconcileError::External(err.into()))?;
+                        tracing::info!(service_id, npm_id = existing.id, "npm host adopted");
+                        // Persist the mapping before any further call.  If a later
+                        // step fails (e.g. NPM overloaded), the next reconcile takes
+                        // the get/update path instead of re-adopting — which would
+                        // otherwise loop forever, each adoption triggering an nginx
+                        // reload and keeping NPM pegged.
+                        crate::storage::set_npm_host(
+                            &self.db,
+                            service_id,
+                            host.index.into(),
+                            existing.id,
+                        )
+                        .await?;
+                        existing.id
+                    }
+                    Err(err) => return Err(ReconcileError::External(err.into())),
+                },
+            };
 
         // Only update — which makes NPM regenerate its config and reload nginx —
         // when the stored host has actually drifted from the desired payload.
@@ -373,6 +384,8 @@ impl Reconciler {
         // grace period (see GATUS_REMOVAL_GRACE_SECS).
         if !self.options.dry_run {
             self.sweep_orphan_gatus_files(&expected_gatus_files).await;
+            self.sweep_pending_npm_removals(npm_ctx.as_ref(), &mut report)
+                .await;
         }
 
         tracing::info!(
@@ -419,6 +432,63 @@ impl Reconciler {
                 Err(err) => {
                     tracing::warn!(error = %err, "error reading gatus config dir entry");
                     break;
+                }
+            }
+        }
+    }
+
+    /// Prune NPM proxy hosts recorded in `pending_npm_removals` once they are
+    /// past the grace period.  This is the backstop for removals deferred by
+    /// `apply_inner` (within-grace, breaker open, or a failed delete) and for
+    /// machines that went offline entirely without a final empty snapshot.
+    async fn sweep_pending_npm_removals(
+        &self,
+        npm_ctx: Option<&(String, Vec<crate::integrations::npm::Certificate>)>,
+        report: &mut ResyncReport,
+    ) {
+        let pending = match crate::storage::list_pending_npm_removals(&self.db).await {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(error = %err, "could not list pending npm removals");
+                return;
+            }
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let Some((token, _)) = npm_ctx else {
+            // No NPM access this pass; leave the entries for the next sweep.
+            return;
+        };
+        let client = self.npm.as_ref().expect("npm_ctx implies npm client");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX);
+
+        for (service_id, npm_index, npm_id, last_seen) in pending {
+            if now.saturating_sub(last_seen) < GATUS_REMOVAL_GRACE_SECS {
+                // Still within grace (a removal that landed just before this
+                // sweep); a later sweep will pick it up.
+                continue;
+            }
+            match client.delete_proxy_host(token, npm_id).await {
+                Ok(()) => {
+                    tracing::info!(service_id, npm_id, "pending npm host pruned");
+                    if let Err(err) =
+                        crate::storage::delete_pending_npm_removal(&self.db, &service_id, npm_index)
+                            .await
+                    {
+                        tracing::warn!(service_id, error = %err, "failed to clear pending npm removal");
+                        report.failed += 1;
+                    } else {
+                        report.repaired += 1;
+                    }
+                }
+                Err(err) => {
+                    // Leave the pending row in place so the next sweep retries.
+                    tracing::warn!(service_id, npm_id, error = %err, "pending npm host prune failed");
+                    report.failed += 1;
                 }
             }
         }
@@ -569,7 +639,7 @@ impl Reconciler {
     /// is acked so the snapshot is durable even when the external reconcile is
     /// deferred.  `removed_last_seen` is captured here because `upsert_snapshot`
     /// deletes those rows.
-    async fn persist_inner(&self, snap: &Snapshot) -> Result<Vec<(String, i64)>, ReconcileError> {
+    async fn persist_inner(&self, snap: &Snapshot) -> Result<Vec<RemovedService>, ReconcileError> {
         let current_ids =
             crate::integrations::intended::intended_services(&snap.machine_id, &snap.containers)
                 .iter()
@@ -578,10 +648,26 @@ impl Reconciler {
         let removed =
             crate::storage::removed_service_ids(&self.db, snap.machine_id.as_str(), &current_ids)
                 .await?;
-        let removed_last_seen =
-            crate::storage::get_services_last_seen(&self.db, &removed).await?;
+        let removed_last_seen = crate::storage::get_services_last_seen(&self.db, &removed).await?;
+        // Capture NPM host mappings before upsert_snapshot's cascade wipes them.
+        let npm_hosts = crate::storage::get_npm_hosts_for_services(&self.db, &removed).await?;
         crate::storage::upsert_snapshot(&self.db, snap).await?;
-        Ok(removed_last_seen)
+
+        let mut hosts_by_service: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+        for (service_id, npm_index, npm_id) in npm_hosts {
+            hosts_by_service
+                .entry(service_id)
+                .or_default()
+                .push((npm_index, npm_id));
+        }
+        Ok(removed_last_seen
+            .into_iter()
+            .map(|(service_id, last_seen)| RemovedService {
+                npm_hosts: hosts_by_service.remove(&service_id).unwrap_or_default(),
+                service_id,
+                last_seen,
+            })
+            .collect())
     }
 
     /// Apply the external side effects of a snapshot: Gatus config files, NPM
@@ -593,7 +679,7 @@ impl Reconciler {
     async fn apply_inner(
         &self,
         snap: &Snapshot,
-        removed_last_seen: Vec<(String, i64)>,
+        removed: Vec<RemovedService>,
     ) -> Result<(), ReconcileError> {
         let intended =
             crate::integrations::intended::intended_services(&snap.machine_id, &snap.containers);
@@ -605,7 +691,7 @@ impl Reconciler {
         // snapshot every tick; re-running issues NPM calls (and risks reloads)
         // for nothing.  Only safe when there are no pending removals to process;
         // genuine drift is still corrected by the periodic full_resync.
-        if removed_last_seen.is_empty()
+        if removed.is_empty()
             && self.last_reconciled.lock().await.get(&machine) == Some(&intent_hash)
         {
             tracing::debug!(machine = %machine, "snapshot unchanged since last successful reconcile; skipping external reconcile");
@@ -632,22 +718,22 @@ impl Reconciler {
         // that are still within the grace period are cleaned up by
         // full_resync's orphan sweep.
         let snap_time = snap.taken_at as i64;
-        for (service_id, last_seen) in removed_last_seen {
-            let absent_secs = snap_time.saturating_sub(last_seen);
+        for rs in &removed {
+            let absent_secs = snap_time.saturating_sub(rs.last_seen);
             if absent_secs >= GATUS_REMOVAL_GRACE_SECS {
-                tracing::info!(service_id, absent_secs, "service removed");
+                tracing::info!(service_id = %rs.service_id, absent_secs, "service removed");
                 if let Err(err) = crate::integrations::gatus::remove_service_file(
                     &self.options.gatus_config_dir,
-                    &service_id,
+                    &rs.service_id,
                 )
                 .await
                 {
-                    tracing::warn!(service_id, error = %err, "gatus removal failed");
+                    tracing::warn!(service_id = %rs.service_id, error = %err, "gatus removal failed");
                     failures += 1;
                 }
             } else {
                 tracing::debug!(
-                    service_id,
+                    service_id = %rs.service_id,
                     absent_secs,
                     grace_secs = GATUS_REMOVAL_GRACE_SECS,
                     "service absent but within grace period, keeping gatus file"
@@ -659,7 +745,9 @@ impl Reconciler {
         // shared across every host below.  If the circuit breaker is open
         // (NPM has been failing), skip NPM entirely this cycle so we stop
         // adding load to a struggling dependency.
-        let needs_npm = self.npm.is_some() && intended.iter().any(|s| !s.labels.npm.is_empty());
+        let has_npm_removals = removed.iter().any(|r| !r.npm_hosts.is_empty());
+        let needs_npm = self.npm.is_some()
+            && (has_npm_removals || intended.iter().any(|s| !s.labels.npm.is_empty()));
         let now = std::time::Instant::now();
         let skip_npm = needs_npm && self.npm_breaker.is_open(now);
         if skip_npm {
@@ -682,7 +770,60 @@ impl Reconciler {
             None
         };
 
+        // Prune NPM proxy hosts for services that left the snapshot.  Past the
+        // grace period we delete immediately; within it we defer (a brief
+        // container restart should not tear down and recreate the host, which
+        // reloads nginx).  Anything we can't delete right now — within grace,
+        // breaker open, token unavailable, or a failed API call — is recorded
+        // in pending_npm_removals so the periodic resync sweep retries it.  The
+        // npm_hosts mapping has already been cascade-deleted, so that table is
+        // the only durable record of what to prune.
+        for rs in &removed {
+            let absent_secs = snap_time.saturating_sub(rs.last_seen);
+            let prune_now = absent_secs >= GATUS_REMOVAL_GRACE_SECS && !skip_npm;
+            for &(npm_index, npm_id) in &rs.npm_hosts {
+                let deleted = if prune_now {
+                    match &npm_ctx {
+                        Some((token, _)) => {
+                            let client = self.npm.as_ref().expect("npm_ctx implies npm client");
+                            match client.delete_proxy_host(token, npm_id).await {
+                                Ok(()) => {
+                                    tracing::info!(service_id = %rs.service_id, npm_id, "npm host pruned");
+                                    true
+                                }
+                                Err(err) => {
+                                    tracing::warn!(service_id = %rs.service_id, npm_id, error = %err, "npm host prune failed; deferring");
+                                    npm_failed = true;
+                                    failures += 1;
+                                    false
+                                }
+                            }
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if !deleted {
+                    crate::storage::add_pending_npm_removal(
+                        &self.db,
+                        &rs.service_id,
+                        npm_index,
+                        npm_id,
+                        rs.last_seen,
+                    )
+                    .await?;
+                }
+            }
+        }
+
         for service in &intended {
+            // A service present in the snapshot is live, so any pending NPM
+            // removal for it is stale (it briefly disappeared and came back).
+            // Drop it before reconciling so the returning host is never pruned.
+            crate::storage::clear_pending_npm_removals_for_service(&self.db, &service.service_id)
+                .await?;
+
             if !skip_npm {
                 for npm_host in &service.labels.npm {
                     match &npm_ctx {
@@ -742,7 +883,10 @@ impl Reconciler {
         // Record success only when NPM actually ran (not when skipped by the
         // breaker), so a breaker-skipped cycle still retries once it closes.
         if !skip_npm {
-            self.last_reconciled.lock().await.insert(machine, intent_hash);
+            self.last_reconciled
+                .lock()
+                .await
+                .insert(machine, intent_hash);
         }
         Ok(())
     }
@@ -809,15 +953,12 @@ impl Reconciler {
 
     pub async fn reconcile_snapshot(&self, snap: &Snapshot) -> Result<(), ReconcileError> {
         let _guard = self.lock.lock().await;
-        let removed_last_seen = self.persist_inner(snap).await?;
+        let removed = self.persist_inner(snap).await?;
         if self.options.dry_run {
-            tracing::debug!(
-                removed = removed_last_seen.len(),
-                "dry-run: would reconcile snapshot"
-            );
+            tracing::debug!(removed = removed.len(), "dry-run: would reconcile snapshot");
             return Ok(());
         }
-        self.apply_inner(snap, removed_last_seen).await
+        self.apply_inner(snap, removed).await
     }
 
     /// Persist the snapshot and return the data a deferred external reconcile
@@ -827,7 +968,7 @@ impl Reconciler {
     pub async fn ingest_snapshot(
         &self,
         snap: &Snapshot,
-    ) -> Result<Vec<(String, i64)>, ReconcileError> {
+    ) -> Result<Vec<RemovedService>, ReconcileError> {
         let _guard = self.lock.lock().await;
         self.persist_inner(snap).await
     }
@@ -837,13 +978,13 @@ impl Reconciler {
     pub async fn apply_reconcile(
         &self,
         snap: &Snapshot,
-        removed_last_seen: Vec<(String, i64)>,
+        removed: Vec<RemovedService>,
     ) -> Result<(), ReconcileError> {
         if self.options.dry_run {
             return Ok(());
         }
         let _guard = self.lock.lock().await;
-        self.apply_inner(snap, removed_last_seen).await
+        self.apply_inner(snap, removed).await
     }
 }
 
@@ -1479,6 +1620,204 @@ mod tests {
         assert_eq!(stored, Some(61));
     }
 
+    #[tokio::test]
+    async fn npm_host_deferred_to_pending_when_service_absent_within_grace() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        // A brief restart must NOT delete the proxy host.
+        let delete = npm_server
+            .mock("DELETE", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body("{}")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        let snap = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at: 100,
+            containers: vec![ContainerEntry {
+                name: "app".into(),
+                labels: npm_host_labels("a.example.com"),
+            }],
+        };
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+
+        // Service gone only 30s later — within the grace period.
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 130,
+                containers: vec![],
+            })
+            .await
+            .unwrap();
+
+        delete.assert_async().await;
+        // The host is recorded for a later sweep, carrying its original last_seen.
+        assert_eq!(
+            storage::list_pending_npm_removals(&pool).await.unwrap(),
+            vec![("m1/app".to_string(), 0, 50, 100)]
+        );
+    }
+
+    #[tokio::test]
+    async fn full_resync_prunes_pending_npm_removal_past_grace() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let delete = npm_server
+            .mock("DELETE", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        // A pending removal whose last_seen is far in the past (well past grace).
+        storage::add_pending_npm_removal(&pool, "m1/app", 0, 50, 1)
+            .await
+            .unwrap();
+
+        reconciler.full_resync().await.unwrap();
+
+        delete.assert_async().await;
+        assert!(
+            storage::list_pending_npm_removals(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_npm_removal_cleared_when_service_reappears() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        // The returning service re-creates its host; the stale pending row must
+        // never trigger a delete of the now-live host.
+        let _create = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .create_async()
+            .await;
+        let delete = npm_server
+            .mock("DELETE", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body("{}")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        // A pending removal left over from a brief disappearance.
+        storage::add_pending_npm_removal(&pool, "m1/app", 0, 50, 100)
+            .await
+            .unwrap();
+
+        // The service comes back in a fresh snapshot.
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 200,
+                containers: vec![ContainerEntry {
+                    name: "app".into(),
+                    labels: npm_host_labels("a.example.com"),
+                }],
+            })
+            .await
+            .unwrap();
+
+        delete.assert_async().await;
+        assert!(
+            storage::list_pending_npm_removals(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     fn npm_host_labels(host: &str) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
         labels.insert("docktornet.npm.0.host".to_string(), host.to_string());
@@ -1962,5 +2301,79 @@ mod tests {
         // create was attempted exactly `threshold` times, then the breaker
         // suppressed further NPM calls.
         create.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn npm_host_deleted_when_service_absent_past_grace_period() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        // The proxy host for the departed service must be deleted exactly once.
+        let delete = npm_server
+            .mock("DELETE", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        // Seed a service with a mapped NPM host id.
+        let snap = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at: 1,
+            containers: vec![ContainerEntry {
+                name: "app".into(),
+                labels: npm_host_labels("a.example.com"),
+            }],
+        };
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+
+        // Service leaves the snapshot, well past the grace period.
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: (1 + GATUS_REMOVAL_GRACE_SECS + 1) as u64,
+                containers: vec![],
+            })
+            .await
+            .unwrap();
+
+        delete.assert_async().await;
+        // Pruned outright, so nothing is left pending.
+        assert!(
+            storage::list_pending_npm_removals(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

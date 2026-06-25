@@ -71,11 +71,9 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
 }
 
 pub async fn list_machines(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, String, i64)>> {
-    sqlx::query_as(
-        "SELECT machine_id, forward_host, last_seen FROM machines ORDER BY machine_id",
-    )
-    .fetch_all(pool)
-    .await
+    sqlx::query_as("SELECT machine_id, forward_host, last_seen FROM machines ORDER BY machine_id")
+        .fetch_all(pool)
+        .await
 }
 
 pub async fn list_services_for_machine(
@@ -185,6 +183,93 @@ pub async fn delete_npm_host(
     sqlx::query("DELETE FROM npm_hosts WHERE service_id = ? AND npm_index = ?")
         .bind(service_id)
         .bind(npm_index)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Return every `(service_id, npm_index, npm_id)` mapping for the given
+/// services, ordered by `(service_id, npm_index)`.  Used to capture NPM host
+/// ids for services about to leave a snapshot, before `upsert_snapshot`'s
+/// cascade deletes the `npm_hosts` rows.
+pub async fn get_npm_hosts_for_services(
+    pool: &Pool<Sqlite>,
+    service_ids: &[String],
+) -> sqlx::Result<Vec<(String, i64, i64)>> {
+    if service_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", service_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT service_id, npm_index, npm_id FROM npm_hosts \
+         WHERE service_id IN ({placeholders}) ORDER BY service_id, npm_index"
+    );
+    let mut q = sqlx::query_as(&sql);
+    for id in service_ids {
+        q = q.bind(id);
+    }
+    q.fetch_all(pool).await
+}
+
+/// Record an NPM proxy host whose service has left a snapshot but whose grace
+/// period has not yet elapsed, so it can be pruned later by the resync sweep.
+pub async fn add_pending_npm_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    npm_index: i64,
+    npm_id: i64,
+    last_seen: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO pending_npm_removals (service_id, npm_index, npm_id, last_seen)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(service_id, npm_index) DO UPDATE SET
+             npm_id    = excluded.npm_id,
+             last_seen = excluded.last_seen"#,
+    )
+    .bind(service_id)
+    .bind(npm_index)
+    .bind(npm_id)
+    .bind(last_seen)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_pending_npm_removals(
+    pool: &Pool<Sqlite>,
+) -> sqlx::Result<Vec<(String, i64, i64, i64)>> {
+    sqlx::query_as(
+        "SELECT service_id, npm_index, npm_id, last_seen FROM pending_npm_removals \
+         ORDER BY service_id, npm_index",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn delete_pending_npm_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    npm_index: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM pending_npm_removals WHERE service_id = ? AND npm_index = ?")
+        .bind(service_id)
+        .bind(npm_index)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Drop every pending removal for a service.  Called when a service reappears,
+/// so a host that is live again is never pruned.
+pub async fn clear_pending_npm_removals_for_service(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM pending_npm_removals WHERE service_id = ?")
+        .bind(service_id)
         .execute(pool)
         .await?;
     Ok(())
@@ -447,6 +532,98 @@ mod tests {
         assert_eq!(get_npm_host(&p, "m1/app", 0).await.unwrap(), Some(58));
         delete_npm_host(&p, "m1/app", 0).await.unwrap();
         assert_eq!(get_npm_host(&p, "m1/app", 0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn lists_npm_hosts_for_a_set_of_services() {
+        let p = pool().await;
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.10".into(),
+                taken_at: 100,
+                containers: vec![entry("a", &[]), entry("b", &[])],
+            },
+        )
+        .await
+        .unwrap();
+        set_npm_host(&p, "m1/a", 0, 10).await.unwrap();
+        set_npm_host(&p, "m1/a", 1, 11).await.unwrap();
+        set_npm_host(&p, "m1/b", 0, 20).await.unwrap();
+
+        // Only the requested services are returned, ordered (service_id, index).
+        let hosts = get_npm_hosts_for_services(&p, &["m1/a".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            hosts,
+            vec![("m1/a".to_string(), 0, 10), ("m1/a".to_string(), 1, 11)]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_npm_hosts_for_services_returns_empty_for_empty_input() {
+        let p = pool().await;
+        let hosts = get_npm_hosts_for_services(&p, &[]).await.unwrap();
+        assert!(hosts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_npm_removals_round_trip() {
+        let p = pool().await;
+        // No FK to services: pending rows must survive after the service is gone.
+        add_pending_npm_removal(&p, "m1/a", 0, 10, 100)
+            .await
+            .unwrap();
+        add_pending_npm_removal(&p, "m1/a", 1, 11, 100)
+            .await
+            .unwrap();
+        add_pending_npm_removal(&p, "m1/b", 0, 20, 150)
+            .await
+            .unwrap();
+
+        let pending = list_pending_npm_removals(&p).await.unwrap();
+        assert_eq!(
+            pending,
+            vec![
+                ("m1/a".to_string(), 0, 10, 100),
+                ("m1/a".to_string(), 1, 11, 100),
+                ("m1/b".to_string(), 0, 20, 150),
+            ]
+        );
+
+        // Deleting a single (service, index) entry leaves the rest.
+        delete_pending_npm_removal(&p, "m1/a", 0).await.unwrap();
+        let pending = list_pending_npm_removals(&p).await.unwrap();
+        assert_eq!(
+            pending,
+            vec![
+                ("m1/a".to_string(), 1, 11, 100),
+                ("m1/b".to_string(), 0, 20, 150),
+            ]
+        );
+
+        // Clearing by service removes all of that service's pending entries.
+        clear_pending_npm_removals_for_service(&p, "m1/a")
+            .await
+            .unwrap();
+        let pending = list_pending_npm_removals(&p).await.unwrap();
+        assert_eq!(pending, vec![("m1/b".to_string(), 0, 20, 150)]);
+    }
+
+    #[tokio::test]
+    async fn add_pending_npm_removal_upserts_on_conflict() {
+        let p = pool().await;
+        add_pending_npm_removal(&p, "m1/a", 0, 10, 100)
+            .await
+            .unwrap();
+        // Same (service, index) again updates npm_id/last_seen rather than erroring.
+        add_pending_npm_removal(&p, "m1/a", 0, 99, 200)
+            .await
+            .unwrap();
+        let pending = list_pending_npm_removals(&p).await.unwrap();
+        assert_eq!(pending, vec![("m1/a".to_string(), 0, 99, 200)]);
     }
 
     #[tokio::test]

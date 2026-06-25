@@ -65,7 +65,10 @@ mod tests {
         let t0 = Instant::now();
         b.record_failure(t0);
         b.record_failure(t0);
-        assert!(!b.is_open(t0), "two failures with threshold 3 must stay closed");
+        assert!(
+            !b.is_open(t0),
+            "two failures with threshold 3 must stay closed"
+        );
     }
 
     #[test]
