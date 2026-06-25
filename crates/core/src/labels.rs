@@ -16,7 +16,10 @@ pub struct ParsedLabels {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NpmHost {
     pub index: u8,
-    pub host: String,
+    /// One or more public domain names that resolve to this single NPM proxy
+    /// host. Written as a comma-separated `host` label; a single domain is the
+    /// common case. NPM stores these as one entry's `domain_names`.
+    pub hosts: Vec<String>,
     pub port: u16,
     pub scheme: NpmScheme,
     pub ssl: bool,
@@ -148,7 +151,16 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
 }
 
 fn build_npm_host(index: u8, fields: &BTreeMap<String, String>) -> Result<NpmHost, String> {
-    let host = fields.get("host").ok_or("missing host")?.clone();
+    let hosts: Vec<String> = fields
+        .get("host")
+        .ok_or("missing host")?
+        .split(',')
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .collect();
+    if hosts.is_empty() {
+        return Err("missing host".to_string());
+    }
     let port = fields
         .get("port")
         .ok_or("missing port")?
@@ -174,7 +186,7 @@ fn build_npm_host(index: u8, fields: &BTreeMap<String, String>) -> Result<NpmHos
 
     Ok(NpmHost {
         index,
-        host,
+        hosts,
         port,
         scheme,
         ssl,
@@ -298,7 +310,7 @@ mod tests {
         assert_eq!(p.npm.len(), 1);
         let h = &p.npm[0];
         assert_eq!(h.index, 0);
-        assert_eq!(h.host, "a.example.com");
+        assert_eq!(h.hosts, vec!["a.example.com".to_string()]);
         assert_eq!(h.port, 3000);
         assert_eq!(h.scheme, NpmScheme::Http);
         assert!(h.ssl);
@@ -308,6 +320,35 @@ mod tests {
         assert_eq!(h.websockets, None);
         assert_eq!(h.cert_id, None);
         assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn npm_host_splits_comma_separated_domains_into_one_entry() {
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", "a.example.com, b.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "true"),
+        ]));
+        assert_eq!(p.npm.len(), 1);
+        assert_eq!(
+            p.npm[0].hosts,
+            vec!["a.example.com".to_string(), "b.example.com".to_string()]
+        );
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn npm_host_with_only_separators_emits_warning_and_skips() {
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", " , , "),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "true"),
+        ]));
+        assert!(p.npm.is_empty());
+        assert_eq!(p.warnings.len(), 1);
+        assert!(p.warnings[0].contains("npm.0"));
     }
 
     #[test]

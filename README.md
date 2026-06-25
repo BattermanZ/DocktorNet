@@ -28,9 +28,21 @@ Boolean fields accept `true`/`1`/`yes` or `false`/`0`/`no`.
 `<index>` is an integer (`0`, `1`, …) so a single container can publish
 multiple proxy hosts.
 
+To route **several public domains to the same upstream as one NPM entry**, give
+`host` a comma-separated list (e.g. `app.example.com,app.mydomain.org`). All
+domains share that entry's port, scheme, SSL and certificate. Use a separate
+`<index>` only when you need a different upstream or settings.
+
+> **Certificates:** NPM stores one certificate per proxy host. Cert resolution
+> matches on the first listed domain that has a cert, and adoption of an
+> existing host matches on any of the listed domains. If your domains need
+> *different* certificates, use a separate `<index>` per domain instead. Domains
+> covered by a single wildcard/SAN cert (the usual reason to group them) work as
+> one entry.
+
 | Label | Required | Type | Default | Example | Notes |
 |-------|----------|------|---------|---------|-------|
-| `docktornet.npm.<index>.host` | yes | string | — | `flowsync.example.com` | Public hostname (FQDN). |
+| `docktornet.npm.<index>.host` | yes | string (comma-separated) | — | `flowsync.example.com` | One or more public hostnames (FQDN) on a single proxy host. Comma-separated for multiple domains. |
 | `docktornet.npm.<index>.port` | yes | u16 | — | `8080` | Upstream port. |
 | `docktornet.npm.<index>.scheme` | yes | `http` \| `https` | — | `http` | Upstream scheme. |
 | `docktornet.npm.<index>.ssl` | yes | bool | — | `true` | Enable SSL on the proxy host. |

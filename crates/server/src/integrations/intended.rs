@@ -68,6 +68,6 @@ mod tests {
         );
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].service_id, "m1/app");
-        assert_eq!(services[0].labels.npm[0].host, "app.example.com");
+        assert_eq!(services[0].labels.npm[0].hosts, vec!["app.example.com"]);
     }
 }

@@ -184,7 +184,7 @@ impl Reconciler {
         let cert_id = host
             .cert_id
             .map(i64::from)
-            .or_else(|| crate::integrations::npm::matching_cert_id(&host.host, certs));
+            .or_else(|| crate::integrations::npm::matching_cert_id_for_hosts(&host.hosts, certs));
         let payload = crate::integrations::npm::proxy_payload(host, forward_host, cert_id);
 
         // Resolve the NPM host id: an existing mapping, a fresh create, or an
@@ -207,7 +207,7 @@ impl Reconciler {
                     }
                     Err(err) if self.options.adopt_existing => {
                         let existing = client
-                            .find_proxy_host_by_domain(token, &host.host)
+                            .find_proxy_host_by_any_domain(token, &host.hosts)
                             .await
                             .map_err(|e| ReconcileError::External(e.into()))?
                             .ok_or_else(|| ReconcileError::External(err.into()))?;
@@ -526,7 +526,7 @@ impl Reconciler {
         let desired_cert = host
             .cert_id
             .map(i64::from)
-            .or_else(|| crate::integrations::npm::matching_cert_id(&host.host, certs));
+            .or_else(|| crate::integrations::npm::matching_cert_id_for_hosts(&host.hosts, certs));
         let payload = crate::integrations::npm::proxy_payload(host, forward_host, desired_cert);
 
         match existing {

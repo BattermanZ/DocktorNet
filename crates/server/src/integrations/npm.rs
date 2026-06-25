@@ -214,6 +214,18 @@ impl NpmClient {
         token: &str,
         domain: &str,
     ) -> Result<Option<ProxyHostResponse>, NpmError> {
+        self.find_proxy_host_by_any_domain(token, std::slice::from_ref(&domain.to_string()))
+            .await
+    }
+
+    /// Like `find_proxy_host_by_domain` but matches if *any* of `domains` is
+    /// present on an existing host. A proxy host with several domain names is
+    /// one NPM entry, so finding it by any of its domains lets us adopt it.
+    pub async fn find_proxy_host_by_any_domain(
+        &self,
+        token: &str,
+        domains: &[String],
+    ) -> Result<Option<ProxyHostResponse>, NpmError> {
         let resp = self
             .http
             .get(self.endpoint("api/nginx/proxy-hosts"))
@@ -224,9 +236,11 @@ impl NpmClient {
 
         let hosts = resp.json::<Vec<ProxyHostResponse>>().await?;
         Ok(hosts.into_iter().find(|host| {
-            host.domain_names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(domain))
+            host.domain_names.iter().any(|name| {
+                domains
+                    .iter()
+                    .any(|domain| name.eq_ignore_ascii_case(domain))
+            })
         }))
     }
 
@@ -279,7 +293,7 @@ pub fn proxy_payload(
     let http2_support = ssl_enabled && host.http2.unwrap_or(true);
 
     ProxyHostPayload {
-        domain_names: vec![host.host.clone()],
+        domain_names: host.hosts.clone(),
         forward_scheme: match host.scheme {
             NpmScheme::Http => "http".to_string(),
             NpmScheme::Https => "https".to_string(),
@@ -302,6 +316,15 @@ pub fn proxy_payload(
             "dns_challenge": false,
         }),
     }
+}
+
+/// Resolve a certificate for a proxy host that may carry several domains. NPM
+/// stores one certificate per proxy host, so we pick the first domain that has
+/// a matching (exact, then wildcard) cert.
+pub fn matching_cert_id_for_hosts(hosts: &[String], certs: &[Certificate]) -> Option<i64> {
+    hosts
+        .iter()
+        .find_map(|host| matching_cert_id(host, certs))
 }
 
 pub fn matching_cert_id(host: &str, certs: &[Certificate]) -> Option<i64> {
@@ -364,7 +387,7 @@ mod tests {
     fn host() -> NpmHost {
         NpmHost {
             index: 0,
-            host: "app.example.com".to_string(),
+            hosts: vec!["app.example.com".to_string()],
             port: 3000,
             scheme: NpmScheme::Http,
             ssl: true,
@@ -405,6 +428,29 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn payload_carries_every_domain_on_one_entry() {
+        let mut multi = host();
+        multi.hosts = vec!["app.example.com".to_string(), "app.mydomain.org".to_string()];
+        let payload = proxy_payload(&multi, "web.internal", Some(42));
+
+        assert_eq!(
+            payload.domain_names,
+            vec!["app.example.com".to_string(), "app.mydomain.org".to_string()]
+        );
+    }
+
+    #[test]
+    fn cert_for_hosts_matches_on_a_later_domain() {
+        let certs = vec![Certificate {
+            id: 9,
+            domain_names: vec!["app.mydomain.org".to_string()],
+        }];
+        let hosts = vec!["app.example.com".to_string(), "app.mydomain.org".to_string()];
+
+        assert_eq!(matching_cert_id_for_hosts(&hosts, &certs), Some(9));
     }
 
     #[test]
