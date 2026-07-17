@@ -82,6 +82,14 @@ pub enum ReconcileError {
     Db(#[from] sqlx::Error),
     #[error("external integration error: {0}")]
     External(#[from] anyhow::Error),
+    #[error(
+        "NPM host {service_id} (index {index}) requested ssl=true but no certificate resolved for {hosts:?}; refusing to publish over plain HTTP"
+    )]
+    SslWithoutCertificate {
+        service_id: String,
+        index: u8,
+        hosts: Vec<String>,
+    },
 }
 
 /// Gatus files for containers that temporarily disappear from a snapshot (e.g.
@@ -210,6 +218,24 @@ impl Reconciler {
             .cert_id
             .map(i64::from)
             .or_else(|| crate::integrations::npm::matching_cert_id_for_hosts(&host.hosts, certs));
+
+        // ssl=true but no certificate resolved would silently publish the
+        // hostname over plain HTTP (ssl_forced/hsts/http2 all disabled). Fail
+        // this host loudly instead of inverting the operator's TLS intent.
+        if host.ssl && cert_id.unwrap_or_default() <= 0 {
+            tracing::error!(
+                service_id,
+                index = host.index,
+                hosts = ?host.hosts,
+                "NPM host requested ssl=true but no certificate resolved; refusing to publish over plain HTTP"
+            );
+            return Err(ReconcileError::SslWithoutCertificate {
+                service_id: service_id.to_string(),
+                index: host.index,
+                hosts: host.hosts.clone(),
+            });
+        }
+
         let payload = crate::integrations::npm::proxy_payload(host, forward_host, cert_id);
 
         // Resolve the NPM host id: an existing mapping, a fresh create, or an
@@ -611,6 +637,23 @@ impl Reconciler {
             .cert_id
             .map(i64::from)
             .or_else(|| crate::integrations::npm::matching_cert_id_for_hosts(&host.hosts, certs));
+
+        // Same guard as reconcile_npm: never silently republish an ssl=true host
+        // over plain HTTP because its certificate no longer resolves.
+        if host.ssl && desired_cert.unwrap_or_default() <= 0 {
+            tracing::error!(
+                service_id,
+                index = host.index,
+                hosts = ?host.hosts,
+                "NPM host requested ssl=true but no certificate resolved; refusing to publish over plain HTTP"
+            );
+            return Err(ReconcileError::SslWithoutCertificate {
+                service_id: service_id.to_string(),
+                index: host.index,
+                hosts: host.hosts.clone(),
+            });
+        }
+
         let payload = crate::integrations::npm::proxy_payload(host, forward_host, desired_cert);
 
         match existing {
@@ -2683,6 +2726,73 @@ mod tests {
         create_b.assert_async().await;
         // The failure is still surfaced (for logging), not silently swallowed.
         assert!(result.is_err(), "partial failure should be reported");
+    }
+
+    #[tokio::test]
+    async fn npm_ssl_without_matching_certificate_does_not_publish_plaintext() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // NPM has no certificates, so ssl=true cannot resolve to a cert.
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // The proxy host must NOT be created over plain HTTP when TLS was
+        // requested but no certificate matched the hostname.
+        let create = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"{"id":1,"domain_names":["app.example.com"]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool,
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        let mut labels = npm_host_labels("app.example.com");
+        labels.insert("docktornet.npm.0.ssl".to_string(), "true".to_string());
+
+        let result = reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 1,
+                containers: vec![ContainerEntry {
+                    name: "app".into(),
+                    labels,
+                }],
+            })
+            .await;
+
+        // TLS was requested but no cert resolved: reconcile must fail loudly
+        // rather than silently publishing an HTTP-only proxy host.
+        assert!(
+            result.is_err(),
+            "ssl=true with no matching certificate must not silently downgrade to plaintext"
+        );
+        create.assert_async().await;
     }
 
     #[tokio::test]
