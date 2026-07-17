@@ -75,7 +75,7 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
         let parts: Vec<&str> = rest.split('.').collect();
 
         match parts.as_slice() {
-            ["npm", idx, field] => match idx.parse::<u8>() {
+            ["npm", idx, field] => match parse_canonical_index(idx) {
                 Ok(index) => {
                     if is_npm_field(field) {
                         npm_groups
@@ -92,7 +92,7 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
                     .warnings
                     .push(format!("invalid npm index in key '{key}'")),
             },
-            ["gatus", idx, field] => match idx.parse::<u8>() {
+            ["gatus", idx, field] => match parse_canonical_index(idx) {
                 Ok(index) => {
                     if is_gatus_field(field) {
                         gatus_groups
@@ -153,6 +153,20 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
     out.gatus.sort_by_key(|monitor| monitor.index);
 
     out
+}
+
+/// Parse an index token, requiring it to be in canonical decimal form so that
+/// non-canonical spellings (e.g. "00", "01") cannot collide with their
+/// canonical counterparts ("0", "1") and silently merge two distinct label
+/// groups into one — dropping a public hostname. The u8 value is used as the
+/// stable NPM host key, so it must round-trip exactly.
+fn parse_canonical_index(idx: &str) -> Result<u8, ()> {
+    let index = idx.parse::<u8>().map_err(|_| ())?;
+    if idx == index.to_string() {
+        Ok(index)
+    } else {
+        Err(())
+    }
 }
 
 fn build_npm_host(
@@ -485,6 +499,53 @@ mod tests {
         // the operator still gets a signal for each degraded field
         assert_eq!(p.warnings.len(), 2);
         assert!(p.warnings.iter().all(|w| w.contains("npm.0")));
+    }
+
+    #[test]
+    fn npm_non_canonical_index_does_not_collide_with_canonical() {
+        // "0" and "00" both parse to 0u8, which previously merged two distinct
+        // label groups into a single NPM host, silently dropping a public
+        // hostname. The canonical "0" host must survive; the non-canonical
+        // "00" group must be rejected with a warning rather than overwriting it.
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", "a.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "true"),
+            ("docktornet.npm.00.host", "b.example.com"),
+            ("docktornet.npm.00.port", "4000"),
+            ("docktornet.npm.00.scheme", "http"),
+            ("docktornet.npm.00.ssl", "true"),
+        ]));
+        assert_eq!(p.npm.len(), 1, "canonical host must not be merged away");
+        assert_eq!(p.npm[0].hosts, vec!["a.example.com".to_string()]);
+        assert_eq!(p.npm[0].port, 3000);
+        assert!(
+            p.warnings.iter().any(|w| w.contains("00")),
+            "non-canonical index must produce a warning, got {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn gatus_non_canonical_index_does_not_collide_with_canonical() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://a"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.00.url", "https://b"),
+            ("docktornet.gatus.00.interval", "60s"),
+        ]));
+        assert_eq!(
+            p.gatus.len(),
+            1,
+            "canonical monitor must not be merged away"
+        );
+        assert_eq!(p.gatus[0].url, "https://a");
+        assert!(
+            p.warnings.iter().any(|w| w.contains("00")),
+            "non-canonical index must produce a warning, got {:?}",
+            p.warnings
+        );
     }
 
     #[test]
