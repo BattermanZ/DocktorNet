@@ -340,6 +340,13 @@ impl Reconciler {
                 }
             };
             let parsed = docktornet_core::labels::parse(&raw);
+            if !parsed.warnings.is_empty() {
+                tracing::warn!(
+                    service_id,
+                    warnings = ?parsed.warnings,
+                    "malformed docktornet labels during resync; affected resources will not be reconciled"
+                );
+            }
 
             for host in &parsed.npm {
                 if let Err(err) = self
