@@ -275,6 +275,74 @@ pub async fn clear_pending_npm_removals_for_service(
     Ok(())
 }
 
+/// Return every `(service_id, record_id)` Cloudflare mapping for the given
+/// services, ordered by `service_id`.  Used to capture DNS record ids for
+/// services about to leave a snapshot, before `upsert_snapshot`'s cascade
+/// deletes the `cf_dns_records` rows.
+pub async fn get_cf_records_for_services(
+    pool: &Pool<Sqlite>,
+    service_ids: &[String],
+) -> sqlx::Result<Vec<(String, String)>> {
+    if service_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", service_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT service_id, record_id FROM cf_dns_records \
+         WHERE service_id IN ({placeholders}) ORDER BY service_id"
+    );
+    let mut q = sqlx::query_as(&sql);
+    for id in service_ids {
+        q = q.bind(id);
+    }
+    q.fetch_all(pool).await
+}
+
+/// Record a Cloudflare DNS record whose service has left a snapshot but whose
+/// grace period has not yet elapsed (or whose deletion failed), so it can be
+/// deleted later by the resync sweep.
+pub async fn add_pending_cf_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    record_id: &str,
+    last_seen: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO pending_cf_removals (service_id, record_id, last_seen)
+           VALUES (?, ?, ?)
+           ON CONFLICT(service_id) DO UPDATE SET
+             record_id = excluded.record_id,
+             last_seen = excluded.last_seen"#,
+    )
+    .bind(service_id)
+    .bind(record_id)
+    .bind(last_seen)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_pending_cf_removals(
+    pool: &Pool<Sqlite>,
+) -> sqlx::Result<Vec<(String, String, i64)>> {
+    sqlx::query_as(
+        "SELECT service_id, record_id, last_seen FROM pending_cf_removals \
+         ORDER BY service_id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn delete_pending_cf_removal(pool: &Pool<Sqlite>, service_id: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM pending_cf_removals WHERE service_id = ?")
+        .bind(service_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn get_cf_dns_record(
     pool: &Pool<Sqlite>,
     service_id: &str,
@@ -743,5 +811,77 @@ mod tests {
         );
         delete_cf_dns_record(&p, "m1/app").await.unwrap();
         assert_eq!(get_cf_dns_record(&p, "m1/app").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn lists_cf_records_for_a_set_of_services() {
+        let p = pool().await;
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.10".into(),
+                taken_at: 100,
+                containers: vec![entry("a", &[]), entry("b", &[])],
+            },
+        )
+        .await
+        .unwrap();
+        set_cf_dns_record(&p, "m1/a", "rec-a").await.unwrap();
+        set_cf_dns_record(&p, "m1/b", "rec-b").await.unwrap();
+
+        // Only the requested services are returned.
+        let records = get_cf_records_for_services(&p, &["m1/a".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(records, vec![("m1/a".to_string(), "rec-a".to_string())]);
+
+        // Empty input short-circuits to an empty result.
+        assert!(
+            get_cf_records_for_services(&p, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_cf_removals_round_trip() {
+        let p = pool().await;
+        // No FK to services: pending rows must survive after the service is gone.
+        add_pending_cf_removal(&p, "m1/a", "rec-a", 100)
+            .await
+            .unwrap();
+        add_pending_cf_removal(&p, "m1/b", "rec-b", 150)
+            .await
+            .unwrap();
+
+        let pending = list_pending_cf_removals(&p).await.unwrap();
+        assert_eq!(
+            pending,
+            vec![
+                ("m1/a".to_string(), "rec-a".to_string(), 100),
+                ("m1/b".to_string(), "rec-b".to_string(), 150),
+            ]
+        );
+
+        // Re-adding the same service upserts record_id/last_seen rather than erroring.
+        add_pending_cf_removal(&p, "m1/a", "rec-a2", 200)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_pending_cf_removals(&p).await.unwrap(),
+            vec![
+                ("m1/a".to_string(), "rec-a2".to_string(), 200),
+                ("m1/b".to_string(), "rec-b".to_string(), 150),
+            ]
+        );
+
+        // Deleting by service removes that service's pending entry.
+        delete_pending_cf_removal(&p, "m1/a").await.unwrap();
+        assert_eq!(
+            list_pending_cf_removals(&p).await.unwrap(),
+            vec![("m1/b".to_string(), "rec-b".to_string(), 150)]
+        );
     }
 }

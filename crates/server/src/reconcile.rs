@@ -37,6 +37,10 @@ pub struct RemovedService {
     pub last_seen: i64,
     /// `(npm_index, npm_id)` for every NPM proxy host the service owned.
     pub npm_hosts: Vec<(i64, i64)>,
+    /// The Cloudflare DNS `record_id` the service owned, captured before the
+    /// `cf_dns_records` cascade wipes it, so the public record can still be
+    /// deleted after the service row is gone.
+    pub cf_record: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -386,6 +390,7 @@ impl Reconciler {
             self.sweep_orphan_gatus_files(&expected_gatus_files).await;
             self.sweep_pending_npm_removals(npm_ctx.as_ref(), &mut report)
                 .await;
+            self.sweep_pending_cf_removals(&mut report).await;
         }
 
         tracing::info!(
@@ -488,6 +493,57 @@ impl Reconciler {
                 Err(err) => {
                     // Leave the pending row in place so the next sweep retries.
                     tracing::warn!(service_id, npm_id, error = %err, "pending npm host prune failed");
+                    report.failed += 1;
+                }
+            }
+        }
+    }
+
+    /// Delete Cloudflare DNS records recorded in `pending_cf_removals` once they
+    /// are past the grace period.  This is the backstop for removals deferred by
+    /// `apply_inner` (within-grace, no client, or a failed delete) and for
+    /// machines that went offline entirely without a final empty snapshot.
+    async fn sweep_pending_cf_removals(&self, report: &mut ResyncReport) {
+        let pending = match crate::storage::list_pending_cf_removals(&self.db).await {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(error = %err, "could not list pending cf removals");
+                return;
+            }
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let Some(client) = &self.cloudflare else {
+            // No Cloudflare access this pass; leave the entries for the next sweep.
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX);
+
+        for (service_id, record_id, last_seen) in pending {
+            if now.saturating_sub(last_seen) < GATUS_REMOVAL_GRACE_SECS {
+                // Still within grace (a removal that landed just before this
+                // sweep); a later sweep will pick it up.
+                continue;
+            }
+            match client.delete_record(&record_id).await {
+                Ok(()) => {
+                    tracing::info!(service_id, record_id = %record_id, "pending cf record deleted");
+                    if let Err(err) =
+                        crate::storage::delete_pending_cf_removal(&self.db, &service_id).await
+                    {
+                        tracing::warn!(service_id, error = %err, "failed to clear pending cf removal");
+                        report.failed += 1;
+                    } else {
+                        report.repaired += 1;
+                    }
+                }
+                Err(err) => {
+                    // Leave the pending row in place so the next sweep retries.
+                    tracing::warn!(service_id, record_id = %record_id, error = %err, "pending cf record delete failed");
                     report.failed += 1;
                 }
             }
@@ -649,8 +705,10 @@ impl Reconciler {
             crate::storage::removed_service_ids(&self.db, snap.machine_id.as_str(), &current_ids)
                 .await?;
         let removed_last_seen = crate::storage::get_services_last_seen(&self.db, &removed).await?;
-        // Capture NPM host mappings before upsert_snapshot's cascade wipes them.
+        // Capture NPM host + Cloudflare record mappings before upsert_snapshot's
+        // cascade wipes them.
         let npm_hosts = crate::storage::get_npm_hosts_for_services(&self.db, &removed).await?;
+        let cf_records = crate::storage::get_cf_records_for_services(&self.db, &removed).await?;
         crate::storage::upsert_snapshot(&self.db, snap).await?;
 
         let mut hosts_by_service: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
@@ -660,10 +718,15 @@ impl Reconciler {
                 .or_default()
                 .push((npm_index, npm_id));
         }
+        let mut cf_by_service: HashMap<String, String> = HashMap::new();
+        for (service_id, record_id) in cf_records {
+            cf_by_service.insert(service_id, record_id);
+        }
         Ok(removed_last_seen
             .into_iter()
             .map(|(service_id, last_seen)| RemovedService {
                 npm_hosts: hosts_by_service.remove(&service_id).unwrap_or_default(),
+                cf_record: cf_by_service.remove(&service_id),
                 service_id,
                 last_seen,
             })
@@ -817,12 +880,58 @@ impl Reconciler {
             }
         }
 
+        // Delete Cloudflare DNS records for services that left the snapshot.
+        // Past the grace period we delete immediately; within it we defer (a
+        // brief container restart should not tear down a live public record).
+        // Anything we can't delete right now — within grace, no client, or a
+        // failed API call — is recorded in pending_cf_removals so the periodic
+        // resync sweep retries it.  The cf_dns_records mapping has already been
+        // cascade-deleted, so that table is the only durable record of what to
+        // delete.
+        for rs in &removed {
+            let Some(record_id) = &rs.cf_record else {
+                continue;
+            };
+            let absent_secs = snap_time.saturating_sub(rs.last_seen);
+            let delete_now = absent_secs >= GATUS_REMOVAL_GRACE_SECS;
+            let deleted = if delete_now {
+                match &self.cloudflare {
+                    Some(client) => match client.delete_record(record_id).await {
+                        Ok(()) => {
+                            tracing::info!(service_id = %rs.service_id, record_id = %record_id, "cf record deleted");
+                            true
+                        }
+                        Err(err) => {
+                            tracing::warn!(service_id = %rs.service_id, record_id = %record_id, error = %err, "cf record delete failed; deferring");
+                            failures += 1;
+                            false
+                        }
+                    },
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !deleted {
+                crate::storage::add_pending_cf_removal(
+                    &self.db,
+                    &rs.service_id,
+                    record_id,
+                    rs.last_seen,
+                )
+                .await?;
+            }
+        }
+
         for service in &intended {
             // A service present in the snapshot is live, so any pending NPM
             // removal for it is stale (it briefly disappeared and came back).
             // Drop it before reconciling so the returning host is never pruned.
             crate::storage::clear_pending_npm_removals_for_service(&self.db, &service.service_id)
                 .await?;
+            // Likewise for a pending Cloudflare removal: a returning service's
+            // record must never be deleted.
+            crate::storage::delete_pending_cf_removal(&self.db, &service.service_id).await?;
 
             if !skip_npm {
                 for npm_host in &service.labels.npm {
@@ -1845,6 +1954,283 @@ mod tests {
             },
         );
         (npm, cf)
+    }
+
+    /// Build NPM + Cloudflare clients where Cloudflare targets a mock server so
+    /// its DNS calls can be asserted (NPM points at `npm_url`, unused unless the
+    /// snapshot carries NPM labels).
+    fn test_clients_with_cf(
+        npm_url: &str,
+        cf_base: &str,
+    ) -> (
+        crate::integrations::npm::NpmClient,
+        crate::integrations::cloudflare::CloudflareClient,
+    ) {
+        let npm = crate::integrations::npm::NpmClient::new(crate::config::NpmConfig {
+            url: url::Url::parse(npm_url).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let cf = crate::integrations::cloudflare::CloudflareClient::with_base_url(
+            crate::config::CloudflareConfig {
+                api_token: "t".into(),
+                zone_id: "z".into(),
+            },
+            cf_base,
+        );
+        (npm, cf)
+    }
+
+    fn cf_dns_labels(name: &str, target: &str) -> BTreeMap<String, String> {
+        let mut labels = BTreeMap::new();
+        labels.insert("docktornet.cf.dns.name".to_string(), name.to_string());
+        labels.insert("docktornet.cf.dns.target".to_string(), target.to_string());
+        labels.insert("docktornet.cf.dns.proxied".to_string(), "false".to_string());
+        labels
+    }
+
+    #[tokio::test]
+    async fn cf_record_deleted_when_service_removed_past_grace() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut cf_server = mockito::Server::new_async().await;
+        // The orphaned record must be deleted from Cloudflare.
+        let delete = cf_server
+            .mock("DELETE", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(r#"{"success":true}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients_with_cf(&cf_server.url(), &cf_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        // Seed a service that owns a Cloudflare DNS record.
+        let snap = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at: 1,
+            containers: vec![ContainerEntry {
+                name: "app".into(),
+                labels: cf_dns_labels("app", "home.example.com"),
+            }],
+        };
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
+            .await
+            .unwrap();
+
+        // The container is decommissioned: an empty snapshot, well past grace.
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: (1 + GATUS_REMOVAL_GRACE_SECS + 1) as u64,
+                containers: vec![],
+            })
+            .await
+            .unwrap();
+
+        delete.assert_async().await;
+        assert_eq!(
+            storage::get_cf_dns_record(&pool, "m1/app").await.unwrap(),
+            None,
+            "cf record mapping must be cleared after deletion"
+        );
+        assert!(
+            storage::list_pending_cf_removals(&pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no pending removal should remain once the record is deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cf_record_deferred_to_pending_when_service_absent_within_grace() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut cf_server = mockito::Server::new_async().await;
+        // A brief restart must NOT delete the record.
+        let delete = cf_server
+            .mock("DELETE", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(r#"{"success":true}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients_with_cf(&cf_server.url(), &cf_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        let snap = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at: 100,
+            containers: vec![ContainerEntry {
+                name: "app".into(),
+                labels: cf_dns_labels("app", "home.example.com"),
+            }],
+        };
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
+            .await
+            .unwrap();
+
+        // Gone only 30s later — within grace.
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 130,
+                containers: vec![],
+            })
+            .await
+            .unwrap();
+
+        delete.assert_async().await;
+        assert_eq!(
+            storage::list_pending_cf_removals(&pool).await.unwrap(),
+            vec![("m1/app".to_string(), "rec-1".to_string(), 100)],
+            "the record must be recorded for a later sweep, carrying its last_seen"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_resync_prunes_pending_cf_removal_past_grace() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut cf_server = mockito::Server::new_async().await;
+        let delete = cf_server
+            .mock("DELETE", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(r#"{"success":true}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients_with_cf(&cf_server.url(), &cf_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        // A pending removal whose last_seen is far in the past (well past grace).
+        storage::add_pending_cf_removal(&pool, "m1/app", "rec-1", 1)
+            .await
+            .unwrap();
+
+        reconciler.full_resync().await.unwrap();
+
+        delete.assert_async().await;
+        assert!(
+            storage::list_pending_cf_removals(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_cf_removal_cleared_when_service_reappears() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut cf_server = mockito::Server::new_async().await;
+        // Zone lookup for the returning service's reconcile.
+        let _zone = cf_server
+            .mock("GET", "/zones/z")
+            .with_status(200)
+            .with_body(r#"{"success":true,"result":{"id":"z","name":"example.com"}}"#)
+            .create_async()
+            .await;
+        // The returning service re-creates its record (the old mapping was
+        // cascade-deleted when the service left); the stale pending row must
+        // never trigger a delete.
+        let _create = cf_server
+            .mock("POST", "/zones/z/dns_records")
+            .with_status(200)
+            .with_body(
+                r#"{"success":true,"result":{"id":"rec-2","name":"app.example.com","content":"home.example.com","proxied":false}}"#,
+            )
+            .create_async()
+            .await;
+        let delete = cf_server
+            .mock("DELETE", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(r#"{"success":true}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients_with_cf(&cf_server.url(), &cf_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        // A pending removal left over from a brief disappearance.  The
+        // cf_dns_records mapping is already gone (cascade-deleted), so the
+        // pending row is the only durable record.
+        storage::add_pending_cf_removal(&pool, "m1/app", "rec-1", 100)
+            .await
+            .unwrap();
+
+        // The service comes back in a fresh snapshot.
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 200,
+                containers: vec![ContainerEntry {
+                    name: "app".into(),
+                    labels: cf_dns_labels("app", "home.example.com"),
+                }],
+            })
+            .await
+            .unwrap();
+
+        delete.assert_async().await;
+        assert!(
+            storage::list_pending_cf_removals(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
