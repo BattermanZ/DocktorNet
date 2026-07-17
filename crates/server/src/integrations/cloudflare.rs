@@ -2,7 +2,15 @@ use docktornet_core::labels::CloudflareDns;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use std::time::Duration;
+
 use crate::config::CloudflareConfig;
+
+/// Per-request timeout for Cloudflare API calls.  Without it a hung Cloudflare
+/// edge (as opposed to a refused connection) would block a reconcile
+/// indefinitely, holding the global reconcile lock and stalling every machine's
+/// updates.  Mirrors the protection already applied to the NPM client.
+const CF_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DnsRecordPayload {
@@ -73,13 +81,25 @@ impl CloudflareClient {
     }
 
     pub fn with_base_url(config: CloudflareConfig, base_url: impl Into<String>) -> Self {
+        Self::with_base_url_and_timeout(config, base_url, CF_REQUEST_TIMEOUT)
+    }
+
+    pub fn with_base_url_and_timeout(
+        config: CloudflareConfig,
+        base_url: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
+        let http = Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("failed to build Cloudflare HTTP client");
 
         Self {
             api_token: config.api_token,
             zone_id: config.zone_id,
             base_url,
-            http: Client::new(),
+            http,
         }
     }
 
@@ -329,6 +349,49 @@ mod tests {
         let err = client.delete_record("rec-42").await.unwrap_err();
 
         assert!(matches!(err, CloudflareError::Api));
+    }
+
+    #[tokio::test]
+    async fn requests_time_out_against_an_unresponsive_server() {
+        use std::time::{Duration, Instant};
+
+        // A listener that accepts connections but never sends a response, so
+        // the request hangs until the client's timeout fires (as opposed to a
+        // fast connection-refused when nothing is listening). Without a request
+        // timeout this would hang forever while the global reconcile lock is
+        // held, stalling ingestion for every machine.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let client = CloudflareClient::with_base_url_and_timeout(
+            CloudflareConfig {
+                api_token: "t".to_string(),
+                zone_id: "zone-id".to_string(),
+            },
+            format!("http://{addr}/client/v4"),
+            Duration::from_millis(150),
+        );
+
+        let start = Instant::now();
+        let err = client.zone().await.unwrap_err();
+        let elapsed = start.elapsed();
+
+        match err {
+            CloudflareError::Http(e) => {
+                assert!(e.is_timeout(), "expected a timeout error, got: {e}")
+            }
+            other => panic!("expected http timeout error, got: {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should time out promptly, took {elapsed:?}"
+        );
     }
 
     #[tokio::test]
