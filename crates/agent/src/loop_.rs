@@ -43,7 +43,7 @@ pub async fn run(
     let mut next = Instant::now();
 
     loop {
-        match poll_once(&machine, &forward_host, &sources).await {
+        match poll_once(&machine, &forward_host, &sources, interval).await {
             Some(snap) => match client.push_with_retry(&snap, 3).await {
                 Ok(()) => tracing::debug!(containers = snap.containers.len(), "snapshot pushed"),
                 Err(error) => {
@@ -81,8 +81,9 @@ async fn poll_once(
     machine: &MachineId,
     forward_host: &str,
     sources: &[Box<dyn ContainerSource>],
+    per_source_timeout: Duration,
 ) -> Option<Snapshot> {
-    let outcome = crate::sockets::list_all(sources).await;
+    let outcome = crate::sockets::list_all(sources, per_source_timeout).await;
     if outcome.any_failed() {
         warn!(
             failed_sources = ?outcome.failed_sources,
@@ -152,9 +153,14 @@ mod tests {
             }),
         ];
 
-        let snap = poll_once(&MachineId::new("m1"), "10.0.0.10", &sources)
-            .await
-            .expect("snapshot should be built when every source succeeds");
+        let snap = poll_once(
+            &MachineId::new("m1"),
+            "10.0.0.10",
+            &sources,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("snapshot should be built when every source succeeds");
 
         assert_eq!(snap.containers.len(), 2);
     }
@@ -171,7 +177,13 @@ mod tests {
             Box::new(Boom),
         ];
 
-        let snap = poll_once(&MachineId::new("m1"), "10.0.0.10", &sources).await;
+        let snap = poll_once(
+            &MachineId::new("m1"),
+            "10.0.0.10",
+            &sources,
+            Duration::from_secs(30),
+        )
+        .await;
 
         assert!(
             snap.is_none(),

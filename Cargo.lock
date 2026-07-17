@@ -393,6 +393,7 @@ dependencies = [
  "bollard",
  "docktornet-core",
  "dotenvy",
+ "futures-util",
  "humantime-serde",
  "mockito",
  "reqwest",

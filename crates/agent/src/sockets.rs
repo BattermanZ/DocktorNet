@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::ListContainersOptions;
+use futures_util::future::join_all;
+use tokio::time::timeout;
 use tracing::warn;
 
 use crate::config::SocketSpec;
@@ -99,19 +102,44 @@ impl ListOutcome {
 /// Merge results from every configured source. Duplicate container names from
 /// different sockets are kept because the operator controls socket selection.
 ///
-/// Sources that fail to enumerate are recorded in [`ListOutcome::failed_sources`]
-/// rather than being dropped, so the caller can tell a partial view apart from a
-/// genuinely empty machine.
-pub async fn list_all(sources: &[Box<dyn ContainerSource>]) -> ListOutcome {
-    let mut outcome = ListOutcome::default();
-
-    for source in sources {
-        match source.list().await {
-            Ok(mut containers) => outcome.containers.append(&mut containers),
-            Err(error) => {
+/// Sources are enumerated **concurrently** and each `list()` is bounded by
+/// `per_source_timeout`, so one wedged socket (a daemon that has gone
+/// unresponsive without dropping the connection) can neither stall the healthy
+/// sockets nor hold the tick open for the full bollard client timeout.
+///
+/// A source that fails or times out is recorded in [`ListOutcome::failed_sources`]
+/// rather than being dropped or encoded as "zero containers", so the caller can
+/// tell a partial view apart from a genuinely empty machine.
+pub async fn list_all(
+    sources: &[Box<dyn ContainerSource>],
+    per_source_timeout: Duration,
+) -> ListOutcome {
+    let results = join_all(sources.iter().map(|source| async move {
+        match timeout(per_source_timeout, source.list()).await {
+            Ok(Ok(containers)) => Ok(containers),
+            Ok(Err(error)) => {
                 warn!(source = %source.label(), %error, "source failed to list containers");
-                outcome.failed_sources.push(source.label().to_string());
+                Err(source.label().to_string())
             }
+            Err(_elapsed) => {
+                warn!(
+                    source = %source.label(),
+                    timeout = ?per_source_timeout,
+                    "source timed out listing containers"
+                );
+                Err(source.label().to_string())
+            }
+        }
+    }))
+    .await;
+
+    // `join_all` preserves input order, so the merged list and any failure
+    // reports stay in the operator's configured socket order.
+    let mut outcome = ListOutcome::default();
+    for result in results {
+        match result {
+            Ok(mut containers) => outcome.containers.append(&mut containers),
+            Err(label) => outcome.failed_sources.push(label),
         }
     }
 
@@ -121,6 +149,10 @@ pub async fn list_all(sources: &[Box<dyn ContainerSource>]) -> ListOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A per-source timeout that never fires for the deterministic tests below;
+    /// individual timeout tests override this with a short value.
+    const NEVER: Duration = Duration::from_secs(3600);
 
     struct Fake {
         items: Vec<RawContainer>,
@@ -134,6 +166,45 @@ mod tests {
 
         fn label(&self) -> &str {
             "Fake"
+        }
+    }
+
+    /// A source whose `list()` never returns within the tick: it models a Docker
+    /// daemon that has gone unresponsive (I/O stall) without dropping the socket.
+    struct Hung {
+        label: String,
+    }
+
+    #[async_trait]
+    impl ContainerSource for Hung {
+        async fn list(&self) -> anyhow::Result<Vec<RawContainer>> {
+            // Sleeps far longer than any per-source timeout the caller sets.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(Vec::new())
+        }
+
+        fn label(&self) -> &str {
+            &self.label
+        }
+    }
+
+    /// A source that sleeps a fixed amount before returning, used to prove that
+    /// sources are enumerated concurrently rather than one after another.
+    struct Slow {
+        delay: Duration,
+        label: String,
+        item: RawContainer,
+    }
+
+    #[async_trait]
+    impl ContainerSource for Slow {
+        async fn list(&self) -> anyhow::Result<Vec<RawContainer>> {
+            tokio::time::sleep(self.delay).await;
+            Ok(vec![self.item.clone()])
+        }
+
+        fn label(&self) -> &str {
+            &self.label
         }
     }
 
@@ -156,7 +227,7 @@ mod tests {
             items: vec![rc("b", &[])],
         });
 
-        let merged = list_all(&[a, b]).await;
+        let merged = list_all(&[a, b], NEVER).await;
 
         assert_eq!(
             merged
@@ -188,7 +259,7 @@ mod tests {
             items: vec![rc("b", &[])],
         });
 
-        let merged = list_all(&[a, b]).await;
+        let merged = list_all(&[a, b], NEVER).await;
 
         assert_eq!(merged.containers.len(), 1);
         assert_eq!(merged.containers[0].name, "b");
@@ -201,7 +272,7 @@ mod tests {
             items: vec![rc("b", &[])],
         });
 
-        let outcome = list_all(&[a, b]).await;
+        let outcome = list_all(&[a, b], NEVER).await;
 
         // The surviving source's container is still enumerated...
         assert_eq!(outcome.containers.len(), 1);
@@ -223,9 +294,74 @@ mod tests {
             items: vec![rc("b", &[])],
         });
 
-        let outcome = list_all(&[a, b]).await;
+        let outcome = list_all(&[a, b], NEVER).await;
 
         assert!(!outcome.any_failed());
         assert!(outcome.failed_sources.is_empty());
+    }
+
+    /// A daemon that has gone unresponsive (but not dropped its socket) must be
+    /// treated as a *failed* source once it blows the per-source timeout, not
+    /// awaited for the full bollard client timeout and not encoded as "zero
+    /// containers on that socket". The healthy source's containers still come
+    /// through so only the wedged socket is reported.
+    #[tokio::test(start_paused = true)]
+    async fn list_all_treats_a_hung_source_as_failed() {
+        let healthy: Box<dyn ContainerSource> = Box::new(Fake {
+            items: vec![rc("still-running", &[])],
+        });
+        let hung: Box<dyn ContainerSource> = Box::new(Hung {
+            label: "Docker:/hung.sock".to_string(),
+        });
+
+        let outcome = list_all(&[healthy, hung], Duration::from_secs(5)).await;
+
+        assert_eq!(
+            outcome
+                .containers
+                .iter()
+                .map(|container| container.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["still-running"],
+            "the healthy socket's containers must still be enumerated"
+        );
+        assert!(
+            outcome.any_failed(),
+            "a hung source that exceeds the per-source timeout must be reported"
+        );
+        assert_eq!(
+            outcome.failed_sources,
+            vec!["Docker:/hung.sock".to_string()]
+        );
+    }
+
+    /// Sources are enumerated concurrently: two sockets that each take `delay`
+    /// to answer must finish in roughly `delay`, not `2 * delay`. A sequential
+    /// loop would take twice as long and let one slow socket stall the others.
+    #[tokio::test]
+    async fn list_all_enumerates_sources_concurrently() {
+        let delay = Duration::from_millis(300);
+        let a: Box<dyn ContainerSource> = Box::new(Slow {
+            delay,
+            label: "A".to_string(),
+            item: rc("a", &[]),
+        });
+        let b: Box<dyn ContainerSource> = Box::new(Slow {
+            delay,
+            label: "B".to_string(),
+            item: rc("b", &[]),
+        });
+
+        let start = std::time::Instant::now();
+        let outcome = list_all(&[a, b], NEVER).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcome.containers.len(), 2);
+        assert!(
+            elapsed < delay * 2,
+            "sources should be enumerated concurrently (took {elapsed:?}, \
+             expected well under {:?})",
+            delay * 2
+        );
     }
 }

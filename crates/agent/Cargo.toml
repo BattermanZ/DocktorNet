@@ -13,6 +13,7 @@ docktornet-core = { path = "../core" }
 
 async-trait = "0.1"
 tokio       = { workspace = true }
+futures-util = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }
@@ -27,6 +28,7 @@ bollard     = { workspace = true }
 [dev-dependencies]
 mockito  = { workspace = true }
 tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
