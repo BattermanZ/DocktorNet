@@ -72,21 +72,50 @@ impl ContainerSource for BollardSource {
     }
 }
 
+/// Outcome of enumerating every configured source.
+///
+/// A source returning `Err` (socket missing, permission denied, daemon
+/// restarting, timeout) must never be silently encoded as "zero containers on
+/// that socket": doing so makes the merged list a *partial* view that the
+/// server would treat as the authoritative complete state for the machine and
+/// tear down healthy services. `failed_sources` carries that signal to the
+/// caller so a degraded tick can be skipped instead of pushed.
+#[derive(Debug, Default)]
+pub struct ListOutcome {
+    /// Containers merged from every source that enumerated successfully.
+    pub containers: Vec<RawContainer>,
+    /// Labels of the sources that failed to enumerate this tick.
+    pub failed_sources: Vec<String>,
+}
+
+impl ListOutcome {
+    /// True when at least one configured source failed to enumerate, meaning
+    /// `containers` is a partial view and must not be treated as authoritative.
+    pub fn any_failed(&self) -> bool {
+        !self.failed_sources.is_empty()
+    }
+}
+
 /// Merge results from every configured source. Duplicate container names from
 /// different sockets are kept because the operator controls socket selection.
-pub async fn list_all(sources: &[Box<dyn ContainerSource>]) -> Vec<RawContainer> {
-    let mut out = Vec::new();
+///
+/// Sources that fail to enumerate are recorded in [`ListOutcome::failed_sources`]
+/// rather than being dropped, so the caller can tell a partial view apart from a
+/// genuinely empty machine.
+pub async fn list_all(sources: &[Box<dyn ContainerSource>]) -> ListOutcome {
+    let mut outcome = ListOutcome::default();
 
     for source in sources {
         match source.list().await {
-            Ok(mut containers) => out.append(&mut containers),
+            Ok(mut containers) => outcome.containers.append(&mut containers),
             Err(error) => {
-                warn!(source = %source.label(), %error, "source failed to list containers")
+                warn!(source = %source.label(), %error, "source failed to list containers");
+                outcome.failed_sources.push(source.label().to_string());
             }
         }
     }
 
-    out
+    outcome
 }
 
 #[cfg(test)]
@@ -131,6 +160,7 @@ mod tests {
 
         assert_eq!(
             merged
+                .containers
                 .iter()
                 .map(|container| container.name.clone())
                 .collect::<Vec<_>>(),
@@ -160,7 +190,42 @@ mod tests {
 
         let merged = list_all(&[a, b]).await;
 
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].name, "b");
+        assert_eq!(merged.containers.len(), 1);
+        assert_eq!(merged.containers[0].name, "b");
+    }
+
+    #[tokio::test]
+    async fn list_all_reports_which_sources_failed() {
+        let a: Box<dyn ContainerSource> = Box::new(Boom);
+        let b: Box<dyn ContainerSource> = Box::new(Fake {
+            items: vec![rc("b", &[])],
+        });
+
+        let outcome = list_all(&[a, b]).await;
+
+        // The surviving source's container is still enumerated...
+        assert_eq!(outcome.containers.len(), 1);
+        // ...but the failure MUST be surfaced so the caller can refuse to treat
+        // this partial list as the authoritative machine state.
+        assert!(
+            outcome.any_failed(),
+            "a failing source must be reported, not swallowed"
+        );
+        assert_eq!(outcome.failed_sources, vec!["Boom".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_all_reports_no_failure_when_all_sources_succeed() {
+        let a: Box<dyn ContainerSource> = Box::new(Fake {
+            items: vec![rc("a", &[])],
+        });
+        let b: Box<dyn ContainerSource> = Box::new(Fake {
+            items: vec![rc("b", &[])],
+        });
+
+        let outcome = list_all(&[a, b]).await;
+
+        assert!(!outcome.any_failed());
+        assert!(outcome.failed_sources.is_empty());
     }
 }
