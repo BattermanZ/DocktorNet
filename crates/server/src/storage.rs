@@ -262,6 +262,25 @@ pub async fn delete_pending_npm_removal(
     Ok(())
 }
 
+/// Return the `(npm_index, npm_id)` pairs recorded in `pending_npm_removals`
+/// for a single service.  Used when a service reappears within the grace
+/// period: the pending row is the only surviving record of the NPM host id
+/// (the `npm_hosts` mapping was cascade-deleted when the service left), so it
+/// is restored into `npm_hosts` before reconcile runs — otherwise reconcile
+/// would create a duplicate proxy host and orphan the original.
+pub async fn get_pending_npm_removals_for_service(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<Vec<(i64, i64)>> {
+    sqlx::query_as(
+        "SELECT npm_index, npm_id FROM pending_npm_removals \
+         WHERE service_id = ? ORDER BY npm_index",
+    )
+    .bind(service_id)
+    .fetch_all(pool)
+    .await
+}
+
 /// Drop every pending removal for a service.  Called when a service reappears,
 /// so a host that is live again is never pruned.
 pub async fn clear_pending_npm_removals_for_service(
@@ -333,6 +352,22 @@ pub async fn list_pending_cf_removals(
     )
     .fetch_all(pool)
     .await
+}
+
+/// Return the Cloudflare `record_id` recorded in `pending_cf_removals` for a
+/// single service, if any.  The counterpart to
+/// `get_pending_npm_removals_for_service`: when a service reappears within the
+/// grace period this restores the `cf_dns_records` mapping so reconcile updates
+/// the existing DNS record instead of creating a duplicate.
+pub async fn get_pending_cf_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_as("SELECT record_id FROM pending_cf_removals WHERE service_id = ?")
+        .bind(service_id)
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.map(|(record_id,)| record_id))
 }
 
 pub async fn delete_pending_cf_removal(pool: &Pool<Sqlite>, service_id: &str) -> sqlx::Result<()> {

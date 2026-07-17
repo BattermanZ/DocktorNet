@@ -926,11 +926,33 @@ impl Reconciler {
         for service in &intended {
             // A service present in the snapshot is live, so any pending NPM
             // removal for it is stale (it briefly disappeared and came back).
-            // Drop it before reconciling so the returning host is never pruned.
+            //
+            // But the pending row is also the only surviving record of the
+            // external host id: upsert_snapshot's cascade wiped the npm_hosts
+            // mapping the moment the container left a snapshot.  If we simply
+            // dropped the pending row, reconcile_npm's get_npm_host would return
+            // None and create a SECOND proxy host for the same domain, orphaning
+            // the original.  So restore the mapping first, then clear the
+            // pending row — reconcile then updates the existing host in place.
+            for (npm_index, npm_id) in
+                crate::storage::get_pending_npm_removals_for_service(&self.db, &service.service_id)
+                    .await?
+            {
+                crate::storage::set_npm_host(&self.db, &service.service_id, npm_index, npm_id)
+                    .await?;
+            }
             crate::storage::clear_pending_npm_removals_for_service(&self.db, &service.service_id)
                 .await?;
             // Likewise for a pending Cloudflare removal: a returning service's
-            // record must never be deleted.
+            // record must never be deleted, and its record_id must be restored
+            // (the cf_dns_records mapping was cascade-deleted too) so reconcile
+            // updates the existing DNS record instead of creating a duplicate.
+            if let Some(record_id) =
+                crate::storage::get_pending_cf_removal(&self.db, &service.service_id).await?
+            {
+                crate::storage::set_cf_dns_record(&self.db, &service.service_id, &record_id)
+                    .await?;
+            }
             crate::storage::delete_pending_cf_removal(&self.db, &service.service_id).await?;
 
             if !skip_npm {
@@ -1854,7 +1876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_npm_removal_cleared_when_service_reappears() {
+    async fn npm_host_mapping_restored_when_service_reappears_within_grace() {
         let dir = tempdir().unwrap();
         let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
 
@@ -1863,27 +1885,51 @@ mod tests {
             .mock("POST", "/api/tokens")
             .with_status(200)
             .with_body(r#"{"token":"t"}"#)
+            .expect_at_least(1)
             .create_async()
             .await;
         let _certs = npm_server
             .mock("GET", "/api/nginx/certificates")
             .with_status(200)
             .with_body("[]")
+            .expect_at_least(1)
             .create_async()
             .await;
-        // The returning service re-creates its host; the stale pending row must
-        // never trigger a delete of the now-live host.
-        let _create = npm_server
+        // A returning service must UPDATE its existing proxy host, never create
+        // a SECOND one for the same domain (which would orphan the original).
+        let create = npm_server
             .mock("POST", "/api/nginx/proxy-hosts")
             .with_status(200)
-            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .with_body(r#"{"id":99,"domain_names":["a.example.com"]}"#)
+            .expect(0)
             .create_async()
             .await;
+        // The now-live host must never be deleted.
         let delete = npm_server
             .mock("DELETE", "/api/nginx/proxy-hosts/50")
             .with_status(200)
             .with_body("{}")
             .expect(0)
+            .create_async()
+            .await;
+        // The restored mapping drives a fetch of the original host (id 50);
+        // its stored port (9999) differs from the payload (3000), so it is
+        // updated in place rather than recreated.
+        let get = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(
+                r#"{"id":50,"domain_names":["a.example.com"],"forward_scheme":"http",
+                    "forward_host":"10.0.0.1","forward_port":9999,"certificate_id":0}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -1899,7 +1945,9 @@ mod tests {
             cf,
         );
 
-        // A pending removal left over from a brief disappearance.
+        // A pending removal left over from a brief disappearance.  The
+        // npm_hosts mapping was cascade-deleted when the service left, so this
+        // pending row is the only surviving record of host id 50.
         storage::add_pending_npm_removal(&pool, "m1/app", 0, 50, 100)
             .await
             .unwrap();
@@ -1918,7 +1966,16 @@ mod tests {
             .await
             .unwrap();
 
+        create.assert_async().await;
         delete.assert_async().await;
+        get.assert_async().await;
+        update.assert_async().await;
+        // The mapping is restored to the original host id and the pending row
+        // is cleared.
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
+            Some(50)
+        );
         assert!(
             storage::list_pending_npm_removals(&pool)
                 .await
@@ -2160,7 +2217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_cf_removal_cleared_when_service_reappears() {
+    async fn cf_record_mapping_restored_when_service_reappears_within_grace() {
         let dir = tempdir().unwrap();
         let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
 
@@ -2170,24 +2227,36 @@ mod tests {
             .mock("GET", "/zones/z")
             .with_status(200)
             .with_body(r#"{"success":true,"result":{"id":"z","name":"example.com"}}"#)
+            .expect_at_least(1)
             .create_async()
             .await;
-        // The returning service re-creates its record (the old mapping was
-        // cascade-deleted when the service left); the stale pending row must
-        // never trigger a delete.
-        let _create = cf_server
+        // A returning service must UPDATE its existing DNS record, never create
+        // a SECOND one for the same name (which would orphan the original).
+        let create = cf_server
             .mock("POST", "/zones/z/dns_records")
             .with_status(200)
             .with_body(
                 r#"{"success":true,"result":{"id":"rec-2","name":"app.example.com","content":"home.example.com","proxied":false}}"#,
             )
+            .expect(0)
             .create_async()
             .await;
+        // The now-live record must never be deleted.
         let delete = cf_server
             .mock("DELETE", "/zones/z/dns_records/rec-1")
             .with_status(200)
             .with_body(r#"{"success":true}"#)
             .expect(0)
+            .create_async()
+            .await;
+        // The restored mapping drives an update of the original record (rec-1).
+        let update = cf_server
+            .mock("PUT", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(
+                r#"{"success":true,"result":{"id":"rec-1","name":"app.example.com","content":"home.example.com","proxied":false}}"#,
+            )
+            .expect(1)
             .create_async()
             .await;
 
@@ -2205,7 +2274,7 @@ mod tests {
 
         // A pending removal left over from a brief disappearance.  The
         // cf_dns_records mapping is already gone (cascade-deleted), so the
-        // pending row is the only durable record.
+        // pending row is the only durable record of record id rec-1.
         storage::add_pending_cf_removal(&pool, "m1/app", "rec-1", 100)
             .await
             .unwrap();
@@ -2224,7 +2293,15 @@ mod tests {
             .await
             .unwrap();
 
+        create.assert_async().await;
         delete.assert_async().await;
+        update.assert_async().await;
+        // The mapping is restored to the original record id and the pending row
+        // is cleared.
+        assert_eq!(
+            storage::get_cf_dns_record(&pool, "m1/app").await.unwrap(),
+            Some("rec-1".to_string())
+        );
         assert!(
             storage::list_pending_cf_removals(&pool)
                 .await
