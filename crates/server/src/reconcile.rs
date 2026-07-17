@@ -26,6 +26,25 @@ pub struct Reconciler {
     /// unchanged snapshot skip the external reconcile entirely (drift is still
     /// caught by the periodic `full_resync`).
     last_reconciled: Arc<Mutex<HashMap<String, u64>>>,
+    /// Per-machine tail of the apply chain: the receiver that resolves when the
+    /// most recently ingested snapshot's background apply finishes.  Ingest
+    /// hands each new apply the previous tail to wait on, so a machine's applies
+    /// run strictly in ingest order and a stale snapshot can never be applied to
+    /// public DNS / proxy state after a newer one.
+    apply_chain: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<()>>>>,
+}
+
+/// Everything a background apply needs, handed back by [`Reconciler::ingest_snapshot`].
+/// It carries the ingest-order sequencing token so applies for a machine are
+/// serialized in the order they were persisted, never reordered by the scheduler.
+pub struct ApplyTicket {
+    removed: Vec<RemovedService>,
+    /// Resolves when the previous snapshot's apply for this machine finished.
+    /// `None` for the first apply after startup.  The apply awaits this before
+    /// touching any external state.
+    wait_on: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Signals the next queued apply for this machine that this one is done.
+    done: tokio::sync::oneshot::Sender<()>,
 }
 
 /// A service that has just left a machine's snapshot, along with the data a
@@ -125,6 +144,7 @@ impl Reconciler {
                 NPM_BREAKER_COOLDOWN,
             )),
             last_reconciled: Arc::new(Mutex::new(HashMap::new())),
+            apply_chain: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -145,6 +165,7 @@ impl Reconciler {
                 NPM_BREAKER_COOLDOWN,
             )),
             last_reconciled: Arc::new(Mutex::new(HashMap::new())),
+            apply_chain: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1103,26 +1124,56 @@ impl Reconciler {
     /// needs.  The ingest handler calls this so a push is acked as soon as the
     /// snapshot is durable, without blocking on slow NPM/Cloudflare calls, then
     /// runs `apply_reconcile` in the background.
-    pub async fn ingest_snapshot(
-        &self,
-        snap: &Snapshot,
-    ) -> Result<Vec<RemovedService>, ReconcileError> {
+    pub async fn ingest_snapshot(&self, snap: &Snapshot) -> Result<ApplyTicket, ReconcileError> {
         let _guard = self.lock.lock().await;
-        self.persist_inner(snap).await
+        let removed = self.persist_inner(snap).await?;
+        // Link this apply into the machine's ordered chain: it waits on the
+        // previous tail and installs its own completion channel as the new
+        // tail.  `insert` returns the prior tail (the receiver this apply must
+        // wait for), or `None` if this is the first snapshot for the machine.
+        let (done, done_rx) = tokio::sync::oneshot::channel();
+        let wait_on = self
+            .apply_chain
+            .lock()
+            .await
+            .insert(snap.machine_id.as_str().to_string(), done_rx);
+        Ok(ApplyTicket {
+            removed,
+            wait_on,
+            done,
+        })
     }
 
     /// Apply the external side effects for an already-persisted snapshot.  Runs
-    /// after `ingest_snapshot`, off the request path.
+    /// after `ingest_snapshot`, off the request path.  Applies for a single
+    /// machine are serialized in ingest order via the ticket's chain, so a
+    /// snapshot can never be applied to public DNS / proxy state after a newer
+    /// one has already been applied.
     pub async fn apply_reconcile(
         &self,
         snap: &Snapshot,
-        removed: Vec<RemovedService>,
+        ticket: ApplyTicket,
     ) -> Result<(), ReconcileError> {
-        if self.options.dry_run {
-            return Ok(());
+        let ApplyTicket {
+            removed,
+            wait_on,
+            done,
+        } = ticket;
+        // Block until the previous snapshot's apply for this machine has
+        // finished.  A dropped sender (predecessor task cancelled/panicked)
+        // resolves the receiver with an error, which we treat as "go ahead".
+        if let Some(rx) = wait_on {
+            let _ = rx.await;
         }
-        let _guard = self.lock.lock().await;
-        self.apply_inner(snap, removed).await
+        let result = if self.options.dry_run {
+            Ok(())
+        } else {
+            let _guard = self.lock.lock().await;
+            self.apply_inner(snap, removed).await
+        };
+        // Release the next queued apply for this machine, whatever the outcome.
+        let _ = done.send(());
+        result
     }
 }
 
@@ -1400,6 +1451,81 @@ mod tests {
         assert!(
             !service_file.exists(),
             "gatus file must be deleted after the grace period"
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_order_background_applies_do_not_resurrect_removed_service() {
+        // Two pushes arrive back-to-back: A with the container present, then B
+        // with it gone (past the grace period).  The ingest path persists each
+        // synchronously and fires a background apply.  The scheduler may run
+        // B's apply before A's; without per-machine sequencing the stale apply
+        // A re-creates the just-removed service's public state.  The gatus file
+        // stands in here for the NPM proxy host / Cloudflare record: the final
+        // state must reflect B (file gone), never the resurrected A.
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = Reconciler::new(
+            pool,
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: gatus_dir.clone(),
+            },
+        );
+
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "docktornet.gatus.0.url".to_string(),
+            "https://example.com".to_string(),
+        );
+        labels.insert("docktornet.gatus.0.interval".to_string(), "30s".to_string());
+
+        let snap_present = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "127.0.0.1".into(),
+            taken_at: 1,
+            containers: vec![ContainerEntry {
+                name: "app".to_string(),
+                labels,
+            }],
+        };
+        // B is taken well past the grace period, so its apply must delete the
+        // service's gatus file rather than defer it.
+        let snap_gone = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "127.0.0.1".into(),
+            taken_at: (1 + GATUS_REMOVAL_GRACE_SECS + 1) as u64,
+            containers: vec![],
+        };
+
+        // Persist both synchronously in order, exactly as the ingest handler does.
+        let ticket_present = reconciler.ingest_snapshot(&snap_present).await.unwrap();
+        let ticket_gone = reconciler.ingest_snapshot(&snap_gone).await.unwrap();
+
+        // Simulate the scheduler favouring B's apply: spawn it first and give
+        // it a generous head start.  Per-machine ordering must hold it until
+        // A's apply has completed.
+        let reconciler_b = reconciler.clone();
+        let snap_gone_bg = snap_gone.clone();
+        let handle_b = tokio::spawn(async move {
+            reconciler_b
+                .apply_reconcile(&snap_gone_bg, ticket_gone)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        reconciler
+            .apply_reconcile(&snap_present, ticket_present)
+            .await
+            .unwrap();
+        handle_b.await.unwrap().unwrap();
+
+        let service_file = gatus::service_file_path(&gatus_dir, "m1/app");
+        assert!(
+            !service_file.exists(),
+            "a stale background apply resurrected a removed service's public state"
         );
     }
 
