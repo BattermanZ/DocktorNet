@@ -40,6 +40,41 @@ pub async fn run(
     client: PushClient,
     interval: Duration,
 ) {
+    run_until(
+        machine,
+        forward_host,
+        sources,
+        client,
+        interval,
+        shutdown_signal,
+    )
+    .await;
+}
+
+/// Core poll/push loop, parameterised over how the shutdown signal is awaited so
+/// it can be driven deterministically in tests.
+///
+/// `make_shutdown` yields the future that resolves when shutdown is requested.
+async fn run_until<Sig, Fut>(
+    machine: MachineId,
+    forward_host: String,
+    sources: Vec<Box<dyn ContainerSource>>,
+    client: PushClient,
+    interval: Duration,
+    make_shutdown: Sig,
+) where
+    Sig: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // Register the shutdown listener ONCE, up front. tokio installs a
+    // process-wide signal handler on first use and retains any signal that
+    // arrives while the future is parked, so building this future a single time
+    // means a SIGTERM/SIGINT that lands mid-push is still observed at the next
+    // sleep boundary. Rebuilding it each iteration would drop the pending edge
+    // and silently swallow the shutdown request.
+    let shutdown = make_shutdown();
+    tokio::pin!(shutdown);
+
     let mut next = Instant::now();
 
     loop {
@@ -61,7 +96,7 @@ pub async fn run(
         next += interval;
         tokio::select! {
             () = sleep_until(next) => {},
-            () = shutdown_signal() => {
+            () = &mut shutdown => {
                 info!("shutdown signal received");
                 return;
             },
@@ -163,6 +198,108 @@ mod tests {
         .expect("snapshot should be built when every source succeeds");
 
         assert_eq!(snap.containers.len(), 2);
+    }
+
+    /// Models tokio's process-signal semantics as an *edge*: a listener only
+    /// observes a signal that is raised **after** the listener is created.
+    /// `listen` captures the current generation; the returned future resolves
+    /// only once `fire` bumps the generation past that captured value — exactly
+    /// like a freshly-constructed `tokio::signal::Signal` that never observes an
+    /// edge delivered before it existed.
+    #[derive(Clone)]
+    struct EdgeSignal {
+        generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl EdgeSignal {
+        fn new() -> Self {
+            Self {
+                generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }
+        }
+
+        fn fire(&self) {
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn listen(self) -> impl std::future::Future<Output = ()> + 'static {
+            let generation = self.generation;
+            let start = generation.load(std::sync::atomic::Ordering::SeqCst);
+            async move {
+                while generation.load(std::sync::atomic::Ordering::SeqCst) == start {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }
+    }
+
+    /// Raises a shutdown signal on its first enumeration, i.e. while the tick's
+    /// poll/push is in flight.
+    struct FireOnList {
+        signal: EdgeSignal,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ContainerSource for FireOnList {
+        async fn list(&self) -> anyhow::Result<Vec<RawContainer>> {
+            if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.signal.fire();
+            }
+            Ok(vec![labelled("a")])
+        }
+
+        fn label(&self) -> &str {
+            "FireOnList"
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_raised_during_in_flight_push_is_honored() {
+        // The shutdown signal is raised while the first tick's poll/push is in
+        // flight — no listener is registered at that instant. A correct loop
+        // registers its shutdown listener ONCE up front, so the pending signal
+        // is still observed at the next sleep boundary and the agent exits. The
+        // buggy loop rebuilds the listener every iteration, so the edge is lost
+        // and the agent spins forever.
+        let signal = EdgeSignal::new();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v1/snapshot")
+            .with_status(204)
+            .create_async()
+            .await;
+        let client = crate::push::PushClient::new(server.url(), "s").unwrap();
+
+        let sources: Vec<Box<dyn ContainerSource>> = vec![Box::new(FireOnList {
+            signal: signal.clone(),
+            fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })];
+
+        let make_shutdown = {
+            let signal = signal.clone();
+            move || signal.clone().listen()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_until(
+                MachineId::new("m1"),
+                "10.0.0.10".into(),
+                sources,
+                client,
+                Duration::from_millis(10),
+                make_shutdown,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "agent must exit when a shutdown signal is raised during an in-flight push"
+        );
     }
 
     #[tokio::test]
