@@ -125,7 +125,12 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
 
     for (index, fields) in npm_groups {
         match build_npm_host(index, &fields) {
-            Ok(host) => out.npm.push(host),
+            Ok((host, warnings)) => {
+                out.npm.push(host);
+                for warning in warnings {
+                    out.warnings.push(format!("npm.{index}: {warning}"));
+                }
+            }
             Err(err) => out.warnings.push(format!("npm.{index}: {err}")),
         }
     }
@@ -150,7 +155,10 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
     out
 }
 
-fn build_npm_host(index: u8, fields: &BTreeMap<String, String>) -> Result<NpmHost, String> {
+fn build_npm_host(
+    index: u8,
+    fields: &BTreeMap<String, String>,
+) -> Result<(NpmHost, Vec<String>), String> {
     let hosts: Vec<String> = fields
         .get("host")
         .ok_or("missing host")?
@@ -173,30 +181,44 @@ fn build_npm_host(index: u8, fields: &BTreeMap<String, String>) -> Result<NpmHos
         None => return Err("missing scheme".to_string()),
     };
     let ssl = parse_bool(fields.get("ssl").ok_or("missing ssl")?)?;
-    let hsts = fields.get("hsts").map(parse_bool).transpose()?;
-    let hsts_subdomains = fields.get("hsts_subdomains").map(parse_bool).transpose()?;
-    let http2 = fields.get("http2").map(parse_bool).transpose()?;
-    let block_exploits = fields.get("block_exploits").map(parse_bool).transpose()?;
-    let websockets = fields.get("websockets").map(parse_bool).transpose()?;
-    let cert_id = fields
-        .get("cert_id")
-        .map(|cert_id| cert_id.parse::<u32>())
-        .transpose()
-        .map_err(|_| "cert_id must be u32".to_string())?;
 
-    Ok(NpmHost {
-        index,
-        hosts,
-        port,
-        scheme,
-        ssl,
-        hsts,
-        hsts_subdomains,
-        http2,
-        block_exploits,
-        websockets,
-        cert_id,
-    })
+    // Optional hardening flags are advisory: a single malformed value must
+    // degrade to its default plus a warning, never un-publish the whole host.
+    let mut warnings = Vec::new();
+    let hsts = parse_optional_bool(fields, "hsts", &mut warnings);
+    let hsts_subdomains = parse_optional_bool(fields, "hsts_subdomains", &mut warnings);
+    let http2 = parse_optional_bool(fields, "http2", &mut warnings);
+    let block_exploits = parse_optional_bool(fields, "block_exploits", &mut warnings);
+    let websockets = parse_optional_bool(fields, "websockets", &mut warnings);
+    let cert_id = match fields.get("cert_id") {
+        Some(value) => match value.parse::<u32>() {
+            Ok(parsed) => Some(parsed),
+            Err(_) => {
+                warnings.push(format!(
+                    "cert_id: must be u32, got '{value}'; ignoring optional field"
+                ));
+                None
+            }
+        },
+        None => None,
+    };
+
+    Ok((
+        NpmHost {
+            index,
+            hosts,
+            port,
+            scheme,
+            ssl,
+            hsts,
+            hsts_subdomains,
+            http2,
+            block_exploits,
+            websockets,
+            cert_id,
+        },
+        warnings,
+    ))
 }
 
 fn is_npm_field(field: &str) -> bool {
@@ -272,10 +294,29 @@ fn is_gatus_field(field: &str) -> bool {
 }
 
 fn parse_bool(value: impl AsRef<str>) -> Result<bool, String> {
-    match value.as_ref() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        other => Err(format!("expected bool, got '{other}'")),
+    match value.as_ref().trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!("expected bool, got '{}'", value.as_ref())),
+    }
+}
+
+/// Parse an optional boolean field, degrading a malformed value to `None`
+/// plus a warning rather than aborting the whole host.
+fn parse_optional_bool(
+    fields: &BTreeMap<String, String>,
+    key: &str,
+    warnings: &mut Vec<String>,
+) -> Option<bool> {
+    match fields.get(key) {
+        Some(value) => match parse_bool(value) {
+            Ok(parsed) => Some(parsed),
+            Err(err) => {
+                warnings.push(format!("{key}: {err}; ignoring optional field"));
+                None
+            }
+        },
+        None => None,
     }
 }
 
@@ -400,6 +441,50 @@ mod tests {
         assert_eq!(p.npm[0].block_exploits, Some(false));
         assert_eq!(p.npm[0].websockets, Some(false));
         assert_eq!(p.npm[0].cert_id, Some(42));
+    }
+
+    #[test]
+    fn parse_bool_is_case_insensitive() {
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", "a.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "True"),
+            ("docktornet.npm.0.hsts", "YES"),
+            ("docktornet.npm.0.http2", "Off"),
+        ]));
+        assert_eq!(p.npm.len(), 1);
+        assert!(p.npm[0].ssl);
+        assert_eq!(p.npm[0].hsts, Some(true));
+        assert_eq!(p.npm[0].http2, Some(false));
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn npm_malformed_optional_field_degrades_not_drops() {
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", "a.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "true"),
+            // a single malformed optional field must not un-publish the host
+            ("docktornet.npm.0.cert_id", "abc"),
+            ("docktornet.npm.0.hsts", "maybe"),
+        ]));
+        assert_eq!(
+            p.npm.len(),
+            1,
+            "host must survive a malformed optional field"
+        );
+        let h = &p.npm[0];
+        assert_eq!(h.hosts, vec!["a.example.com".to_string()]);
+        assert_eq!(h.port, 3000);
+        assert!(h.ssl);
+        assert_eq!(h.cert_id, None);
+        assert_eq!(h.hsts, None);
+        // the operator still gets a signal for each degraded field
+        assert_eq!(p.warnings.len(), 2);
+        assert!(p.warnings.iter().all(|w| w.contains("npm.0")));
     }
 
     #[test]
