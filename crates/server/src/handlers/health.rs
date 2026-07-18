@@ -1,5 +1,6 @@
 use axum::Json;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use serde::Serialize;
 
 use crate::handlers::snapshot::AppState;
@@ -15,11 +16,36 @@ pub struct AgentStatus {
 pub struct HealthResponse {
     pub status: &'static str,
     pub server_time: String,
-    pub agents: Vec<AgentStatus>,
+    /// Per-agent inventory (machine id, internal forward address, last-seen).
+    /// Only populated for callers presenting a valid bearer token; omitted
+    /// entirely for unauthenticated liveness probes so those details are not
+    /// leaked to anyone who can reach the listen socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<AgentStatus>>,
 }
 
-pub async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
+/// Returns true when the request carries the expected bearer token.
+fn is_authenticated(headers: &HeaderMap, secret: &str) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        == Some(secret)
+}
+
+pub async fn healthz(State(state): State<AppState>, headers: HeaderMap) -> Json<HealthResponse> {
     let server_time = humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
+
+    // Unauthenticated callers get a bare liveness probe only. The per-agent
+    // inventory (which discloses internal LAN forward addresses) is gated
+    // behind the same bearer token that guards snapshot ingest.
+    if !is_authenticated(&headers, state.secret.as_str()) {
+        return Json(HealthResponse {
+            status: "ok",
+            server_time,
+            agents: None,
+        });
+    }
 
     let (status, agents) = match crate::storage::list_machines(state.reconciler.pool()).await {
         Ok(rows) => {
@@ -34,11 +60,11 @@ pub async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
                     .to_string(),
                 })
                 .collect();
-            ("ok", agents)
+            ("ok", Some(agents))
         }
         Err(error) => {
             tracing::warn!(%error, "healthz: failed to list machines");
-            ("degraded", vec![])
+            ("degraded", None)
         }
     };
 
