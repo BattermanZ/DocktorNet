@@ -1,5 +1,13 @@
+use std::collections::HashSet;
+
 use docktornet_core::{Snapshot, service_id};
 use sqlx::{Pool, Sqlite};
+
+/// Maximum number of bind parameters to place in a single statement. SQLite's
+/// compile-time `SQLITE_MAX_VARIABLE_NUMBER` defaults to 32766; staying well
+/// under it lets id-list queries chunk safely no matter how many containers a
+/// machine reports.
+const MAX_BIND_PARAMS: usize = 20_000;
 
 pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Result<()> {
     let now = snap.taken_at as i64;
@@ -47,24 +55,23 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
         .await?;
     }
 
-    // delete any services for this machine that were not in the snapshot
-    if seen_ids.is_empty() {
-        sqlx::query("DELETE FROM services WHERE machine_id = ?")
-            .bind(machine)
-            .execute(&mut *tx)
-            .await?;
-    } else {
-        // Build the IN clause manually because sqlx does not expand Vec into IN args.
-        let placeholders = std::iter::repeat_n("?", seen_ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql =
-            format!("DELETE FROM services WHERE machine_id = ? AND id NOT IN ({placeholders})");
-        let mut q = sqlx::query(&sql).bind(machine);
-        for id in &seen_ids {
-            q = q.bind(id);
+    // Delete any services for this machine that were not in the snapshot.
+    // Rather than build a `NOT IN (...)` clause with one bind per seen id —
+    // which overflows SQLITE_MAX_VARIABLE_NUMBER on machines with very many
+    // containers — fetch the machine's current ids and delete the stale ones
+    // individually. The number of removed containers per snapshot is small.
+    let seen: HashSet<&str> = seen_ids.iter().map(String::as_str).collect();
+    let existing: Vec<String> = sqlx::query_scalar("SELECT id FROM services WHERE machine_id = ?")
+        .bind(machine)
+        .fetch_all(&mut *tx)
+        .await?;
+    for id in &existing {
+        if !seen.contains(id.as_str()) {
+            sqlx::query("DELETE FROM services WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
-        q.execute(&mut *tx).await?;
     }
 
     tx.commit().await
@@ -105,16 +112,22 @@ pub async fn get_services_last_seen(
     if service_ids.is_empty() {
         return Ok(vec![]);
     }
-    let placeholders = std::iter::repeat_n("?", service_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql =
-        format!("SELECT id, last_seen FROM services WHERE id IN ({placeholders}) ORDER BY id");
-    let mut q = sqlx::query_as::<_, (String, i64)>(&sql);
-    for id in service_ids {
-        q = q.bind(id.as_str());
+    // Chunk the id list so the bind count never exceeds SQLite's variable
+    // limit, then re-sort to restore the overall `ORDER BY id`.
+    let mut out: Vec<(String, i64)> = Vec::new();
+    for chunk in service_ids.chunks(MAX_BIND_PARAMS) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id, last_seen FROM services WHERE id IN ({placeholders})");
+        let mut q = sqlx::query_as::<_, (String, i64)>(&sql);
+        for id in chunk {
+            q = q.bind(id.as_str());
+        }
+        out.extend(q.fetch_all(pool).await?);
     }
-    q.fetch_all(pool).await
+    out.sort();
+    Ok(out)
 }
 
 pub async fn removed_service_ids(
@@ -122,24 +135,20 @@ pub async fn removed_service_ids(
     machine: &str,
     current_ids: &[String],
 ) -> sqlx::Result<Vec<String>> {
-    if current_ids.is_empty() {
-        return sqlx::query_scalar("SELECT id FROM services WHERE machine_id = ? ORDER BY id")
+    // Fetch every id for the machine and subtract the current set in memory.
+    // A `NOT IN (...)` clause would bind one parameter per current id and
+    // overflow SQLITE_MAX_VARIABLE_NUMBER when a machine has very many
+    // containers. The result stays ordered because the query is `ORDER BY id`.
+    let all: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM services WHERE machine_id = ? ORDER BY id")
             .bind(machine)
             .fetch_all(pool)
-            .await;
-    }
-
-    let placeholders = std::iter::repeat_n("?", current_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT id FROM services WHERE machine_id = ? AND id NOT IN ({placeholders}) ORDER BY id"
-    );
-    let mut q = sqlx::query_scalar(&sql).bind(machine);
-    for id in current_ids {
-        q = q.bind(id);
-    }
-    q.fetch_all(pool).await
+            .await?;
+    let current: HashSet<&str> = current_ids.iter().map(String::as_str).collect();
+    Ok(all
+        .into_iter()
+        .filter(|id| !current.contains(id.as_str()))
+        .collect())
 }
 
 pub async fn get_npm_host(
@@ -199,18 +208,25 @@ pub async fn get_npm_hosts_for_services(
     if service_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", service_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT service_id, npm_index, npm_id FROM npm_hosts \
-         WHERE service_id IN ({placeholders}) ORDER BY service_id, npm_index"
-    );
-    let mut q = sqlx::query_as(&sql);
-    for id in service_ids {
-        q = q.bind(id);
+    // Chunk to stay under SQLite's bind-parameter limit, then re-sort to
+    // restore the overall `ORDER BY service_id, npm_index`.
+    let mut out: Vec<(String, i64, i64)> = Vec::new();
+    for chunk in service_ids.chunks(MAX_BIND_PARAMS) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT service_id, npm_index, npm_id FROM npm_hosts \
+             WHERE service_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        out.extend(q.fetch_all(pool).await?);
     }
-    q.fetch_all(pool).await
+    out.sort();
+    Ok(out)
 }
 
 /// Record an NPM proxy host whose service has left a snapshot but whose grace
@@ -305,18 +321,25 @@ pub async fn get_cf_records_for_services(
     if service_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", service_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT service_id, record_id FROM cf_dns_records \
-         WHERE service_id IN ({placeholders}) ORDER BY service_id"
-    );
-    let mut q = sqlx::query_as(&sql);
-    for id in service_ids {
-        q = q.bind(id);
+    // Chunk to stay under SQLite's bind-parameter limit, then re-sort to
+    // restore the overall `ORDER BY service_id`.
+    let mut out: Vec<(String, String)> = Vec::new();
+    for chunk in service_ids.chunks(MAX_BIND_PARAMS) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT service_id, record_id FROM cf_dns_records \
+             WHERE service_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        out.extend(q.fetch_all(pool).await?);
     }
-    q.fetch_all(pool).await
+    out.sort();
+    Ok(out)
 }
 
 /// Record a Cloudflare DNS record whose service has left a snapshot but whose
@@ -823,6 +846,60 @@ mod tests {
         let p = pool().await;
         let rows = get_services_last_seen(&p, &[]).await.unwrap();
         assert!(rows.is_empty());
+    }
+
+    // A machine with very many containers produces an id list longer than
+    // SQLITE_MAX_VARIABLE_NUMBER (32766).  The old IN/NOT IN builders bound one
+    // parameter per id, so past that count SQLite rejects the statement with
+    // "too many SQL variables" and every query for that machine fails.  These
+    // tests exercise the id-list functions with an oversized input; they must
+    // succeed rather than error.
+    const OVER_LIMIT: usize = 40_000;
+
+    #[tokio::test]
+    async fn get_services_last_seen_handles_huge_id_list() {
+        let p = pool().await;
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.10".into(),
+                taken_at: 42,
+                containers: vec![entry("app", &[])],
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut ids: Vec<String> = (0..OVER_LIMIT).map(|i| format!("m1/c{i}")).collect();
+        ids.push("m1/app".to_string());
+
+        let rows = get_services_last_seen(&p, &ids).await.unwrap();
+        assert_eq!(rows, vec![("m1/app".to_string(), 42_i64)]);
+    }
+
+    #[tokio::test]
+    async fn removed_service_ids_handles_huge_current_list() {
+        let p = pool().await;
+        upsert_snapshot(
+            &p,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.10".into(),
+                taken_at: 100,
+                containers: vec![entry("a", &[]), entry("b", &[])],
+            },
+        )
+        .await
+        .unwrap();
+
+        // A large "still present" set that includes a but not b: b must be
+        // reported removed without the query blowing the variable limit.
+        let mut current: Vec<String> = (0..OVER_LIMIT).map(|i| format!("m1/x{i}")).collect();
+        current.push("m1/a".to_string());
+
+        let removed = removed_service_ids(&p, "m1", &current).await.unwrap();
+        assert_eq!(removed, vec!["m1/b".to_string()]);
     }
 
     #[tokio::test]
