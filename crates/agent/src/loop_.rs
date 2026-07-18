@@ -93,7 +93,13 @@ async fn run_until<Sig, Fut>(
             }
         }
 
-        next += interval;
+        // Floor the schedule at now() before advancing so a push slower than
+        // the interval doesn't leave `next` in the past: without this, every
+        // subsequent `sleep_until` returns immediately and the agent busy-polls
+        // with no idle period until it catches up. Flooring guarantees at least
+        // a full interval of idle after a slow tick while preserving the steady
+        // cadence when pushes are fast.
+        next = next.max(Instant::now()) + interval;
         tokio::select! {
             () = sleep_until(next) => {},
             () = &mut shutdown => {
@@ -300,6 +306,136 @@ mod tests {
             result.is_ok(),
             "agent must exit when a shutdown signal is raised during an in-flight push"
         );
+    }
+
+    /// Records the wall-clock start of every enumeration and raises the
+    /// shutdown signal once `stop_after` enumerations have happened, so the
+    /// loop exits deterministically.
+    struct RecordingSource {
+        starts: std::sync::Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+        stop_after: usize,
+        signal: EdgeSignal,
+    }
+
+    #[async_trait]
+    impl ContainerSource for RecordingSource {
+        async fn list(&self) -> anyhow::Result<Vec<RawContainer>> {
+            let n = {
+                let mut starts = self.starts.lock().unwrap();
+                starts.push(tokio::time::Instant::now());
+                starts.len()
+            };
+            if n >= self.stop_after {
+                self.signal.fire();
+            }
+            Ok(vec![labelled("a")])
+        }
+
+        fn label(&self) -> &str {
+            "RecordingSource"
+        }
+    }
+
+    /// A minimal HTTP endpoint that returns 204 for every request, but delays
+    /// the *first* response by `first_delay` to simulate a push slower than the
+    /// tick interval. Each connection is served independently and closed, so
+    /// reqwest opens a fresh connection per push.
+    async fn slow_first_push_server(first_delay: Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let delay = if first {
+                    first = false;
+                    first_delay
+                } else {
+                    Duration::ZERO
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    // Drain whatever arrived; a small POST fits in one read.
+                    let _ = sock.read(&mut buf).await;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                        )
+                        .await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn slow_push_does_not_cause_busy_polling() {
+        // When a push runs slower than the interval, the schedule falls behind
+        // wall-clock time. Without a floor at now(), every subsequent
+        // `sleep_until` targets an instant already in the past and returns
+        // immediately, so the agent polls back-to-back with no idle period
+        // until it "catches up". Every tick after the slow one must still be
+        // separated by at least the interval.
+        let interval = Duration::from_millis(50);
+        let signal = EdgeSignal::new();
+        let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // First push takes 4x the interval, the rest are immediate.
+        let base = slow_first_push_server(Duration::from_millis(200)).await;
+        let client = crate::push::PushClient::new(base, "s").unwrap();
+
+        let sources: Vec<Box<dyn ContainerSource>> = vec![Box::new(RecordingSource {
+            starts: starts.clone(),
+            stop_after: 4,
+            signal: signal.clone(),
+        })];
+
+        let make_shutdown = {
+            let signal = signal.clone();
+            move || signal.clone().listen()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_until(
+                MachineId::new("m1"),
+                "10.0.0.10".into(),
+                sources,
+                client,
+                interval,
+                make_shutdown,
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "loop should exit after the shutdown signal");
+
+        let starts = starts.lock().unwrap().clone();
+        assert!(
+            starts.len() >= 3,
+            "expected several polls, got {}",
+            starts.len()
+        );
+
+        // Skip the gap that spans the slow push; inspect the ticks after it.
+        let floor = interval / 2;
+        for pair in starts.windows(2).skip(1) {
+            let gap = pair[1].duration_since(pair[0]);
+            assert!(
+                gap >= floor,
+                "consecutive polls were only {gap:?} apart (interval {interval:?}); \
+                 the agent is busy-polling after a slow push instead of idling",
+            );
+        }
     }
 
     #[tokio::test]
