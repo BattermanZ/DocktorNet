@@ -331,10 +331,21 @@ impl Reconciler {
             .await
             .map_err(|err| ReconcileError::External(err.into()))?;
         match existing {
+            // The host was deleted out-of-band in NPM, so the stored id is dead.
+            // PUTting to it would 404; recreate the host and remap to the new id.
+            None => {
+                tracing::info!(service_id, npm_id, "npm host missing, recreating");
+                let created = client
+                    .create_proxy_host(token, &payload)
+                    .await
+                    .map_err(|err| ReconcileError::External(err.into()))?;
+                crate::storage::set_npm_host(&self.db, service_id, host.index.into(), created.id)
+                    .await?;
+            }
             Some(found) if found.matches_payload(&payload) => {
                 tracing::debug!(service_id, npm_id, "npm host already in sync");
             }
-            _ => {
+            Some(_) => {
                 tracing::info!(service_id, npm_id, "npm host updated");
                 client
                     .update_proxy_host(token, npm_id, &payload)
@@ -1953,6 +1964,92 @@ mod tests {
         create.assert_async().await;
         get.assert_async().await;
         update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn npm_recreates_host_when_deleted_in_npm() {
+        // A host is mapped (id 50) but has been deleted out-of-band in NPM, so
+        // GET /proxy-hosts/50 returns 404.  reconcile_npm must recreate the host
+        // (POST) and persist the new id, NOT PUT to the dead id 50.
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // The mapped host no longer exists in NPM.
+        let get = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(404)
+            .with_body(r#"{"error":{"message":"not found"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // PUTting to the dead id must never happen.
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        // Instead the host is recreated with a fresh id.
+        let create = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"{"id":77,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        let snap = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at: 1,
+            containers: vec![ContainerEntry {
+                name: "app".into(),
+                labels: npm_host_labels("a.example.com"),
+            }],
+        };
+        // Seed the service row and a stale mapping so reconcile takes the
+        // get/verify path against id 50.
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+
+        reconciler.reconcile_snapshot(&snap).await.unwrap();
+
+        get.assert_async().await;
+        update.assert_async().await;
+        create.assert_async().await;
+        // The mapping now points at the recreated host id.
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
+            Some(77)
+        );
     }
 
     #[tokio::test]
