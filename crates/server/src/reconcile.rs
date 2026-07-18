@@ -90,6 +90,15 @@ pub enum ReconcileError {
         index: u8,
         hosts: Vec<String>,
     },
+    #[error(
+        "NPM host {service_id} (index {index}) matched an existing host serving {existing:?} but labels only manage {wanted:?}; refusing to adopt and drop the unmanaged domains"
+    )]
+    AdoptWouldDropDomains {
+        service_id: String,
+        index: u8,
+        existing: Vec<String>,
+        wanted: Vec<String>,
+    },
 }
 
 /// Gatus files for containers that temporarily disappear from a snapshot (e.g.
@@ -240,46 +249,80 @@ impl Reconciler {
 
         // Resolve the NPM host id: an existing mapping, a fresh create, or an
         // adoption of a host that already exists in NPM.
-        let npm_id =
-            match crate::storage::get_npm_host(&self.db, service_id, host.index.into()).await? {
-                Some(id) => id,
-                None => match client.create_proxy_host(token, &payload).await {
-                    Ok(created) => {
-                        tracing::info!(service_id, npm_id = created.id, "npm host created");
-                        crate::storage::set_npm_host(
-                            &self.db,
+        let npm_id = match crate::storage::get_npm_host(&self.db, service_id, host.index.into())
+            .await?
+        {
+            Some(id) => id,
+            None => match client.create_proxy_host(token, &payload).await {
+                Ok(created) => {
+                    tracing::info!(service_id, npm_id = created.id, "npm host created");
+                    crate::storage::set_npm_host(
+                        &self.db,
+                        service_id,
+                        host.index.into(),
+                        created.id,
+                    )
+                    .await?;
+                    // A freshly created host already matches the payload.
+                    return Ok(());
+                }
+                Err(err) if self.options.adopt_existing => {
+                    let existing = client
+                        .find_proxy_host_by_any_domain(token, &host.hosts)
+                        .await
+                        .map_err(|e| ReconcileError::External(e.into()))?
+                        .ok_or_else(|| ReconcileError::External(err.into()))?;
+
+                    // The match only requires a single overlapping domain,
+                    // so the existing host may carry others we do not
+                    // manage. Overwriting it with our payload would silently
+                    // drop those domains, so refuse to adopt (and clobber) a
+                    // host that serves more than our labels intend.
+                    let unmanaged: Vec<String> = existing
+                        .domain_names
+                        .iter()
+                        .filter(|name| {
+                            !host
+                                .hosts
+                                .iter()
+                                .any(|wanted| wanted.eq_ignore_ascii_case(name))
+                        })
+                        .cloned()
+                        .collect();
+                    if !unmanaged.is_empty() {
+                        tracing::error!(
                             service_id,
-                            host.index.into(),
-                            created.id,
-                        )
-                        .await?;
-                        // A freshly created host already matches the payload.
-                        return Ok(());
+                            index = host.index,
+                            npm_id = existing.id,
+                            unmanaged = ?unmanaged,
+                            "refusing to adopt NPM host: it serves domains we do not manage; adopting would drop them"
+                        );
+                        return Err(ReconcileError::AdoptWouldDropDomains {
+                            service_id: service_id.to_string(),
+                            index: host.index,
+                            existing: existing.domain_names.clone(),
+                            wanted: host.hosts.clone(),
+                        });
                     }
-                    Err(err) if self.options.adopt_existing => {
-                        let existing = client
-                            .find_proxy_host_by_any_domain(token, &host.hosts)
-                            .await
-                            .map_err(|e| ReconcileError::External(e.into()))?
-                            .ok_or_else(|| ReconcileError::External(err.into()))?;
-                        tracing::info!(service_id, npm_id = existing.id, "npm host adopted");
-                        // Persist the mapping before any further call.  If a later
-                        // step fails (e.g. NPM overloaded), the next reconcile takes
-                        // the get/update path instead of re-adopting — which would
-                        // otherwise loop forever, each adoption triggering an nginx
-                        // reload and keeping NPM pegged.
-                        crate::storage::set_npm_host(
-                            &self.db,
-                            service_id,
-                            host.index.into(),
-                            existing.id,
-                        )
-                        .await?;
-                        existing.id
-                    }
-                    Err(err) => return Err(ReconcileError::External(err.into())),
-                },
-            };
+
+                    tracing::info!(service_id, npm_id = existing.id, "npm host adopted");
+                    // Persist the mapping before any further call.  If a later
+                    // step fails (e.g. NPM overloaded), the next reconcile takes
+                    // the get/update path instead of re-adopting — which would
+                    // otherwise loop forever, each adoption triggering an nginx
+                    // reload and keeping NPM pegged.
+                    crate::storage::set_npm_host(
+                        &self.db,
+                        service_id,
+                        host.index.into(),
+                        existing.id,
+                    )
+                    .await?;
+                    existing.id
+                }
+                Err(err) => return Err(ReconcileError::External(err.into())),
+            },
+        };
 
         // Only update — which makes NPM regenerate its config and reload nginx —
         // when the stored host has actually drifted from the desired payload.
@@ -3038,6 +3081,105 @@ mod tests {
         assert_eq!(
             storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
             Some(90)
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_adopt_refuses_to_drop_domains_of_matched_host() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _create = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(400)
+            .with_body(r#"{"error":{"message":"domain already in use"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // The pre-existing NPM host carries a second domain (b.example.com) that
+        // our labels do not manage. It is matched by the single overlapping
+        // domain a.example.com.
+        let _list = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"[{"id":91,"domain_names":["a.example.com","b.example.com"]}]"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // Provide the GET the (buggy) adoption path would follow, so the failing
+        // signal is the clobbering PUT below rather than a missing mock.
+        let _get = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/91")
+            .with_status(200)
+            .with_body(
+                r#"{"id":91,"domain_names":["a.example.com","b.example.com"],"forward_scheme":"http",
+                    "forward_host":"10.0.0.1","forward_port":3000,"certificate_id":0,
+                    "ssl_forced":0,"http2_support":0,"hsts_enabled":0,
+                    "hsts_subdomains":0,"block_exploits":1,"allow_websocket_upgrade":1}"#,
+            )
+            .create_async()
+            .await;
+        // A PUT here would overwrite domain_names with only [a.example.com],
+        // silently dropping b.example.com. It must never be issued.
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/91")
+            .with_status(200)
+            .with_body(r#"{"id":91,"domain_names":["a.example.com"]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: true,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        // Adoption is refused (it would drop an unmanaged domain), so the
+        // reconcile surfaces a failure.
+        let result = reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 1,
+                containers: vec![ContainerEntry {
+                    name: "app".into(),
+                    labels: npm_host_labels("a.example.com"),
+                }],
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "reconcile should surface the refused adoption"
+        );
+        // No clobbering PUT was issued...
+        update.assert_async().await;
+        // ...and the host that serves more than we manage was not taken over.
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
+            None
         );
     }
 
