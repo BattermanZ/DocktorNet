@@ -263,12 +263,20 @@ impl NpmClient {
     }
 
     pub async fn delete_proxy_host(&self, token: &str, id: i64) -> Result<(), NpmError> {
-        self.http
+        let resp = self
+            .http
             .delete(self.endpoint(&format!("api/nginx/proxy-hosts/{id}")))
             .bearer_auth(token)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        // An already-absent host is the desired end state: treat 404 as a
+        // successful delete so the caller clears its pending_npm_removals row
+        // instead of retrying forever and feeding the breaker a spurious
+        // failure.  Mirrors get_proxy_host's NOT_FOUND handling.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        resp.error_for_status()?;
 
         Ok(())
     }
@@ -757,5 +765,28 @@ mod tests {
         m.assert_async().await;
         assert_eq!(got.id, 7);
         assert_eq!(got.certificate_id, Some(12));
+    }
+
+    #[tokio::test]
+    async fn delete_proxy_host_treats_404_as_success() {
+        // NPM returns 404 when the host is already gone (deleted out-of-band, or
+        // a prior delete succeeded but its response was lost).  Deleting an
+        // already-absent host must be a no-op success; otherwise the caller
+        // leaves a stuck pending_npm_removals row and feeds the circuit breaker
+        // a spurious failure forever.  Mirrors get_proxy_host's 404 handling.
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("DELETE", "/api/nginx/proxy-hosts/42")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = NpmClient::new(crate::config::NpmConfig {
+            url: Url::parse(&server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        client.delete_proxy_host("tok", 42).await.unwrap();
+        m.assert_async().await;
     }
 }

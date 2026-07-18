@@ -376,11 +376,36 @@ impl Reconciler {
         let existing_id = crate::storage::get_cf_dns_record(&self.db, service_id).await?;
 
         if let Some(id) = existing_id {
-            tracing::info!(service_id, record_id = %id, "cf record updated");
-            client
-                .update_record(&id, &payload)
+            // Only PUT when the record has actually drifted.  The intent hash is
+            // per-machine, so any unrelated label change re-runs this loop for
+            // every cf_dns service; an unconditional update would issue a
+            // redundant public-API write each time.  Mirrors resync_cloudflare.
+            let existing = client
+                .get_record(&id)
                 .await
                 .map_err(|err| ReconcileError::External(err.into()))?;
+            match existing {
+                // The record was deleted out-of-band, so the stored id is dead;
+                // recreate it and remap to the new id rather than PUT to a 404.
+                None => {
+                    tracing::info!(service_id, "cf record missing, recreating");
+                    let created = client
+                        .create_record(&payload)
+                        .await
+                        .map_err(|err| ReconcileError::External(err.into()))?;
+                    crate::storage::set_cf_dns_record(&self.db, service_id, &created.id).await?;
+                }
+                Some(found) if !cf_record_matches(&found, &payload) => {
+                    tracing::info!(service_id, record_id = %id, "cf record drifted, updating");
+                    client
+                        .update_record(&id, &payload)
+                        .await
+                        .map_err(|err| ReconcileError::External(err.into()))?;
+                }
+                Some(_) => {
+                    tracing::debug!(service_id, record_id = %id, "cf record already in sync");
+                }
+            }
             return Ok(());
         }
 
@@ -2660,6 +2685,17 @@ mod tests {
             .expect(0)
             .create_async()
             .await;
+        // The reconcile fetches the existing record to drift-check it; it drifted
+        // while the service was gone (stale content), so an update is warranted.
+        let get = cf_server
+            .mock("GET", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(
+                r#"{"success":true,"result":{"id":"rec-1","name":"app.example.com","content":"stale.example.com","proxied":false}}"#,
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
         // The restored mapping drives an update of the original record (rec-1).
         let update = cf_server
             .mock("PUT", "/zones/z/dns_records/rec-1")
@@ -2706,6 +2742,7 @@ mod tests {
 
         create.assert_async().await;
         delete.assert_async().await;
+        get.assert_async().await;
         update.assert_async().await;
         // The mapping is restored to the original record id and the pending row
         // is cleared.
@@ -2719,6 +2756,79 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn cf_reconcile_skips_update_when_record_in_sync() {
+        // A per-snapshot Cloudflare reconcile for a service whose DNS record is
+        // already in its desired state must NOT issue a redundant update_record
+        // PUT.  The snapshot intent hash is per-machine, so any unrelated label
+        // change re-runs the intended loop; without a drift check every cf_dns
+        // service on the machine gets a wasteful public-API write every time.
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut cf_server = mockito::Server::new_async().await;
+        let _zone = cf_server
+            .mock("GET", "/zones/z")
+            .with_status(200)
+            .with_body(r#"{"success":true,"result":{"id":"z","name":"example.com"}}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // The existing record already matches the desired payload, so the
+        // reconcile must fetch it to compare...
+        let get = cf_server
+            .mock("GET", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(
+                r#"{"success":true,"result":{"id":"rec-1","name":"app.example.com","content":"home.example.com","proxied":false}}"#,
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // ...and must NOT PUT an unchanged record.
+        let update = cf_server
+            .mock("PUT", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(
+                r#"{"success":true,"result":{"id":"rec-1","name":"app.example.com","content":"home.example.com","proxied":false}}"#,
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients_with_cf(&cf_server.url(), &cf_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        // Seed the service and its existing record mapping.
+        let snap = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at: 1,
+            containers: vec![ContainerEntry {
+                name: "app".into(),
+                labels: cf_dns_labels("app", "home.example.com"),
+            }],
+        };
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
+            .await
+            .unwrap();
+
+        reconciler.reconcile_snapshot(&snap).await.unwrap();
+
+        get.assert_async().await;
+        update.assert_async().await;
     }
 
     #[tokio::test]
