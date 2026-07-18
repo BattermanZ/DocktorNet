@@ -30,6 +30,7 @@ axum        = { workspace = true }
 reqwest     = { workspace = true }
 url         = { workspace = true }
 sqlx        = { workspace = true }
+subtle      = { workspace = true }
 
 [dev-dependencies]
 reqwest  = { workspace = true }
