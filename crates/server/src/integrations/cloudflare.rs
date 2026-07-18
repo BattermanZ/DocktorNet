@@ -193,8 +193,14 @@ impl CloudflareClient {
             .delete(self.endpoint(&format!("zones/{}/dns_records/{id}", self.zone_id)))
             .bearer_auth(&self.api_token)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        // An already-absent record is the desired end state: treat 404 as a
+        // successful delete so the caller can clear its DB pointer and cache the
+        // intent hash instead of retrying forever.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let resp = resp.error_for_status()?;
 
         let response = resp.json::<DeleteResponse>().await?;
         if response.success {
@@ -392,6 +398,40 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "should time out promptly, took {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_record_treats_404_as_success() {
+        // Cloudflare returns 404 when the record is already gone.  Deleting an
+        // already-absent record must be a no-op success, otherwise the caller
+        // leaves a stale DB pointer and blocks intent-hash caching, retrying
+        // forever.
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("DELETE", "/client/v4/zones/zone-id/dns_records/gone")
+            .with_status(404)
+            .with_body(
+                serde_json::json!({
+                    "success": false,
+                    "errors": [{ "code": 81044, "message": "Record does not exist." }],
+                    "messages": [],
+                    "result": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "t".to_string(),
+                zone_id: "zone-id".to_string(),
+            },
+            format!("{}/client/v4", server.url()),
+        );
+
+        client.delete_record("gone").await.unwrap();
+        m.assert_async().await;
     }
 
     #[tokio::test]
