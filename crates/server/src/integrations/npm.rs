@@ -319,12 +319,26 @@ pub fn proxy_payload(
 }
 
 /// Resolve a certificate for a proxy host that may carry several domains. NPM
-/// stores one certificate per proxy host, so we pick the first domain that has
-/// a matching (exact, then wildcard) cert.
+/// stores one certificate per proxy host, so we only pick a cert that covers
+/// *every* domain (exact or wildcard). Selecting one that matches a subset
+/// would serve the remaining domains a mismatched cert while `ssl_forced`
+/// redirects them to HTTPS, breaking them.
 pub fn matching_cert_id_for_hosts(hosts: &[String], certs: &[Certificate]) -> Option<i64> {
-    hosts
+    if hosts.is_empty() {
+        return None;
+    }
+    certs
         .iter()
-        .find_map(|host| matching_cert_id(host, certs))
+        .find(|cert| hosts.iter().all(|host| cert_covers(cert, host)))
+        .map(|cert| cert.id)
+}
+
+/// Whether `cert` covers `host` by an exact (case-insensitive) or wildcard
+/// domain entry.
+fn cert_covers(cert: &Certificate, host: &str) -> bool {
+    cert.domain_names
+        .iter()
+        .any(|domain| domain.eq_ignore_ascii_case(host) || wildcard_matches(domain, host))
 }
 
 pub fn matching_cert_id(host: &str, certs: &[Certificate]) -> Option<i64> {
@@ -433,24 +447,56 @@ mod tests {
     #[test]
     fn payload_carries_every_domain_on_one_entry() {
         let mut multi = host();
-        multi.hosts = vec!["app.example.com".to_string(), "app.mydomain.org".to_string()];
+        multi.hosts = vec![
+            "app.example.com".to_string(),
+            "app.mydomain.org".to_string(),
+        ];
         let payload = proxy_payload(&multi, "web.internal", Some(42));
 
         assert_eq!(
             payload.domain_names,
-            vec!["app.example.com".to_string(), "app.mydomain.org".to_string()]
+            vec![
+                "app.example.com".to_string(),
+                "app.mydomain.org".to_string()
+            ]
         );
     }
 
     #[test]
-    fn cert_for_hosts_matches_on_a_later_domain() {
+    fn cert_for_hosts_requires_coverage_of_every_domain() {
+        // A single cert whose SANs cover both domains is selected even when the
+        // matching entry for the second domain comes later in its list.
+        let certs = vec![Certificate {
+            id: 9,
+            domain_names: vec![
+                "app.example.com".to_string(),
+                "app.mydomain.org".to_string(),
+            ],
+        }];
+        let hosts = vec![
+            "app.example.com".to_string(),
+            "app.mydomain.org".to_string(),
+        ];
+
+        assert_eq!(matching_cert_id_for_hosts(&hosts, &certs), Some(9));
+    }
+
+    #[test]
+    fn cert_covering_only_one_domain_is_not_selected() {
+        // A cert that matches only one of the host's domains must NOT be
+        // selected: NPM stores one cert per proxy host, so the other domain
+        // would be served a mismatched cert while ssl_forced redirects it to
+        // HTTPS, breaking it.
         let certs = vec![Certificate {
             id: 9,
             domain_names: vec!["app.mydomain.org".to_string()],
         }];
-        let hosts = vec!["app.example.com".to_string(), "app.mydomain.org".to_string()];
+        let hosts = vec![
+            "app.example.com".to_string(),
+            "app.mydomain.org".to_string(),
+        ];
 
-        assert_eq!(matching_cert_id_for_hosts(&hosts, &certs), Some(9));
+        assert_eq!(matching_cert_id_for_hosts(&hosts, &certs), None);
     }
 
     #[test]
