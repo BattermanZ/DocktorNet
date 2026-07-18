@@ -1,12 +1,51 @@
 # Docktornet
 
-Docker/Podman label-driven reconciliation for Nginx Proxy Manager, Cloudflare DNS, and Gatus.
-
-See [the v1 spec](docs/superpowers/specs/2026-05-21-docktornet-design.md) for design details.
+Docktornet is a declarative infrastructure reconciler for self-hosted services.
+Containers describe reverse-proxy, DNS, and monitoring intent through
+`docktornet.*` labels; Docktornet discovers that intent and reconciles Nginx
+Proxy Manager, Cloudflare DNS, and Gatus from one source of truth.
 
 ## Status
 
-**v1 in progress.** Plan 1 (foundation) implemented: workspace, agent, server, SQLite snapshot ingest.
+**v1.0.0 is complete.** The agent/server architecture, SQLite-backed ownership,
+Nginx Proxy Manager, Cloudflare DNS, Gatus, full resync, health endpoint,
+deployment manifests, and cutover runbook are implemented.
+
+## Why Docktornet Is Technically Interesting
+
+- **Declarative control plane:** infrastructure follows container labels instead
+  of separately maintained proxy, DNS, and monitoring configuration.
+- **Distributed discovery:** lightweight agents enumerate Docker or Podman
+  sockets on each host and send authenticated snapshots to a central server.
+- **Stateful reconciliation:** SQLite tracks snapshots and resource ownership so
+  the server can converge external systems and remove resources it owns when
+  their labels disappear.
+- **Failure-aware integrations:** reconciliation includes request timeouts,
+  no-op detection, Cloudflare rate-limit handling, an NPM circuit breaker, and
+  atomic Gatus configuration writes.
+- **Guarded adoption:** dry-run is the default and existing resources are only
+  adopted when explicitly enabled.
+- **Small deployment shape:** three Rust crates produce an agent and a central
+  server, with Compose manifests for each role.
+
+```mermaid
+flowchart LR
+    engines[Docker / Podman] --> agents[Docktornet agents]
+    agents -->|Authenticated snapshots| server[Docktornet server]
+    server <--> state[(SQLite ownership state)]
+    server --> npm[Nginx Proxy Manager]
+    server --> cf[Cloudflare DNS]
+    server --> gatus[Gatus]
+```
+
+## Architecture And Operations
+
+- `docktornet-core` parses labels and defines the shared snapshot model.
+- `docktornet-agent` discovers containers and pushes host snapshots.
+- `docktornet-server` stores desired state and reconciles external providers.
+- [Design specification](docs/superpowers/specs/2026-05-21-docktornet-design.md)
+- [Deployment guide](docs/deployment.md)
+- [v1 cutover runbook](docs/runbooks/v1-cutover.md)
 
 ## Quick start (local dev)
 
@@ -94,3 +133,13 @@ services:
       docktornet.gatus.2.interval: 60s
       docktornet.gatus.2.telegram: "false"
 ```
+
+## Development
+
+The `Justfile` exposes the standard formatting, linting, checking, testing, and
+local run commands. Run `just` to list them.
+
+## Licence
+
+Docktornet is licensed under the GNU Affero General Public License v3.0 or
+later. See [LICENSE](LICENSE).
