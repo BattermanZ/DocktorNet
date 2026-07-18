@@ -478,6 +478,28 @@ impl Reconciler {
                     if expected.contains(&path) {
                         continue;
                     }
+                    // Respect the removal grace period.  A container that briefly
+                    // leaves a snapshot (e.g. a restart) has its service row
+                    // cascade-deleted, so it is no longer "expected", yet
+                    // apply_inner deliberately keeps its file during the grace
+                    // window to preserve Gatus alert state.  The file's mtime is
+                    // the last moment its service was present (write_service_file
+                    // rewrites it on every reconcile), so it is a sound proxy for
+                    // last-seen once the service row is gone.  Deleting a
+                    // still-in-grace file here would reset alert state — exactly
+                    // what the grace period exists to prevent.
+                    let within_grace = match entry.metadata().await {
+                        Ok(meta) => meta
+                            .modified()
+                            .ok()
+                            .and_then(|m| m.elapsed().ok())
+                            .is_some_and(|age| age.as_secs() < GATUS_REMOVAL_GRACE_SECS as u64),
+                        Err(_) => false,
+                    };
+                    if within_grace {
+                        tracing::debug!(path = %path.display(), "orphan gatus file still within grace period, keeping");
+                        continue;
+                    }
                     tracing::info!(path = %path.display(), "removing orphan gatus file");
                     match tokio::fs::remove_file(&path).await {
                         Ok(()) => {}
@@ -1618,12 +1640,85 @@ mod tests {
             .unwrap();
         assert!(service_file.exists(), "file should survive grace period");
 
+        // Age the file past the grace period so the orphan sweep is allowed to
+        // remove it (the file's mtime is the sweep's proxy for last-seen).
+        let old = std::time::SystemTime::now()
+            - std::time::Duration::from_secs((GATUS_REMOVAL_GRACE_SECS + 60) as u64);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&service_file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
         // full_resync should sweep the orphan file (service is no longer in DB).
         let report = reconciler.full_resync().await.unwrap();
         assert_eq!(report.failed, 0);
         assert!(
             !service_file.exists(),
             "full_resync must remove the orphan gatus file"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_resync_keeps_orphan_gatus_file_within_grace() {
+        // A container that briefly leaves the snapshot (e.g. a restart) has its
+        // service row cascade-deleted from the DB, so it is no longer "expected"
+        // by the orphan sweep — yet apply_inner deliberately keeps its gatus file
+        // during the grace period to preserve Gatus alert state.  A full_resync
+        // that coincides with the grace window must NOT delete the file.
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = Reconciler::new(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: gatus_dir.clone(),
+            },
+        );
+
+        let mut labels = BTreeMap::new();
+        labels.insert("docktornet.gatus.0.url".into(), "https://x".into());
+        labels.insert("docktornet.gatus.0.interval".into(), "30s".into());
+
+        // Seed the service.
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "127.0.0.1".into(),
+                taken_at: 1,
+                containers: vec![ContainerEntry {
+                    name: "app".into(),
+                    labels,
+                }],
+            })
+            .await
+            .unwrap();
+        let service_file = gatus::service_file_path(&gatus_dir, "m1/app");
+        assert!(service_file.exists());
+
+        // Remove the service within the grace period so apply_inner keeps the
+        // file (its mtime stays recent, standing in for last-seen).
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "127.0.0.1".into(),
+                taken_at: 31,
+                containers: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(service_file.exists(), "file should survive grace period");
+
+        // A coinciding full_resync must respect the grace period and leave the
+        // still-in-grace file in place.
+        let report = reconciler.full_resync().await.unwrap();
+        assert_eq!(report.failed, 0);
+        assert!(
+            service_file.exists(),
+            "full_resync must not delete a gatus file that is still within the grace period"
         );
     }
 
