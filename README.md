@@ -7,9 +7,11 @@ Proxy Manager, Cloudflare DNS, and Gatus from one source of truth.
 
 ## Status
 
-**v1.0.0 is complete.** The agent/server architecture, SQLite-backed ownership,
-Nginx Proxy Manager, Cloudflare DNS, Gatus, full resync, health endpoint,
-deployment manifests, and cutover runbook are implemented.
+**v1.1.0 is the current stable release.** The agent/server architecture,
+SQLite-backed ownership, Nginx Proxy Manager, Cloudflare DNS, Gatus, full
+resync, health endpoint, deployment manifests, and cutover runbook are
+implemented. See the [v1.1.0 release notes](https://github.com/BattermanZ/DocktorNet/releases/tag/v1.1.0)
+for the multi-domain NPM workflow and post-v1 reliability and security changes.
 
 ## Why Docktornet Is Technically Interesting
 
@@ -18,8 +20,8 @@ deployment manifests, and cutover runbook are implemented.
 - **Distributed discovery:** lightweight agents enumerate Docker or Podman
   sockets on each host and send authenticated snapshots to a central server.
 - **Stateful reconciliation:** SQLite tracks snapshots and resource ownership so
-  the server can converge external systems and remove resources it owns when
-  their labels disappear.
+  the server can converge external systems and remove resources it owns after
+  their labels disappear and the restart grace period expires.
 - **Failure-aware integrations:** reconciliation includes request timeouts,
   no-op detection, Cloudflare rate-limit handling, an NPM circuit breaker, and
   atomic Gatus configuration writes.
@@ -46,6 +48,20 @@ flowchart LR
 - [Design specification](docs/superpowers/specs/2026-05-21-docktornet-design.md)
 - [Deployment guide](docs/deployment.md)
 - [v1 cutover runbook](docs/runbooks/v1-cutover.md)
+- [v1.1.0 release notes](https://github.com/BattermanZ/DocktorNet/releases/tag/v1.1.0)
+
+The public `GET /healthz` response contains liveness status and server time.
+Send the configured bearer token to include agent inventory; unauthenticated
+callers do not receive machine IDs, forwarding addresses, or last-seen times.
+
+### Resource removal lifecycle
+
+When a service disappears from an agent snapshot, Docktornet preserves its
+managed NPM proxy hosts, Cloudflare DNS record, and Gatus configuration for a
+five-minute restart grace period. If the service returns, its stored external
+resource mappings are restored. If it remains absent, Docktornet removes the
+owned resources; failed external deletions are persisted and retried during
+full resync.
 
 ## Quick start (local dev)
 
@@ -53,6 +69,11 @@ flowchart LR
 just run-server  # in one terminal, with server.env loaded
 just run-agent   # in another, with agent.env loaded
 ```
+
+`DOCKTORNET_SECRET` must be non-empty on the server. Agent
+`DOCKTORNET_POLL_INTERVAL` values must be at least one second. See the
+[deployment guide](docs/deployment.md) for the complete environment-variable
+reference.
 
 ## Container labels
 
@@ -72,12 +93,15 @@ To route **several public domains to the same upstream as one NPM entry**, give
 domains share that entry's port, scheme, SSL and certificate. Use a separate
 `<index>` only when you need a different upstream or settings.
 
-> **Certificates:** NPM stores one certificate per proxy host. Cert resolution
-> matches on the first listed domain that has a cert, and adoption of an
-> existing host matches on any of the listed domains. If your domains need
-> *different* certificates, use a separate `<index>` per domain instead. Domains
-> covered by a single wildcard/SAN cert (the usual reason to group them) work as
-> one entry.
+> **Certificates and adoption:** NPM stores one certificate per proxy host. When
+> `cert_id` is omitted, automatic resolution selects a certificate only when it
+> covers every listed domain (exactly or through its wildcard/SAN names). If no
+> certificate covers every domain and `ssl=true`, Docktornet refuses to publish
+> the host instead of silently downgrading it to HTTP. An explicit `cert_id` is
+> used as configured, so ensure it covers every domain. Adoption can find an
+> existing host through any listed domain, but is refused if the update would
+> drop domains that are not present in the Docktornet labels. Use a separate
+> `<index>` when domains require different certificates or settings.
 
 | Label | Required | Type | Default | Example | Notes |
 |-------|----------|------|---------|---------|-------|
