@@ -35,6 +35,8 @@ pub struct CloudflareConfig {
 pub enum ConfigError {
     #[error("missing environment variable '{0}'")]
     Missing(&'static str),
+    #[error("environment variable '{0}' must not be empty")]
+    Empty(&'static str),
     #[error("invalid boolean value for '{name}': '{value}'")]
     InvalidBool { name: &'static str, value: String },
     #[error("invalid url for '{name}': '{value}'")]
@@ -50,6 +52,14 @@ impl ServerConfig {
 
     pub fn from_map(env: HashMap<String, String>) -> Result<Self, ConfigError> {
         let required = |k: &'static str| env.get(k).cloned().ok_or(ConfigError::Missing(k));
+        let required_non_empty = |k: &'static str| {
+            let value = required(k)?;
+            if value.is_empty() {
+                Err(ConfigError::Empty(k))
+            } else {
+                Ok(value)
+            }
+        };
 
         let dry_run = parse_bool_opt(env.get("DOCKTORNET_DRY_RUN"), "DOCKTORNET_DRY_RUN", true)?;
         let adopt_existing = parse_bool_opt(
@@ -69,7 +79,7 @@ impl ServerConfig {
 
         Ok(Self {
             listen: required("DOCKTORNET_LISTEN")?,
-            secret: required("DOCKTORNET_SECRET")?,
+            secret: required_non_empty("DOCKTORNET_SECRET")?,
             db_path: PathBuf::from(required("DOCKTORNET_DB_PATH")?),
             dry_run,
             adopt_existing,
@@ -312,6 +322,27 @@ mod tests {
                 assert_eq!(name, "DOCKTORNET_FULL_RESYNC_INTERVAL");
                 assert_eq!(value, "soonish");
             }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_secret() {
+        let err = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", ""),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+        ]))
+        .unwrap_err();
+
+        match err {
+            ConfigError::Empty(name) => assert_eq!(name, "DOCKTORNET_SECRET"),
             other => panic!("unexpected error: {other:?}"),
         }
     }

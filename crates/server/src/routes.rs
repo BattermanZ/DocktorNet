@@ -2,7 +2,10 @@ use axum::Router;
 use axum::routing::{get, post};
 
 use crate::auth::{AuthState, require_bearer};
-use crate::handlers::{health, snapshot::{self, AppState}};
+use crate::handlers::{
+    health,
+    snapshot::{self, AppState},
+};
 
 pub fn build(state: AppState) -> Router {
     let auth_state = AuthState {
@@ -199,7 +202,10 @@ mod tests {
             }],
         };
 
-        let resp = app.oneshot(req("POST", Some("s3cret"), &snap)).await.unwrap();
+        let resp = app
+            .oneshot(req("POST", Some("s3cret"), &snap))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         // Snapshot is durably persisted before the ack, even though the
@@ -221,15 +227,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn healthz_lists_agents_after_snapshot_push() {
-        // Use an app that has seen the snapshot so we can verify "m1" appears in the response.
+    async fn healthz_lists_agents_with_valid_bearer() {
+        // With a valid bearer token, the agent inventory is disclosed.
         let (app, _pool, _dir) = make_app().await;
 
         // Push a snapshot for machine "m1".
         let push = req("POST", Some("s3cret"), &snap());
         app.clone().oneshot(push).await.unwrap();
 
-        // Now fetch /healthz and assert the body contains "m1".
+        // Fetch /healthz WITH the bearer token and assert the body contains "m1".
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .header("authorization", "Bearer s3cret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(get_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+        assert!(
+            body_str.contains("m1"),
+            "authed body should contain machine id m1: {body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_hides_agent_inventory_without_auth() {
+        // Unauthenticated /healthz must stay a bare liveness probe: 200, but it
+        // must NOT leak any agent's machine id or internal forward address.
+        let (app, _pool, _dir) = make_app().await;
+
+        // Push a snapshot for machine "m1" (forward_host 10.0.0.10).
+        let push = req("POST", Some("s3cret"), &snap());
+        app.clone().oneshot(push).await.unwrap();
+
+        // Fetch /healthz WITHOUT any Authorization header.
         let get_req = Request::builder()
             .method("GET")
             .uri("/healthz")
@@ -241,6 +276,13 @@ mod tests {
             .await
             .unwrap();
         let body_str = std::str::from_utf8(&body_bytes).unwrap();
-        assert!(body_str.contains("m1"), "body should contain machine id m1: {body_str}");
+        assert!(
+            !body_str.contains("m1"),
+            "unauthenticated body must not leak machine id: {body_str}"
+        );
+        assert!(
+            !body_str.contains("10.0.0.10"),
+            "unauthenticated body must not leak forward address: {body_str}"
+        );
     }
 }

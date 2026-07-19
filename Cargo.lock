@@ -386,13 +386,14 @@ dependencies = [
 
 [[package]]
 name = "docktornet-agent"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bollard",
  "docktornet-core",
  "dotenvy",
+ "futures-util",
  "humantime-serde",
  "mockito",
  "reqwest",
@@ -407,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "docktornet-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -416,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "docktornet-server"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -430,6 +431,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sqlx",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",

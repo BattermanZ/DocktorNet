@@ -46,7 +46,9 @@ pub fn render_gatus_yaml(
     // service_id is `{machine}/{container}`; fall back to the whole id if there
     // is no slash. The container half is the default endpoint name; the machine
     // half is the default group.
-    let (machine, container) = service_id.split_once('/').unwrap_or((service_id, service_id));
+    let (machine, container) = service_id
+        .split_once('/')
+        .unwrap_or((service_id, service_id));
 
     // Pass 1: resolve each monitor's display name (explicit name label, else the
     // bare stack/container name).
@@ -79,10 +81,7 @@ pub fn render_gatus_yaml(
             .zip(names)
             .map(|(monitor, name)| GatusEndpoint {
                 name,
-                group: monitor
-                    .group
-                    .clone()
-                    .unwrap_or_else(|| machine.to_string()),
+                group: monitor.group.clone().unwrap_or_else(|| machine.to_string()),
                 url: monitor.url.clone(),
                 interval: monitor.interval.clone(),
                 conditions: monitor.conditions.clone(),

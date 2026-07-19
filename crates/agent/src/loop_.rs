@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use docktornet_core::MachineId;
+use docktornet_core::{MachineId, Snapshot};
 use tokio::time::{Instant, sleep_until};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::push::PushClient;
 use crate::snapshot;
@@ -40,26 +40,427 @@ pub async fn run(
     client: PushClient,
     interval: Duration,
 ) {
+    run_until(
+        machine,
+        forward_host,
+        sources,
+        client,
+        interval,
+        shutdown_signal,
+    )
+    .await;
+}
+
+/// Core poll/push loop, parameterised over how the shutdown signal is awaited so
+/// it can be driven deterministically in tests.
+///
+/// `make_shutdown` yields the future that resolves when shutdown is requested.
+async fn run_until<Sig, Fut>(
+    machine: MachineId,
+    forward_host: String,
+    sources: Vec<Box<dyn ContainerSource>>,
+    client: PushClient,
+    interval: Duration,
+    make_shutdown: Sig,
+) where
+    Sig: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // Register the shutdown listener ONCE, up front. tokio installs a
+    // process-wide signal handler on first use and retains any signal that
+    // arrives while the future is parked, so building this future a single time
+    // means a SIGTERM/SIGINT that lands mid-push is still observed at the next
+    // sleep boundary. Rebuilding it each iteration would drop the pending edge
+    // and silently swallow the shutdown request.
+    let shutdown = make_shutdown();
+    tokio::pin!(shutdown);
+
     let mut next = Instant::now();
 
     loop {
-        let raw = crate::sockets::list_all(&sources).await;
-        let snap = snapshot::build(&machine, &forward_host, &raw);
-
-        match client.push_with_retry(&snap, 3).await {
-            Ok(()) => tracing::debug!(containers = snap.containers.len(), "snapshot pushed"),
-            Err(error) => {
-                error!(%error, "snapshot push failed after retries; will try again next tick");
+        match poll_once(&machine, &forward_host, &sources, interval).await {
+            Some(snap) => match client.push_with_retry(&snap, 3).await {
+                Ok(()) => tracing::debug!(containers = snap.containers.len(), "snapshot pushed"),
+                Err(error) => {
+                    error!(%error, "snapshot push failed after retries; will try again next tick");
+                }
+            },
+            None => {
+                // A source failed to enumerate this tick, so the snapshot would
+                // be a partial view of the machine. Pushing it would let the
+                // server treat the missing containers as removed and tear down
+                // their DNS/proxy resources. Skip the push and retry next tick.
             }
         }
 
-        next += interval;
+        // Floor the schedule at now() before advancing so a push slower than
+        // the interval doesn't leave `next` in the past: without this, every
+        // subsequent `sleep_until` returns immediately and the agent busy-polls
+        // with no idle period until it catches up. Flooring guarantees at least
+        // a full interval of idle after a slow tick while preserving the steady
+        // cadence when pushes are fast.
+        next = next.max(Instant::now()) + interval;
         tokio::select! {
             () = sleep_until(next) => {},
-            () = shutdown_signal() => {
+            () = &mut shutdown => {
                 info!("shutdown signal received");
                 return;
             },
         }
+    }
+}
+
+/// Enumerate every source and build a snapshot for this tick.
+///
+/// Returns `None` when any configured source failed to enumerate: the resulting
+/// container list would be a partial view of the machine, and the server treats
+/// every pushed snapshot as the authoritative complete state. Encoding a
+/// failed enumeration as "these containers are gone" would prune healthy
+/// services' DNS records and reverse-proxy hosts, so a degraded tick must be
+/// skipped rather than pushed.
+async fn poll_once(
+    machine: &MachineId,
+    forward_host: &str,
+    sources: &[Box<dyn ContainerSource>],
+    per_source_timeout: Duration,
+) -> Option<Snapshot> {
+    let outcome = crate::sockets::list_all(sources, per_source_timeout).await;
+    if outcome.any_failed() {
+        warn!(
+            failed_sources = ?outcome.failed_sources,
+            "skipping snapshot push: a container source failed to enumerate; \
+             refusing to push a partial machine state"
+        );
+        return None;
+    }
+
+    Some(snapshot::build(machine, forward_host, &outcome.containers))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::sockets::RawContainer;
+
+    struct Fake {
+        items: Vec<RawContainer>,
+    }
+
+    #[async_trait]
+    impl ContainerSource for Fake {
+        async fn list(&self) -> anyhow::Result<Vec<RawContainer>> {
+            Ok(self.items.clone())
+        }
+
+        fn label(&self) -> &str {
+            "Fake"
+        }
+    }
+
+    struct Boom;
+
+    #[async_trait]
+    impl ContainerSource for Boom {
+        async fn list(&self) -> anyhow::Result<Vec<RawContainer>> {
+            anyhow::bail!("socket unreadable")
+        }
+
+        fn label(&self) -> &str {
+            "Boom"
+        }
+    }
+
+    fn labelled(name: &str) -> RawContainer {
+        let mut labels = BTreeMap::new();
+        labels.insert("docktornet.gatus.0.url".to_string(), "u".to_string());
+        RawContainer {
+            name: name.into(),
+            labels,
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_once_builds_snapshot_when_all_sources_succeed() {
+        let sources: Vec<Box<dyn ContainerSource>> = vec![
+            Box::new(Fake {
+                items: vec![labelled("a")],
+            }),
+            Box::new(Fake {
+                items: vec![labelled("b")],
+            }),
+        ];
+
+        let snap = poll_once(
+            &MachineId::new("m1"),
+            "10.0.0.10",
+            &sources,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("snapshot should be built when every source succeeds");
+
+        assert_eq!(snap.containers.len(), 2);
+    }
+
+    /// Models tokio's process-signal semantics as an *edge*: a listener only
+    /// observes a signal that is raised **after** the listener is created.
+    /// `listen` captures the current generation; the returned future resolves
+    /// only once `fire` bumps the generation past that captured value — exactly
+    /// like a freshly-constructed `tokio::signal::Signal` that never observes an
+    /// edge delivered before it existed.
+    #[derive(Clone)]
+    struct EdgeSignal {
+        generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl EdgeSignal {
+        fn new() -> Self {
+            Self {
+                generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }
+        }
+
+        fn fire(&self) {
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn listen(self) -> impl std::future::Future<Output = ()> + 'static {
+            let generation = self.generation;
+            let start = generation.load(std::sync::atomic::Ordering::SeqCst);
+            async move {
+                while generation.load(std::sync::atomic::Ordering::SeqCst) == start {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }
+    }
+
+    /// Raises a shutdown signal on its first enumeration, i.e. while the tick's
+    /// poll/push is in flight.
+    struct FireOnList {
+        signal: EdgeSignal,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ContainerSource for FireOnList {
+        async fn list(&self) -> anyhow::Result<Vec<RawContainer>> {
+            if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.signal.fire();
+            }
+            Ok(vec![labelled("a")])
+        }
+
+        fn label(&self) -> &str {
+            "FireOnList"
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_raised_during_in_flight_push_is_honored() {
+        // The shutdown signal is raised while the first tick's poll/push is in
+        // flight — no listener is registered at that instant. A correct loop
+        // registers its shutdown listener ONCE up front, so the pending signal
+        // is still observed at the next sleep boundary and the agent exits. The
+        // buggy loop rebuilds the listener every iteration, so the edge is lost
+        // and the agent spins forever.
+        let signal = EdgeSignal::new();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v1/snapshot")
+            .with_status(204)
+            .create_async()
+            .await;
+        let client = crate::push::PushClient::new(server.url(), "s").unwrap();
+
+        let sources: Vec<Box<dyn ContainerSource>> = vec![Box::new(FireOnList {
+            signal: signal.clone(),
+            fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })];
+
+        let make_shutdown = {
+            let signal = signal.clone();
+            move || signal.clone().listen()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_until(
+                MachineId::new("m1"),
+                "10.0.0.10".into(),
+                sources,
+                client,
+                Duration::from_millis(10),
+                make_shutdown,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "agent must exit when a shutdown signal is raised during an in-flight push"
+        );
+    }
+
+    /// Records the wall-clock start of every enumeration and raises the
+    /// shutdown signal once `stop_after` enumerations have happened, so the
+    /// loop exits deterministically.
+    struct RecordingSource {
+        starts: std::sync::Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+        stop_after: usize,
+        signal: EdgeSignal,
+    }
+
+    #[async_trait]
+    impl ContainerSource for RecordingSource {
+        async fn list(&self) -> anyhow::Result<Vec<RawContainer>> {
+            let n = {
+                let mut starts = self.starts.lock().unwrap();
+                starts.push(tokio::time::Instant::now());
+                starts.len()
+            };
+            if n >= self.stop_after {
+                self.signal.fire();
+            }
+            Ok(vec![labelled("a")])
+        }
+
+        fn label(&self) -> &str {
+            "RecordingSource"
+        }
+    }
+
+    /// A minimal HTTP endpoint that returns 204 for every request, but delays
+    /// the *first* response by `first_delay` to simulate a push slower than the
+    /// tick interval. Each connection is served independently and closed, so
+    /// reqwest opens a fresh connection per push.
+    async fn slow_first_push_server(first_delay: Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let delay = if first {
+                    first = false;
+                    first_delay
+                } else {
+                    Duration::ZERO
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    // Drain whatever arrived; a small POST fits in one read.
+                    let _ = sock.read(&mut buf).await;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                        )
+                        .await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn slow_push_does_not_cause_busy_polling() {
+        // When a push runs slower than the interval, the schedule falls behind
+        // wall-clock time. Without a floor at now(), every subsequent
+        // `sleep_until` targets an instant already in the past and returns
+        // immediately, so the agent polls back-to-back with no idle period
+        // until it "catches up". Every tick after the slow one must still be
+        // separated by at least the interval.
+        let interval = Duration::from_millis(50);
+        let signal = EdgeSignal::new();
+        let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // First push takes 4x the interval, the rest are immediate.
+        let base = slow_first_push_server(Duration::from_millis(200)).await;
+        let client = crate::push::PushClient::new(base, "s").unwrap();
+
+        let sources: Vec<Box<dyn ContainerSource>> = vec![Box::new(RecordingSource {
+            starts: starts.clone(),
+            stop_after: 4,
+            signal: signal.clone(),
+        })];
+
+        let make_shutdown = {
+            let signal = signal.clone();
+            move || signal.clone().listen()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_until(
+                MachineId::new("m1"),
+                "10.0.0.10".into(),
+                sources,
+                client,
+                interval,
+                make_shutdown,
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "loop should exit after the shutdown signal");
+
+        let starts = starts.lock().unwrap().clone();
+        assert!(
+            starts.len() >= 3,
+            "expected several polls, got {}",
+            starts.len()
+        );
+
+        // Skip the gap that spans the slow push; inspect the ticks after it.
+        let floor = interval / 2;
+        for pair in starts.windows(2).skip(1) {
+            let gap = pair[1].duration_since(pair[0]);
+            assert!(
+                gap >= floor,
+                "consecutive polls were only {gap:?} apart (interval {interval:?}); \
+                 the agent is busy-polling after a slow push instead of idling",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_once_skips_push_when_a_source_fails() {
+        // A healthy source keeps returning its running containers while another
+        // socket is unreadable. The tick must be skipped so the server never
+        // sees a partial snapshot and prunes the still-running containers.
+        let sources: Vec<Box<dyn ContainerSource>> = vec![
+            Box::new(Fake {
+                items: vec![labelled("still-running")],
+            }),
+            Box::new(Boom),
+        ];
+
+        let snap = poll_once(
+            &MachineId::new("m1"),
+            "10.0.0.10",
+            &sources,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(
+            snap.is_none(),
+            "a failed source must abort the push, not yield a partial snapshot"
+        );
     }
 }

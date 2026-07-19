@@ -214,6 +214,18 @@ impl NpmClient {
         token: &str,
         domain: &str,
     ) -> Result<Option<ProxyHostResponse>, NpmError> {
+        self.find_proxy_host_by_any_domain(token, std::slice::from_ref(&domain.to_string()))
+            .await
+    }
+
+    /// Like `find_proxy_host_by_domain` but matches if *any* of `domains` is
+    /// present on an existing host. A proxy host with several domain names is
+    /// one NPM entry, so finding it by any of its domains lets us adopt it.
+    pub async fn find_proxy_host_by_any_domain(
+        &self,
+        token: &str,
+        domains: &[String],
+    ) -> Result<Option<ProxyHostResponse>, NpmError> {
         let resp = self
             .http
             .get(self.endpoint("api/nginx/proxy-hosts"))
@@ -224,9 +236,11 @@ impl NpmClient {
 
         let hosts = resp.json::<Vec<ProxyHostResponse>>().await?;
         Ok(hosts.into_iter().find(|host| {
-            host.domain_names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(domain))
+            host.domain_names.iter().any(|name| {
+                domains
+                    .iter()
+                    .any(|domain| name.eq_ignore_ascii_case(domain))
+            })
         }))
     }
 
@@ -249,12 +263,20 @@ impl NpmClient {
     }
 
     pub async fn delete_proxy_host(&self, token: &str, id: i64) -> Result<(), NpmError> {
-        self.http
+        let resp = self
+            .http
             .delete(self.endpoint(&format!("api/nginx/proxy-hosts/{id}")))
             .bearer_auth(token)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        // An already-absent host is the desired end state: treat 404 as a
+        // successful delete so the caller clears its pending_npm_removals row
+        // instead of retrying forever and feeding the breaker a spurious
+        // failure.  Mirrors get_proxy_host's NOT_FOUND handling.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        resp.error_for_status()?;
 
         Ok(())
     }
@@ -279,7 +301,7 @@ pub fn proxy_payload(
     let http2_support = ssl_enabled && host.http2.unwrap_or(true);
 
     ProxyHostPayload {
-        domain_names: vec![host.host.clone()],
+        domain_names: host.hosts.clone(),
         forward_scheme: match host.scheme {
             NpmScheme::Http => "http".to_string(),
             NpmScheme::Https => "https".to_string(),
@@ -302,6 +324,29 @@ pub fn proxy_payload(
             "dns_challenge": false,
         }),
     }
+}
+
+/// Resolve a certificate for a proxy host that may carry several domains. NPM
+/// stores one certificate per proxy host, so we only pick a cert that covers
+/// *every* domain (exact or wildcard). Selecting one that matches a subset
+/// would serve the remaining domains a mismatched cert while `ssl_forced`
+/// redirects them to HTTPS, breaking them.
+pub fn matching_cert_id_for_hosts(hosts: &[String], certs: &[Certificate]) -> Option<i64> {
+    if hosts.is_empty() {
+        return None;
+    }
+    certs
+        .iter()
+        .find(|cert| hosts.iter().all(|host| cert_covers(cert, host)))
+        .map(|cert| cert.id)
+}
+
+/// Whether `cert` covers `host` by an exact (case-insensitive) or wildcard
+/// domain entry.
+fn cert_covers(cert: &Certificate, host: &str) -> bool {
+    cert.domain_names
+        .iter()
+        .any(|domain| domain.eq_ignore_ascii_case(host) || wildcard_matches(domain, host))
 }
 
 pub fn matching_cert_id(host: &str, certs: &[Certificate]) -> Option<i64> {
@@ -364,7 +409,7 @@ mod tests {
     fn host() -> NpmHost {
         NpmHost {
             index: 0,
-            host: "app.example.com".to_string(),
+            hosts: vec!["app.example.com".to_string()],
             port: 3000,
             scheme: NpmScheme::Http,
             ssl: true,
@@ -405,6 +450,61 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn payload_carries_every_domain_on_one_entry() {
+        let mut multi = host();
+        multi.hosts = vec![
+            "app.example.com".to_string(),
+            "app.mydomain.org".to_string(),
+        ];
+        let payload = proxy_payload(&multi, "web.internal", Some(42));
+
+        assert_eq!(
+            payload.domain_names,
+            vec![
+                "app.example.com".to_string(),
+                "app.mydomain.org".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn cert_for_hosts_requires_coverage_of_every_domain() {
+        // A single cert whose SANs cover both domains is selected even when the
+        // matching entry for the second domain comes later in its list.
+        let certs = vec![Certificate {
+            id: 9,
+            domain_names: vec![
+                "app.example.com".to_string(),
+                "app.mydomain.org".to_string(),
+            ],
+        }];
+        let hosts = vec![
+            "app.example.com".to_string(),
+            "app.mydomain.org".to_string(),
+        ];
+
+        assert_eq!(matching_cert_id_for_hosts(&hosts, &certs), Some(9));
+    }
+
+    #[test]
+    fn cert_covering_only_one_domain_is_not_selected() {
+        // A cert that matches only one of the host's domains must NOT be
+        // selected: NPM stores one cert per proxy host, so the other domain
+        // would be served a mismatched cert while ssl_forced redirects it to
+        // HTTPS, breaking it.
+        let certs = vec![Certificate {
+            id: 9,
+            domain_names: vec!["app.mydomain.org".to_string()],
+        }];
+        let hosts = vec![
+            "app.example.com".to_string(),
+            "app.mydomain.org".to_string(),
+        ];
+
+        assert_eq!(matching_cert_id_for_hosts(&hosts, &certs), None);
     }
 
     #[test]
@@ -665,5 +765,28 @@ mod tests {
         m.assert_async().await;
         assert_eq!(got.id, 7);
         assert_eq!(got.certificate_id, Some(12));
+    }
+
+    #[tokio::test]
+    async fn delete_proxy_host_treats_404_as_success() {
+        // NPM returns 404 when the host is already gone (deleted out-of-band, or
+        // a prior delete succeeded but its response was lost).  Deleting an
+        // already-absent host must be a no-op success; otherwise the caller
+        // leaves a stuck pending_npm_removals row and feeds the circuit breaker
+        // a spurious failure forever.  Mirrors get_proxy_host's 404 handling.
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("DELETE", "/api/nginx/proxy-hosts/42")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = NpmClient::new(crate::config::NpmConfig {
+            url: Url::parse(&server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        client.delete_proxy_host("tok", 42).await.unwrap();
+        m.assert_async().await;
     }
 }

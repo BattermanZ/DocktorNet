@@ -62,6 +62,17 @@ impl AgentConfig {
             msg: e.to_string(),
         })?;
 
+        const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+        if poll_interval < MIN_POLL_INTERVAL {
+            return Err(ConfigError::Invalid {
+                var: "DOCKTORNET_POLL_INTERVAL",
+                msg: format!(
+                    "must be at least {MIN_POLL_INTERVAL:?}, got {poll_interval:?}; \
+                     a sub-second interval would busy-loop the Docker socket and server ingest"
+                ),
+            });
+        }
+
         let machine_id = MachineId::new(get("DOCKTORNET_MACHINE_ID")?);
 
         let forward_host = get("DOCKTORNET_FORWARD_HOST")?;
@@ -227,6 +238,32 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn zero_poll_interval_errors_with_poll_interval_var() {
+        for value in ["0s", "0", "1ms", "999ms"] {
+            let err = AgentConfig::from_iter(env(&[
+                ("DOCKTORNET_SERVER_URL", "u"),
+                ("DOCKTORNET_SECRET", "s"),
+                ("DOCKTORNET_POLL_INTERVAL", value),
+                ("DOCKTORNET_MACHINE_ID", "m"),
+                ("DOCKTORNET_FORWARD_HOST", "10.0.0.10"),
+                ("DOCKTORNET_SOCKETS", "docker:/x"),
+            ]))
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "DOCKTORNET_POLL_INTERVAL",
+                        ..
+                    }
+                ),
+                "expected Invalid poll-interval error for {value:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]

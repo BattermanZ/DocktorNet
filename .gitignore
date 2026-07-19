@@ -43,3 +43,6 @@ smoke-data/gatus-config/smokebox__*.yaml
 
 # Smoke compose (contains environment-specific hostnames)
 deploy/smoke.compose.yaml
+
+# CodeGraph local index (machine-local, do not commit)
+.codegraph/

@@ -39,8 +39,8 @@ pub async fn ingest(
     // Persist the snapshot synchronously, then ack.  The external reconcile
     // (NPM / Cloudflare / Gatus) runs in the background so a bulk update of
     // many services can't outlast the agent's push timeout.
-    let removed_last_seen = match state.reconciler.ingest_snapshot(&snap).await {
-        Ok(removed) => removed,
+    let ticket = match state.reconciler.ingest_snapshot(&snap).await {
+        Ok(ticket) => ticket,
         Err(e) => {
             warn!(error = %e, "failed to persist snapshot");
             return StatusCode::INTERNAL_SERVER_ERROR;
@@ -49,7 +49,7 @@ pub async fn ingest(
 
     let reconciler = state.reconciler.clone();
     tokio::spawn(async move {
-        if let Err(e) = reconciler.apply_reconcile(&snap, removed_last_seen).await {
+        if let Err(e) = reconciler.apply_reconcile(&snap, ticket).await {
             warn!(error = %e, "background reconcile reported failures");
         }
     });

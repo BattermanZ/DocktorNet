@@ -16,7 +16,10 @@ pub struct ParsedLabels {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NpmHost {
     pub index: u8,
-    pub host: String,
+    /// One or more public domain names that resolve to this single NPM proxy
+    /// host. Written as a comma-separated `host` label; a single domain is the
+    /// common case. NPM stores these as one entry's `domain_names`.
+    pub hosts: Vec<String>,
     pub port: u16,
     pub scheme: NpmScheme,
     pub ssl: bool,
@@ -72,7 +75,7 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
         let parts: Vec<&str> = rest.split('.').collect();
 
         match parts.as_slice() {
-            ["npm", idx, field] => match idx.parse::<u8>() {
+            ["npm", idx, field] => match parse_canonical_index(idx) {
                 Ok(index) => {
                     if is_npm_field(field) {
                         npm_groups
@@ -89,7 +92,7 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
                     .warnings
                     .push(format!("invalid npm index in key '{key}'")),
             },
-            ["gatus", idx, field] => match idx.parse::<u8>() {
+            ["gatus", idx, field] => match parse_canonical_index(idx) {
                 Ok(index) => {
                     if is_gatus_field(field) {
                         gatus_groups
@@ -122,7 +125,12 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
 
     for (index, fields) in npm_groups {
         match build_npm_host(index, &fields) {
-            Ok(host) => out.npm.push(host),
+            Ok((host, warnings)) => {
+                out.npm.push(host);
+                for warning in warnings {
+                    out.warnings.push(format!("npm.{index}: {warning}"));
+                }
+            }
             Err(err) => out.warnings.push(format!("npm.{index}: {err}")),
         }
     }
@@ -147,8 +155,34 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
     out
 }
 
-fn build_npm_host(index: u8, fields: &BTreeMap<String, String>) -> Result<NpmHost, String> {
-    let host = fields.get("host").ok_or("missing host")?.clone();
+/// Parse an index token, requiring it to be in canonical decimal form so that
+/// non-canonical spellings (e.g. "00", "01") cannot collide with their
+/// canonical counterparts ("0", "1") and silently merge two distinct label
+/// groups into one — dropping a public hostname. The u8 value is used as the
+/// stable NPM host key, so it must round-trip exactly.
+fn parse_canonical_index(idx: &str) -> Result<u8, ()> {
+    let index = idx.parse::<u8>().map_err(|_| ())?;
+    if idx == index.to_string() {
+        Ok(index)
+    } else {
+        Err(())
+    }
+}
+
+fn build_npm_host(
+    index: u8,
+    fields: &BTreeMap<String, String>,
+) -> Result<(NpmHost, Vec<String>), String> {
+    let hosts: Vec<String> = fields
+        .get("host")
+        .ok_or("missing host")?
+        .split(',')
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .collect();
+    if hosts.is_empty() {
+        return Err("missing host".to_string());
+    }
     let port = fields
         .get("port")
         .ok_or("missing port")?
@@ -161,30 +195,44 @@ fn build_npm_host(index: u8, fields: &BTreeMap<String, String>) -> Result<NpmHos
         None => return Err("missing scheme".to_string()),
     };
     let ssl = parse_bool(fields.get("ssl").ok_or("missing ssl")?)?;
-    let hsts = fields.get("hsts").map(parse_bool).transpose()?;
-    let hsts_subdomains = fields.get("hsts_subdomains").map(parse_bool).transpose()?;
-    let http2 = fields.get("http2").map(parse_bool).transpose()?;
-    let block_exploits = fields.get("block_exploits").map(parse_bool).transpose()?;
-    let websockets = fields.get("websockets").map(parse_bool).transpose()?;
-    let cert_id = fields
-        .get("cert_id")
-        .map(|cert_id| cert_id.parse::<u32>())
-        .transpose()
-        .map_err(|_| "cert_id must be u32".to_string())?;
 
-    Ok(NpmHost {
-        index,
-        host,
-        port,
-        scheme,
-        ssl,
-        hsts,
-        hsts_subdomains,
-        http2,
-        block_exploits,
-        websockets,
-        cert_id,
-    })
+    // Optional hardening flags are advisory: a single malformed value must
+    // degrade to its default plus a warning, never un-publish the whole host.
+    let mut warnings = Vec::new();
+    let hsts = parse_optional_bool(fields, "hsts", &mut warnings);
+    let hsts_subdomains = parse_optional_bool(fields, "hsts_subdomains", &mut warnings);
+    let http2 = parse_optional_bool(fields, "http2", &mut warnings);
+    let block_exploits = parse_optional_bool(fields, "block_exploits", &mut warnings);
+    let websockets = parse_optional_bool(fields, "websockets", &mut warnings);
+    let cert_id = match fields.get("cert_id") {
+        Some(value) => match value.parse::<u32>() {
+            Ok(parsed) => Some(parsed),
+            Err(_) => {
+                warnings.push(format!(
+                    "cert_id: must be u32, got '{value}'; ignoring optional field"
+                ));
+                None
+            }
+        },
+        None => None,
+    };
+
+    Ok((
+        NpmHost {
+            index,
+            hosts,
+            port,
+            scheme,
+            ssl,
+            hsts,
+            hsts_subdomains,
+            http2,
+            block_exploits,
+            websockets,
+            cert_id,
+        },
+        warnings,
+    ))
 }
 
 fn is_npm_field(field: &str) -> bool {
@@ -260,10 +308,29 @@ fn is_gatus_field(field: &str) -> bool {
 }
 
 fn parse_bool(value: impl AsRef<str>) -> Result<bool, String> {
-    match value.as_ref() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        other => Err(format!("expected bool, got '{other}'")),
+    match value.as_ref().trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!("expected bool, got '{}'", value.as_ref())),
+    }
+}
+
+/// Parse an optional boolean field, degrading a malformed value to `None`
+/// plus a warning rather than aborting the whole host.
+fn parse_optional_bool(
+    fields: &BTreeMap<String, String>,
+    key: &str,
+    warnings: &mut Vec<String>,
+) -> Option<bool> {
+    match fields.get(key) {
+        Some(value) => match parse_bool(value) {
+            Ok(parsed) => Some(parsed),
+            Err(err) => {
+                warnings.push(format!("{key}: {err}; ignoring optional field"));
+                None
+            }
+        },
+        None => None,
     }
 }
 
@@ -298,7 +365,7 @@ mod tests {
         assert_eq!(p.npm.len(), 1);
         let h = &p.npm[0];
         assert_eq!(h.index, 0);
-        assert_eq!(h.host, "a.example.com");
+        assert_eq!(h.hosts, vec!["a.example.com".to_string()]);
         assert_eq!(h.port, 3000);
         assert_eq!(h.scheme, NpmScheme::Http);
         assert!(h.ssl);
@@ -308,6 +375,35 @@ mod tests {
         assert_eq!(h.websockets, None);
         assert_eq!(h.cert_id, None);
         assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn npm_host_splits_comma_separated_domains_into_one_entry() {
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", "a.example.com, b.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "true"),
+        ]));
+        assert_eq!(p.npm.len(), 1);
+        assert_eq!(
+            p.npm[0].hosts,
+            vec!["a.example.com".to_string(), "b.example.com".to_string()]
+        );
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn npm_host_with_only_separators_emits_warning_and_skips() {
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", " , , "),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "true"),
+        ]));
+        assert!(p.npm.is_empty());
+        assert_eq!(p.warnings.len(), 1);
+        assert!(p.warnings[0].contains("npm.0"));
     }
 
     #[test]
@@ -359,6 +455,97 @@ mod tests {
         assert_eq!(p.npm[0].block_exploits, Some(false));
         assert_eq!(p.npm[0].websockets, Some(false));
         assert_eq!(p.npm[0].cert_id, Some(42));
+    }
+
+    #[test]
+    fn parse_bool_is_case_insensitive() {
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", "a.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "True"),
+            ("docktornet.npm.0.hsts", "YES"),
+            ("docktornet.npm.0.http2", "Off"),
+        ]));
+        assert_eq!(p.npm.len(), 1);
+        assert!(p.npm[0].ssl);
+        assert_eq!(p.npm[0].hsts, Some(true));
+        assert_eq!(p.npm[0].http2, Some(false));
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn npm_malformed_optional_field_degrades_not_drops() {
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", "a.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "true"),
+            // a single malformed optional field must not un-publish the host
+            ("docktornet.npm.0.cert_id", "abc"),
+            ("docktornet.npm.0.hsts", "maybe"),
+        ]));
+        assert_eq!(
+            p.npm.len(),
+            1,
+            "host must survive a malformed optional field"
+        );
+        let h = &p.npm[0];
+        assert_eq!(h.hosts, vec!["a.example.com".to_string()]);
+        assert_eq!(h.port, 3000);
+        assert!(h.ssl);
+        assert_eq!(h.cert_id, None);
+        assert_eq!(h.hsts, None);
+        // the operator still gets a signal for each degraded field
+        assert_eq!(p.warnings.len(), 2);
+        assert!(p.warnings.iter().all(|w| w.contains("npm.0")));
+    }
+
+    #[test]
+    fn npm_non_canonical_index_does_not_collide_with_canonical() {
+        // "0" and "00" both parse to 0u8, which previously merged two distinct
+        // label groups into a single NPM host, silently dropping a public
+        // hostname. The canonical "0" host must survive; the non-canonical
+        // "00" group must be rejected with a warning rather than overwriting it.
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", "a.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "true"),
+            ("docktornet.npm.00.host", "b.example.com"),
+            ("docktornet.npm.00.port", "4000"),
+            ("docktornet.npm.00.scheme", "http"),
+            ("docktornet.npm.00.ssl", "true"),
+        ]));
+        assert_eq!(p.npm.len(), 1, "canonical host must not be merged away");
+        assert_eq!(p.npm[0].hosts, vec!["a.example.com".to_string()]);
+        assert_eq!(p.npm[0].port, 3000);
+        assert!(
+            p.warnings.iter().any(|w| w.contains("00")),
+            "non-canonical index must produce a warning, got {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn gatus_non_canonical_index_does_not_collide_with_canonical() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://a"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.00.url", "https://b"),
+            ("docktornet.gatus.00.interval", "60s"),
+        ]));
+        assert_eq!(
+            p.gatus.len(),
+            1,
+            "canonical monitor must not be merged away"
+        );
+        assert_eq!(p.gatus[0].url, "https://a");
+        assert!(
+            p.warnings.iter().any(|w| w.contains("00")),
+            "non-canonical index must produce a warning, got {:?}",
+            p.warnings
+        );
     }
 
     #[test]
