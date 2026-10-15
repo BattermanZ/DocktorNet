@@ -20,11 +20,13 @@ Publishing images to GHCR is out of scope for v1 — tag and push manually for n
 
 Both binaries read the same `.env` file. Keys irrelevant to a given role are ignored.
 
+Give `DOCKTORNET_DB_PATH` as an absolute path on the `./data:/data` volume. A relative path resolves against the image's working directory, `/app`, so the database lands in the container layer and every recreate starts it empty.
+
 | Var | Server | Agent |
 | --- | --- | --- |
 | `DOCKTORNET_LISTEN` | required | — |
 | `DOCKTORNET_SECRET` | required | required |
-| `DOCKTORNET_DB_PATH` | required | — |
+| `DOCKTORNET_DB_PATH` | required, absolute: `/data/docktornet.db` in the container | — |
 | `DOCKTORNET_GATUS_CONFIG_DIR` | required | — |
 | `DOCKTORNET_FULL_RESYNC_INTERVAL` | optional (`1h`) | — |
 | `DOCKTORNET_DRY_RUN` | optional (`true`) | — |
