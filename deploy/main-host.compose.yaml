@@ -1,7 +1,8 @@
 services:
   docktornet-server:
     container_name: docktornet-server
-    image: 192.168.31.233:5000/docktornet-server:latest
+    # Set SERVER_IMAGE to the image you built, e.g. docktornet-server:latest
+    image: ${SERVER_IMAGE:?set SERVER_IMAGE to the image to run}
     restart: unless-stopped
     env_file: .env
     user: "65532:65532"
@@ -13,7 +14,8 @@ services:
 
   docktornet-agent:
     container_name: docktornet-agent
-    image: 192.168.31.233:5000/docktornet-agent:latest
+    # Set AGENT_IMAGE to the image you built, e.g. docktornet-agent:latest
+    image: ${AGENT_IMAGE:?set AGENT_IMAGE to the image to run}
     restart: unless-stopped
     env_file: .env
     user: "65532:65532"
