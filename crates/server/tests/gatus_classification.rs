@@ -381,7 +381,11 @@ async fn endpoints_removed_from_the_labels_leave_the_map() {
 
     // `gone` was last seen past the grace period, so its file and its
     // endpoint go at once.
-    push(&env, 1_000, &[("app", monitor(0, "a"))]).await;
+    sqlx::query("UPDATE services SET last_seen = last_seen - 1000 WHERE id = 'm1/gone'")
+        .execute(env.reconciler.pool())
+        .await
+        .unwrap();
+    push(&env, 4, &[("app", monitor(0, "a"))]).await;
     assert!(!gatus::service_file_path(&env.gatus_dir, "m1/gone").exists());
     assert_eq!(map_keys(&env.gatus_dir), vec!["m1_a", "m1_brief"]);
 }

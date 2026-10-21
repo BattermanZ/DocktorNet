@@ -9,8 +9,9 @@ use sqlx::{Pool, Sqlite, SqliteExecutor};
 /// machine reports.
 const MAX_BIND_PARAMS: usize = 20_000;
 
-pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Result<()> {
-    let now = snap.taken_at as i64;
+/// Store a snapshot as seen at `now`, the server's clock in Unix seconds.  The
+/// agent's `taken_at` is never stored: grace periods are timed in server time.
+pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot, now: i64) -> sqlx::Result<()> {
     let machine = snap.machine_id.as_str();
     let seen_ids: Vec<String> = snap
         .containers
@@ -581,6 +582,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -605,6 +607,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -617,6 +620,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "2")])],
             },
+            200,
         )
         .await
         .unwrap();
@@ -641,6 +645,7 @@ mod tests {
                     entry("b", &[("docktornet.y", "2")]),
                 ],
             },
+            100,
         )
         .await
         .unwrap();
@@ -653,6 +658,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            200,
         )
         .await
         .unwrap();
@@ -677,6 +683,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -689,6 +696,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![],
             },
+            200,
         )
         .await
         .unwrap();
@@ -709,6 +717,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -721,6 +730,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![],
             },
+            100,
         )
         .await
         .unwrap();
@@ -748,6 +758,7 @@ mod tests {
                     ],
                 )],
             },
+            100,
         )
         .await
         .unwrap();
@@ -770,6 +781,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("app", &[])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -791,6 +803,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("a", &[]), entry("b", &[])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -884,6 +897,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![],
             },
+            100,
         )
         .await
         .unwrap();
@@ -896,6 +910,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![],
             },
+            200,
         )
         .await
         .unwrap();
@@ -930,10 +945,10 @@ mod tests {
             containers: vec![],
             agent_version: agent_version.map(str::to_string),
         };
-        upsert_snapshot(&p, &snap(100, Some("1.1.0")))
+        upsert_snapshot(&p, &snap(100, Some("1.1.0")), 100)
             .await
             .unwrap();
-        upsert_snapshot(&p, &snap(200, Some("1.2.0")))
+        upsert_snapshot(&p, &snap(200, Some("1.2.0")), 200)
             .await
             .unwrap();
         assert_eq!(
@@ -942,7 +957,7 @@ mod tests {
         );
 
         // An agent rolled back to a release without version reporting.
-        upsert_snapshot(&p, &snap(300, None)).await.unwrap();
+        upsert_snapshot(&p, &snap(300, None), 300).await.unwrap();
         assert_eq!(list_machines(&p).await.unwrap()[0].agent_version, None);
     }
 
@@ -958,6 +973,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            1,
         )
         .await
         .unwrap();
@@ -970,6 +986,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("b", &[("docktornet.y", "2")])],
             },
+            1,
         )
         .await
         .unwrap();
@@ -992,6 +1009,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("app", &[])],
             },
+            42,
         )
         .await
         .unwrap();
@@ -1029,6 +1047,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("app", &[])],
             },
+            42,
         )
         .await
         .unwrap();
@@ -1052,6 +1071,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("a", &[]), entry("b", &[])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -1077,6 +1097,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("app", &[])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -1101,6 +1122,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![entry("a", &[]), entry("b", &[])],
             },
+            100,
         )
         .await
         .unwrap();

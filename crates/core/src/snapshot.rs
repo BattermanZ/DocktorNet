@@ -19,6 +19,9 @@ pub struct Snapshot {
     pub machine_id: MachineId,
     /// This machine's address that NPM should forward proxied traffic to.
     pub forward_host: String,
+    /// When the agent built the snapshot, in Unix seconds by the agent's
+    /// clock, or 0 if it could not read it.  The server times grace periods by
+    /// its own clock and does not rely on this.
     pub taken_at: u64,
     pub containers: Vec<ContainerEntry>,
     /// The agent's release.  Absent from agents that predate version

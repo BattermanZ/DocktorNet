@@ -32,6 +32,26 @@ pub struct Reconciler {
     /// run strictly in ingest order and a stale snapshot can never be applied to
     /// public DNS / proxy state after a newer one.
     apply_chain: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<()>>>>,
+    clock: Clock,
+}
+
+/// The server's clock, in Unix seconds.  Every grace-period decision reads it,
+/// never an agent's `taken_at`: agent clocks can be skewed, or read as zero.
+/// Tests set it by hand to step through a grace period.
+#[derive(Clone, Default)]
+struct Clock {
+    #[cfg(test)]
+    fixed: Arc<std::sync::Mutex<Option<i64>>>,
+}
+
+impl Clock {
+    fn now(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(now) = *self.fixed.lock().expect("clock mutex poisoned") {
+            return now;
+        }
+        unix_now()
+    }
 }
 
 /// Everything a background apply needs, handed back by [`Reconciler::ingest_snapshot`].
@@ -39,6 +59,9 @@ pub struct Reconciler {
 /// serialized in the order they were persisted, never reordered by the scheduler.
 pub struct ApplyTicket {
     removed: Vec<RemovedService>,
+    /// When the server persisted the snapshot.  The apply judges each removal
+    /// against this, so waiting in the queue never shortens a grace period.
+    ingested_at: i64,
     /// Resolves when the previous snapshot's apply for this machine finished.
     /// `None` for the first apply after startup.  The apply awaits this before
     /// touching any external state.
@@ -123,6 +146,11 @@ pub enum ReconcileError {
 /// `sweep_pending_removals` (every minute) once the window ends.
 const GATUS_REMOVAL_GRACE_SECS: i64 = 300;
 
+/// How old a temporary file from an atomic Gatus write must be before the
+/// sweep deletes it.  A write finishes in well under this, so a file this old
+/// was left behind by a failed or interrupted write.
+const STALE_TEMP_FILE_SECS: u64 = 300;
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -190,6 +218,7 @@ impl Reconciler {
             )),
             last_reconciled: Arc::new(Mutex::new(HashMap::new())),
             apply_chain: Arc::new(Mutex::new(HashMap::new())),
+            clock: Clock::default(),
         }
     }
 
@@ -211,6 +240,7 @@ impl Reconciler {
             )),
             last_reconciled: Arc::new(Mutex::new(HashMap::new())),
             apply_chain: Arc::new(Mutex::new(HashMap::new())),
+            clock: Clock::default(),
         }
     }
 
@@ -574,14 +604,29 @@ impl Reconciler {
         let mut report = ResyncReport::default();
 
         let services = crate::storage::list_all_services(&self.db).await?;
+        // Read before NPM is touched, so a database error can never cut a pass
+        // short after it reached NPM but before it fed the breaker.
+        let expected_gatus_files = if self.options.dry_run {
+            None
+        } else {
+            Some(self.expected_gatus_files().await?)
+        };
 
         // Fetch the NPM token + certificate list once for the whole resync
-        // pass rather than once per host.
-        let npm_ctx = if self.npm.is_some() && !self.options.dry_run {
+        // pass rather than once per host.  While the circuit breaker is open,
+        // leave NPM alone entirely: no fetch, no host checks, no sweep.
+        let use_npm = self.npm.is_some() && !self.options.dry_run;
+        let skip_npm = use_npm && self.npm_breaker.is_open(std::time::Instant::now());
+        if skip_npm {
+            tracing::warn!("npm circuit breaker open; skipping NPM resync this pass");
+        }
+        let mut npm_failed = false;
+        let npm_ctx = if use_npm && !skip_npm {
             match self.fetch_npm_context().await {
                 Ok(ctx) => Some(ctx),
                 Err(err) => {
                     tracing::warn!(error = %err, "npm resync skipped: token/cert fetch failed");
+                    npm_failed = true;
                     None
                 }
             }
@@ -609,15 +654,18 @@ impl Reconciler {
                 );
             }
 
-            for host in &parsed.npm {
-                if let Err(err) = self
-                    .resync_npm_host(&service_id, host, &forward_host, npm_ctx.as_ref())
-                    .await
-                {
-                    tracing::warn!(service_id, index = host.index, error = %err, "npm resync failed");
-                    report.failed += 1;
-                } else {
-                    report.verified += 1;
+            if !skip_npm {
+                for host in &parsed.npm {
+                    if let Err(err) = self
+                        .resync_npm_host(&service_id, host, &forward_host, npm_ctx.as_ref())
+                        .await
+                    {
+                        tracing::warn!(service_id, index = host.index, error = %err, "npm resync failed");
+                        npm_failed = true;
+                        report.failed += 1;
+                    } else {
+                        report.verified += 1;
+                    }
                 }
             }
 
@@ -647,13 +695,21 @@ impl Reconciler {
             }
         }
 
-        if !self.options.dry_run {
-            let expected = self.expected_gatus_files().await?;
-            self.sweep_removals(&expected, npm_ctx.as_ref(), &mut report)
+        if let Some(expected) = &expected_gatus_files {
+            npm_failed |= self
+                .sweep_removals(expected, npm_ctx.as_ref(), &mut report)
                 .await;
             if let Err(err) = self.refresh_classification_map().await {
                 tracing::warn!(error = %err, "gatus classification map refresh failed");
                 report.failed += 1;
+            }
+        }
+        // Feed the breaker only when this pass actually reached NPM.
+        if use_npm && !skip_npm {
+            if npm_failed {
+                self.npm_breaker.record_failure(std::time::Instant::now());
+            } else {
+                self.npm_breaker.record_success();
             }
         }
 
@@ -681,7 +737,7 @@ impl Reconciler {
 
         // Only reach NPM when a pending removal is due, and never while the
         // breaker is open.  Most sweeps have nothing to do.
-        let now = unix_now();
+        let now = self.clock.now();
         let npm_due = self.npm.is_some()
             && crate::storage::list_pending_npm_removals(&self.db)
                 .await?
@@ -805,12 +861,16 @@ impl Reconciler {
                 )
             })
             .collect();
-        let now = unix_now();
+        let now = self.clock.now();
         let mut removed_any = false;
         loop {
             match entries.next_entry().await {
                 Ok(Some(entry)) => {
                     let path = entry.path();
+                    if crate::integrations::gatus::is_temp_file(&path) {
+                        Self::remove_stale_temp_file(&entry).await;
+                        continue;
+                    }
                     if !crate::integrations::gatus::is_managed_service_file(&path) {
                         continue;
                     }
@@ -874,6 +934,31 @@ impl Reconciler {
     async fn clear_pending_gatus_removal(&self, service_id: &str) {
         if let Err(err) = crate::storage::delete_pending_gatus_removal(&self.db, service_id).await {
             tracing::warn!(service_id, error = %err, "failed to clear pending gatus removal");
+        }
+    }
+
+    /// Delete a temporary file a failed or interrupted Gatus write left behind,
+    /// once it is stale, so no write still in flight can be using it.  Gatus
+    /// never loads these, so no reload is needed.
+    async fn remove_stale_temp_file(entry: &tokio::fs::DirEntry) {
+        let path = entry.path();
+        let stale = match entry.metadata().await {
+            Ok(meta) => meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age.as_secs() >= STALE_TEMP_FILE_SECS),
+            Err(_) => false,
+        };
+        if !stale {
+            return;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => tracing::info!(path = %path.display(), "removed stale gatus temp file"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "failed to remove stale gatus temp file");
+            }
         }
     }
 
@@ -967,7 +1052,7 @@ impl Reconciler {
             return false;
         };
         let client = self.npm.as_ref().expect("npm_ctx implies npm client");
-        let now = unix_now();
+        let now = self.clock.now();
         let mut npm_failed = false;
 
         for (service_id, npm_index, npm_id, last_seen) in pending {
@@ -1019,7 +1104,7 @@ impl Reconciler {
             // No Cloudflare access this pass; leave the entries for the next sweep.
             return;
         };
-        let now = unix_now();
+        let now = self.clock.now();
 
         for (service_id, record_id, last_seen) in pending {
             if !past_grace(last_seen, now) {
@@ -1219,7 +1304,11 @@ impl Reconciler {
     /// is acked so the snapshot is durable even when the external reconcile is
     /// deferred.  `removed_last_seen` is captured here because `upsert_snapshot`
     /// deletes those rows.
-    async fn persist_inner(&self, snap: &Snapshot) -> Result<Vec<RemovedService>, ReconcileError> {
+    async fn persist_inner(
+        &self,
+        snap: &Snapshot,
+        now: i64,
+    ) -> Result<Vec<RemovedService>, ReconcileError> {
         let current_ids =
             crate::integrations::intended::intended_services(&snap.machine_id, &snap.containers)
                 .iter()
@@ -1233,9 +1322,9 @@ impl Reconciler {
         // cascade wipes them.
         let npm_hosts = crate::storage::get_npm_hosts_for_services(&self.db, &removed).await?;
         let cf_records = crate::storage::get_cf_records_for_services(&self.db, &removed).await?;
-        self.record_gatus_departures(snap, &current_ids, &removed_last_seen)
+        self.record_gatus_departures(now, &current_ids, &removed_last_seen)
             .await?;
-        crate::storage::upsert_snapshot(&self.db, snap).await?;
+        crate::storage::upsert_snapshot(&self.db, snap, now).await?;
 
         let mut hosts_by_service: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
         for (service_id, npm_index, npm_id) in npm_hosts {
@@ -1266,21 +1355,13 @@ impl Reconciler {
     /// kept Gatus file without its departure; the apply runs later, off the lock.
     async fn record_gatus_departures(
         &self,
-        snap: &Snapshot,
+        now: i64,
         current_ids: &[String],
         removed_last_seen: &[(String, i64)],
     ) -> Result<(), ReconcileError> {
-        let now = unix_now();
         for (service_id, last_seen) in removed_last_seen {
-            let absent_secs = (snap.taken_at as i64).saturating_sub(*last_seen).max(0);
-            if absent_secs < GATUS_REMOVAL_GRACE_SECS {
-                // In server time, backdated by how long the agent saw it gone.
-                crate::storage::add_pending_gatus_removal(
-                    &self.db,
-                    service_id,
-                    now.saturating_sub(absent_secs),
-                )
-                .await?;
+            if !past_grace(*last_seen, now) {
+                crate::storage::add_pending_gatus_removal(&self.db, service_id, *last_seen).await?;
             }
         }
         let returned: Vec<String> = crate::storage::list_pending_gatus_removals(&self.db)
@@ -1300,11 +1381,12 @@ impl Reconciler {
     /// independently — a failure for one is logged and counted but never aborts
     /// work for the others (the next push and the periodic full resync retry).
     /// Returns an error summarizing how many services failed, for the caller to
-    /// log.
+    /// log.  `ingested_at` is when the snapshot was persisted.
     async fn apply_inner(
         &self,
         snap: &Snapshot,
         removed: Vec<RemovedService>,
+        ingested_at: i64,
     ) -> Result<(), ReconcileError> {
         let intended =
             crate::integrations::intended::intended_services(&snap.machine_id, &snap.containers);
@@ -1353,9 +1435,8 @@ impl Reconciler {
         // notifications are never sent.  A file kept through the grace period
         // is a pending removal: sweep_pending_removals deletes it once the
         // grace period that persist_inner recorded ends.
-        let snap_time = snap.taken_at as i64;
         for rs in &removed {
-            let absent_secs = snap_time.saturating_sub(rs.last_seen);
+            let absent_secs = ingested_at.saturating_sub(rs.last_seen);
             if absent_secs >= GATUS_REMOVAL_GRACE_SECS {
                 tracing::info!(service_id = %rs.service_id, absent_secs, "service removed");
                 match crate::integrations::gatus::remove_service_file(
@@ -1426,7 +1507,7 @@ impl Reconciler {
         // npm_hosts mapping has already been cascade-deleted, so that table is
         // the only durable record of what to prune.
         for rs in &removed {
-            let absent_secs = snap_time.saturating_sub(rs.last_seen);
+            let absent_secs = ingested_at.saturating_sub(rs.last_seen);
             let prune_now = absent_secs >= GATUS_REMOVAL_GRACE_SECS && !skip_npm;
             for &(npm_index, npm_id) in &rs.npm_hosts {
                 let deleted = if prune_now {
@@ -1476,7 +1557,7 @@ impl Reconciler {
             let Some(record_id) = &rs.cf_record else {
                 continue;
             };
-            let absent_secs = snap_time.saturating_sub(rs.last_seen);
+            let absent_secs = ingested_at.saturating_sub(rs.last_seen);
             let delete_now = absent_secs >= GATUS_REMOVAL_GRACE_SECS;
             let deleted = if delete_now {
                 match &self.cloudflare {
@@ -1675,12 +1756,13 @@ impl Reconciler {
 
     pub async fn reconcile_snapshot(&self, snap: &Snapshot) -> Result<(), ReconcileError> {
         let _guard = self.lock.lock().await;
-        let removed = self.persist_inner(snap).await?;
+        let ingested_at = self.clock.now();
+        let removed = self.persist_inner(snap, ingested_at).await?;
         if self.options.dry_run {
             tracing::debug!(removed = removed.len(), "dry-run: would reconcile snapshot");
             return Ok(());
         }
-        self.apply_inner(snap, removed).await
+        self.apply_inner(snap, removed, ingested_at).await
     }
 
     /// Persist the snapshot and return the data a deferred external reconcile
@@ -1689,7 +1771,8 @@ impl Reconciler {
     /// runs `apply_reconcile` in the background.
     pub async fn ingest_snapshot(&self, snap: &Snapshot) -> Result<ApplyTicket, ReconcileError> {
         let _guard = self.lock.lock().await;
-        let removed = self.persist_inner(snap).await?;
+        let ingested_at = self.clock.now();
+        let removed = self.persist_inner(snap, ingested_at).await?;
         // Link this apply into the machine's ordered chain: it waits on the
         // previous tail and installs its own completion channel as the new
         // tail.  `insert` returns the prior tail (the receiver this apply must
@@ -1702,6 +1785,7 @@ impl Reconciler {
             .insert(snap.machine_id.as_str().to_string(), done_rx);
         Ok(ApplyTicket {
             removed,
+            ingested_at,
             wait_on,
             done,
         })
@@ -1719,6 +1803,7 @@ impl Reconciler {
     ) -> Result<(), ReconcileError> {
         let ApplyTicket {
             removed,
+            ingested_at,
             wait_on,
             done,
         } = ticket;
@@ -1732,11 +1817,19 @@ impl Reconciler {
             Ok(())
         } else {
             let _guard = self.lock.lock().await;
-            self.apply_inner(snap, removed).await
+            self.apply_inner(snap, removed, ingested_at).await
         };
         // Release the next queued apply for this machine, whatever the outcome.
         let _ = done.send(());
         result
+    }
+}
+
+#[cfg(test)]
+impl Reconciler {
+    /// Stop this reconciler's clock, shared with its clones, at `now`.
+    fn set_now(&self, now: i64) {
+        *self.clock.fixed.lock().expect("clock mutex poisoned") = Some(now);
     }
 }
 
@@ -1992,6 +2085,7 @@ mod tests {
         );
         labels.insert("docktornet.gatus.0.interval".to_string(), "30s".to_string());
 
+        reconciler.set_now(1);
         reconciler
             .reconcile_snapshot(&Snapshot {
                 machine_id: MachineId::new("m1"),
@@ -2009,6 +2103,7 @@ mod tests {
         assert!(service_file.exists());
 
         // Snapshot taken well past the 5-minute grace period.
+        reconciler.set_now(1 + GATUS_REMOVAL_GRACE_SECS + 1);
         reconciler
             .reconcile_snapshot(&Snapshot {
                 machine_id: MachineId::new("m1"),
@@ -2074,7 +2169,9 @@ mod tests {
         };
 
         // Persist both synchronously in order, exactly as the ingest handler does.
+        reconciler.set_now(1);
         let ticket_present = reconciler.ingest_snapshot(&snap_present).await.unwrap();
+        reconciler.set_now(1 + GATUS_REMOVAL_GRACE_SECS + 1);
         let ticket_gone = reconciler.ingest_snapshot(&snap_gone).await.unwrap();
 
         // Simulate the scheduler favouring B's apply: spawn it first and give
@@ -2226,8 +2323,16 @@ mod tests {
         );
     }
 
-    /// Push a snapshot of machine `m1` holding `containers` at `taken_at`.
-    async fn push(reconciler: &Reconciler, taken_at: u64, containers: Vec<ContainerEntry>) {
+    /// Push a snapshot of machine `m1` holding `containers`, with the server's
+    /// clock and the agent's `taken_at` both at `at`.
+    async fn push(reconciler: &Reconciler, at: u64, containers: Vec<ContainerEntry>) {
+        reconciler.set_now(at as i64);
+        push_stamped(reconciler, at, containers).await;
+    }
+
+    /// Push a snapshot of machine `m1` holding `containers`, stamped `taken_at`
+    /// by the agent, leaving the server's clock alone.
+    async fn push_stamped(reconciler: &Reconciler, taken_at: u64, containers: Vec<ContainerEntry>) {
         reconciler
             .reconcile_snapshot(&Snapshot {
                 machine_id: MachineId::new("m1"),
@@ -2261,7 +2366,7 @@ mod tests {
         storage::add_pending_gatus_removal(
             reconciler.pool(),
             service_id,
-            unix_now() - GATUS_REMOVAL_GRACE_SECS - 60,
+            reconciler.clock.now() - GATUS_REMOVAL_GRACE_SECS - 60,
         )
         .await
         .unwrap();
@@ -2314,6 +2419,78 @@ mod tests {
         assert!(
             !service_file.exists(),
             "the short sweep must remove the gatus file once grace has passed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_removal_sweep_removes_old_temp_files_only() {
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = gatus_reconciler(pool, &gatus_dir);
+        std::fs::create_dir_all(&gatus_dir).unwrap();
+        let file = |name: &str, aged: bool| {
+            let path = gatus_dir.join(name);
+            std::fs::write(&path, "x").unwrap();
+            if aged {
+                set_mtime(&path, aged_past_grace());
+            }
+            path
+        };
+        let old_service_tmp = file("x--0123456789abcdef.yaml.tmp-1-2-3", true);
+        let old_map_tmp = file("docktornet-classification.json.tmp-1-2-4", true);
+        let young_tmp = file("y--0123456789abcdef.yaml.tmp-1-2-5", false);
+        let not_ours = [
+            file("notes.yaml.tmp", true),
+            file("x.yaml.tmp-1-2", true),
+            file("x.yaml.tmp-1-2-z", true),
+            // An operator's own dated copy of their base config.
+            file("00-base.yaml.tmp-2026-10-21", true),
+        ];
+
+        reconciler.sweep_pending_removals().await.unwrap();
+
+        assert!(!old_service_tmp.exists());
+        assert!(!old_map_tmp.exists());
+        assert!(young_tmp.exists(), "a write may still be using it");
+        for path in not_ours {
+            assert!(path.exists(), "{} is not a temp file", path.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delayed_apply_decides_on_the_time_of_ingest() {
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = gatus_reconciler(pool, &gatus_dir);
+        push(
+            &reconciler,
+            1,
+            vec![ContainerEntry {
+                name: "app".into(),
+                labels: gatus_labels(),
+            }],
+        )
+        .await;
+
+        // The service is gone 5 s later, but the apply only runs after the
+        // grace period, held up behind a slow pass.
+        reconciler.set_now(6);
+        let gone = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at: 6,
+            agent_version: None,
+            containers: vec![],
+        };
+        let ticket = reconciler.ingest_snapshot(&gone).await.unwrap();
+        reconciler.set_now(6 + GATUS_REMOVAL_GRACE_SECS + 60);
+        reconciler.apply_reconcile(&gone, ticket).await.unwrap();
+
+        assert!(
+            gatus::service_file_path(&gatus_dir, "m1/app").exists(),
+            "the service was gone 5 s when ingested, so its removal is deferred"
         );
     }
 
@@ -2476,6 +2653,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![app()],
             },
+            1,
         )
         .await
         .unwrap();
@@ -2725,6 +2903,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![app()],
             },
+            1,
         )
         .await
         .unwrap();
@@ -2807,6 +2986,7 @@ mod tests {
                 agent_version: None,
                 containers: vec![app()],
             },
+            1,
         )
         .await
         .unwrap();
@@ -3026,7 +3206,9 @@ mod tests {
         };
         // Seed the service row (npm_hosts has an FK to it) and the mapping so
         // reconcile takes the get/verify path rather than creating.
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
 
         reconciler.reconcile_snapshot(&snap).await.unwrap();
@@ -3108,7 +3290,9 @@ mod tests {
         };
         // Seed the service row and a stale mapping so reconcile takes the
         // get/verify path against id 50.
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
 
         reconciler.reconcile_snapshot(&snap).await.unwrap();
@@ -3283,10 +3467,13 @@ mod tests {
                 labels: npm_host_labels("a.example.com"),
             }],
         };
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
 
         // Service gone only 30s later — within the grace period.
+        reconciler.set_now(130);
         reconciler
             .reconcile_snapshot(&Snapshot {
                 machine_id: MachineId::new("m1"),
@@ -3358,6 +3545,137 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A reconciler with NPM and Cloudflare mocks that refuse any delete, for
+    /// tests where a removal must stay deferred.  The NPM mock still serves the
+    /// token and certificates an apply with NPM removals fetches.
+    async fn reconciler_refusing_deletes(
+        dir: &std::path::Path,
+        pool: Db,
+    ) -> (
+        Reconciler,
+        mockito::ServerGuard,
+        mockito::ServerGuard,
+        Vec<mockito::Mock>,
+    ) {
+        let mut npm_server = mockito::Server::new_async().await;
+        let mut cf_server = mockito::Server::new_async().await;
+        let mocks = vec![
+            npm_server
+                .mock("POST", "/api/tokens")
+                .with_status(200)
+                .with_body(r#"{"token":"t"}"#)
+                .expect_at_least(1)
+                .create_async()
+                .await,
+            npm_server
+                .mock("GET", "/api/nginx/certificates")
+                .with_status(200)
+                .with_body("[]")
+                .expect_at_least(1)
+                .create_async()
+                .await,
+            npm_server
+                .mock("DELETE", "/api/nginx/proxy-hosts/50")
+                .with_status(200)
+                .with_body("{}")
+                .expect(0)
+                .create_async()
+                .await,
+            cf_server
+                .mock("DELETE", "/zones/z/dns_records/rec-1")
+                .with_status(200)
+                .with_body(r#"{"success":true}"#)
+                .expect(0)
+                .create_async()
+                .await,
+        ];
+        let (npm, cf) = test_clients_with_cf(&npm_server.url(), &cf_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool,
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.join("gatus"),
+            },
+            npm,
+            cf,
+        );
+        (reconciler, npm_server, cf_server, mocks)
+    }
+
+    /// Push `m1/app` with `taken_at`, give it NPM host 50 and Cloudflare record
+    /// `rec-1`, then push a snapshot without it at `left_at`.
+    async fn publish_then_drop(reconciler: &Reconciler, taken_at: u64, left_at: u64) {
+        push_stamped(
+            reconciler,
+            taken_at,
+            vec![ContainerEntry {
+                name: "app".into(),
+                labels: gatus_labels(),
+            }],
+        )
+        .await;
+        storage::set_npm_host(reconciler.pool(), "m1/app", 0, 50)
+            .await
+            .unwrap();
+        storage::set_cf_dns_record(reconciler.pool(), "m1/app", "rec-1")
+            .await
+            .unwrap();
+        push_stamped(reconciler, left_at, vec![]).await;
+    }
+
+    /// No delete reached NPM or Cloudflare, and both removals still wait.
+    async fn assert_removals_deferred(pool: &Db, mocks: &[mockito::Mock]) {
+        for mock in mocks {
+            mock.assert_async().await;
+        }
+        assert_eq!(
+            storage::list_pending_npm_removals(pool)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage::list_pending_cf_removals(pool).await.unwrap().len(),
+            1
+        );
+    }
+
+    fn agent_now() -> u64 {
+        unix_now() as u64
+    }
+
+    #[tokio::test]
+    async fn agent_clock_behind_the_server_keeps_the_grace_period() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let (reconciler, _npm, _cf, mocks) =
+            reconciler_refusing_deletes(dir.path(), pool.clone()).await;
+
+        // The agent's clock runs an hour behind; by it, the service left 10 s
+        // after it was last seen.
+        let agent_time = agent_now() - 3600;
+        publish_then_drop(&reconciler, agent_time, agent_time + 10).await;
+        reconciler.sweep_pending_removals().await.unwrap();
+
+        assert_removals_deferred(&pool, &mocks).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_stamped_zero_keeps_the_grace_period() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let (reconciler, _npm, _cf, mocks) =
+            reconciler_refusing_deletes(dir.path(), pool.clone()).await;
+
+        // An agent that could not read its clock sends taken_at = 0.
+        publish_then_drop(&reconciler, 0, agent_now()).await;
+        reconciler.sweep_pending_removals().await.unwrap();
+
+        assert_removals_deferred(&pool, &mocks).await;
     }
 
     #[tokio::test]
@@ -3570,7 +3888,9 @@ mod tests {
                 labels: cf_dns_labels("app", "home.example.com"),
             }],
         };
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
             .await
             .unwrap();
@@ -3639,12 +3959,15 @@ mod tests {
                 labels: cf_dns_labels("app", "home.example.com"),
             }],
         };
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
             .await
             .unwrap();
 
         // Gone only 30s later — within grace.
+        reconciler.set_now(130);
         reconciler
             .reconcile_snapshot(&Snapshot {
                 machine_id: MachineId::new("m1"),
@@ -3876,7 +4199,9 @@ mod tests {
                 labels: cf_dns_labels("app", "home.example.com"),
             }],
         };
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
             .await
             .unwrap();
@@ -4606,7 +4931,9 @@ mod tests {
                 labels: npm_host_labels("a.example.com"),
             }],
         };
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
 
         // Service leaves the snapshot, well past the grace period.
@@ -4809,7 +5136,9 @@ mod tests {
             false,
         );
         let snap = snap_with(npm_host_labels("a.example.com"));
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
 
         reconciler.reconcile_snapshot(&snap).await.unwrap();
@@ -4849,7 +5178,9 @@ mod tests {
             false,
         );
         let snap = snap_with(npm_host_labels("a.example.com"));
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
 
         reconciler.reconcile_snapshot(&snap).await.unwrap();
@@ -4892,7 +5223,9 @@ mod tests {
             false,
         );
         let snap = snap_with(npm_host_labels("a.example.com"));
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
 
         let first = reconciler.full_resync().await.unwrap();
@@ -5079,7 +5412,9 @@ mod tests {
             cf,
         );
         let snap = snap_with(npm_host_labels("a.example.com"));
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         let host = docktornet_core::labels::parse(&npm_host_labels("a.example.com"))
             .npm
             .remove(0);
@@ -5198,7 +5533,9 @@ mod tests {
             true,
         );
         let snap = snap_with(npm_host_labels("a.example.com"));
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
 
         reconciler.reconcile_snapshot(&snap).await.unwrap();
@@ -5317,7 +5654,9 @@ mod tests {
             false,
         );
         let snap = snap_with(cf_dns_labels("app", "home.example.com"));
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
             .await
             .unwrap();
@@ -5335,6 +5674,151 @@ mod tests {
             .await;
         assert_eq!(reconciler.full_resync().await.unwrap().failed, 0);
         update.assert_async().await;
+    }
+
+    /// `m1/app` with NPM host 50, Cloudflare record `rec-1` and a Gatus monitor.
+    async fn seed_published_app(pool: &Db) {
+        let mut labels = npm_host_labels("a.example.com");
+        labels.extend(cf_dns_labels("app", "home.example.com"));
+        labels.extend(gatus_labels());
+        storage::upsert_snapshot(pool, &snap_with(labels), 1)
+            .await
+            .unwrap();
+        storage::set_npm_host(pool, "m1/app", 0, 50).await.unwrap();
+        storage::set_cf_dns_record(pool, "m1/app", "rec-1")
+            .await
+            .unwrap();
+    }
+
+    /// A Cloudflare mock holding `rec-1` exactly as `seed_published_app` wants
+    /// it, expecting `reads` reads of the record.
+    async fn cf_server_with_app_record(reads: usize) -> (mockito::ServerGuard, mockito::Mock) {
+        let mut cf_server = cf_server_with_zone().await;
+        let get = cf_server
+            .mock("GET", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-1", Some("docktornet:m1/app"))))
+            .expect(reads)
+            .create_async()
+            .await;
+        (cf_server, get)
+    }
+
+    #[tokio::test]
+    async fn full_resync_npm_failures_open_the_breaker_and_then_skip_npm() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        seed_published_app(&pool).await;
+        // A pending NPM removal past grace, so the sweep has NPM work too.
+        storage::add_pending_npm_removal(&pool, "m1/old", 0, 60, 1)
+            .await
+            .unwrap();
+        let mut npm_server = mockito::Server::new_async().await;
+        let token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(500)
+            .expect(NPM_BREAKER_THRESHOLD as usize)
+            .create_async()
+            .await;
+        let (cf_server, cf_get) =
+            cf_server_with_app_record(NPM_BREAKER_THRESHOLD as usize + 1).await;
+        let reconciler = reconciler_for(
+            pool,
+            dir.path(),
+            &npm_server.url(),
+            &cf_server.url(),
+            false,
+            false,
+        );
+
+        for _ in 0..NPM_BREAKER_THRESHOLD {
+            reconciler.full_resync().await.unwrap();
+        }
+        // The breaker is open: this pass sends NPM nothing, while Gatus and
+        // Cloudflare are still verified.
+        let service_file = gatus::service_file_path(dir.path().join("gatus"), "m1/app");
+        std::fs::remove_file(&service_file).unwrap();
+        let report = reconciler.full_resync().await.unwrap();
+
+        token.assert_async().await;
+        cf_get.assert_async().await;
+        assert!(service_file.exists(), "gatus resync must still run");
+        assert_eq!(report.failed, 0, "skipped NPM hosts are not failures");
+        assert_eq!(report.repaired, 1, "the rewritten gatus file");
+        assert_eq!(
+            report.verified, 1,
+            "the cloudflare record, not the NPM host"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_full_resync_resets_the_npm_breaker() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        seed_published_app(&pool).await;
+        let mut npm_server = mockito::Server::new_async().await;
+        let (cf_server, _cf_get) = cf_server_with_app_record(5).await;
+        let reconciler = reconciler_for(
+            pool,
+            dir.path(),
+            &npm_server.url(),
+            &cf_server.url(),
+            false,
+            false,
+        );
+        let failing_token = |server: &mut mockito::ServerGuard| {
+            server
+                .mock("POST", "/api/tokens")
+                .with_status(500)
+                .expect(NPM_BREAKER_THRESHOLD as usize - 1)
+                .create()
+        };
+
+        // One failure short of the threshold.
+        let failing = failing_token(&mut npm_server);
+        for _ in 1..NPM_BREAKER_THRESHOLD {
+            reconciler.full_resync().await.unwrap();
+        }
+        failing.assert_async().await;
+        failing.remove_async().await;
+
+        // A clean pass: the host is in sync.
+        let healthy = vec![
+            npm_server
+                .mock("POST", "/api/tokens")
+                .with_status(200)
+                .with_body(r#"{"token":"t"}"#)
+                .create_async()
+                .await,
+            npm_server
+                .mock("GET", "/api/nginx/certificates")
+                .with_status(200)
+                .with_body("[]")
+                .create_async()
+                .await,
+            npm_server
+                .mock("GET", "/api/nginx/proxy-hosts/50")
+                .with_status(200)
+                .with_body(stored_host_50(
+                    serde_json::json!({ "docktornet": app_marker() }),
+                ))
+                .create_async()
+                .await,
+        ];
+        assert_eq!(reconciler.full_resync().await.unwrap().failed, 0);
+        for mock in healthy {
+            mock.assert_async().await;
+            mock.remove_async().await;
+        }
+
+        // The success cleared the count, so the same run of failures again
+        // still leaves the breaker closed: every pass reaches NPM.
+        let failing = failing_token(&mut npm_server);
+        for _ in 1..NPM_BREAKER_THRESHOLD {
+            reconciler.full_resync().await.unwrap();
+        }
+        failing.assert_async().await;
+        assert!(!reconciler.npm_breaker.is_open(std::time::Instant::now()));
     }
 
     #[tokio::test]
@@ -5489,7 +5973,9 @@ mod tests {
             .cf_dns
             .unwrap();
         let snap = snap_with(cf_dns_labels("app", "home.example.com"));
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
 
         let err = reconciler
             .reconcile_cloudflare("m1/app", &dns)
@@ -5577,7 +6063,9 @@ mod tests {
             true,
         );
         let snap = snap_with(cf_dns_labels("app", "home.example.com"));
-        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
         storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
             .await
             .unwrap();

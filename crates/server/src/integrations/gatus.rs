@@ -337,10 +337,60 @@ pub async fn write_classification_map(
         return Ok(false);
     }
     tokio::fs::create_dir_all(config_dir.as_ref()).await?;
-    let tmp = service_temp_file_path(&target);
-    tokio::fs::write(&tmp, body).await?;
-    tokio::fs::rename(&tmp, &target).await?;
+    write_atomically(&target, &body, None).await?;
     Ok(true)
+}
+
+/// Write `body` to `target` through a temporary file beside it, so Gatus never
+/// reads a half-written file.  `modified` sets the file's mtime before it takes
+/// `target`'s place.  A failed write removes its temporary file.
+async fn write_atomically(
+    target: &Path,
+    body: &str,
+    modified: Option<SystemTime>,
+) -> std::io::Result<()> {
+    let tmp = service_temp_file_path(target);
+    let result = async {
+        tokio::fs::write(&tmp, body).await?;
+        if let Some(modified) = modified {
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)
+                .await?
+                .into_std()
+                .await
+                .set_modified(modified)?;
+        }
+        tokio::fs::rename(&tmp, target).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+/// Returns true if the path looks like a temporary file `write_atomically`
+/// made for one of docktornet's own files: `{file name}.tmp-{pid}-{nanos}-{counter}`,
+/// where the file name is a service file, the classification map or the
+/// reload trigger.  One left behind by a crash is clutter Gatus never loads.
+/// Operator files that merely look similar are never matched.
+pub fn is_temp_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some((target, suffix)) = name.rsplit_once(".tmp-") else {
+        return false;
+    };
+    let target = Path::new(target);
+    let ours = is_managed_service_file(target)
+        || target == classification_map_path("")
+        || target == reload_trigger_path("");
+    let parts: Vec<&str> = suffix.split('-').collect();
+    ours && parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn service_temp_file_path(target: &std::path::Path) -> PathBuf {
@@ -377,10 +427,8 @@ pub async fn write_service_file(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let tmp = service_temp_file_path(&target);
     let yaml = render_gatus_yaml(service_id, monitors)?;
-    tokio::fs::write(&tmp, yaml).await?;
-    tokio::fs::rename(&tmp, &target).await?;
+    write_atomically(&target, &yaml, None).await?;
 
     Ok(target)
 }
@@ -436,16 +484,12 @@ const RELOAD_TRIGGER_YAML: &str =
 /// inside its reload, so the next load is never older than the trigger.
 pub async fn touch_reload_trigger(config_dir: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
     let target = reload_trigger_path(config_dir);
-    let tmp = service_temp_file_path(&target);
-    tokio::fs::write(&tmp, RELOAD_TRIGGER_YAML).await?;
-    tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(&tmp)
-        .await?
-        .into_std()
-        .await
-        .set_modified(SystemTime::now() + std::time::Duration::from_secs(1))?;
-    tokio::fs::rename(&tmp, &target).await?;
+    write_atomically(
+        &target,
+        RELOAD_TRIGGER_YAML,
+        Some(SystemTime::now() + std::time::Duration::from_secs(1)),
+    )
+    .await?;
     Ok(())
 }
 
@@ -872,5 +916,51 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    /// Occupy `target` with a non-empty directory, so renaming onto it fails.
+    fn block_rename_onto(target: &Path) {
+        std::fs::create_dir_all(target.join("occupied")).unwrap();
+    }
+
+    fn temp_files_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn failed_rename_leaves_no_temp_file_behind() {
+        let dir = tempdir().unwrap();
+        let monitors = vec![GatusMonitor {
+            index: 0,
+            url: "https://app.example.com".to_string(),
+            interval: "30s".to_string(),
+            conditions: vec!["[STATUS] == 200".to_string()],
+            group: None,
+            name: None,
+            telegram: false,
+            severity: None,
+            area: None,
+        }];
+        block_rename_onto(&service_file_path(dir.path(), "m1/app"));
+        block_rename_onto(&classification_map_path(dir.path()));
+        block_rename_onto(&reload_trigger_path(dir.path()));
+
+        assert!(
+            write_service_file(dir.path(), "m1/app", &monitors)
+                .await
+                .is_err()
+        );
+        assert!(
+            write_classification_map(dir.path(), &[], GATUS_DEFAULT_THRESHOLDS)
+                .await
+                .is_err()
+        );
+        assert!(touch_reload_trigger(dir.path()).await.is_err());
+
+        assert_eq!(temp_files_in(dir.path()), Vec::<String>::new());
     }
 }
