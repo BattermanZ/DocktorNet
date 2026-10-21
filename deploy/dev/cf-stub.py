@@ -1,8 +1,9 @@
 """Stateful stand-in for the Cloudflare DNS API, for the dev stack only.
 
-Serves the calls CloudflareClient makes (zone, list by type and name, create,
-update, get, delete) with Cloudflare's response envelope, keeps records in
-memory, and logs every write. GET /_stub/records lists what it holds.
+Serves the calls CloudflareClient makes (zone, list by type, name or exact
+comment, create, update, get, delete) with Cloudflare's response envelope,
+keeps records in memory, and logs every write. GET /_stub/records lists what
+it holds.
 
 Standard library only, so it runs on a stock python image.
 """
@@ -66,6 +67,8 @@ def record_from(body, record_id):
         "content": body["content"],
         "proxied": bool(body.get("proxied", False)),
         "ttl": int(body.get("ttl", 1)),
+        # Like Cloudflare, a write without a comment leaves none.
+        "comment": body.get("comment"),
     }
 
 
@@ -113,11 +116,17 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(url.query)
                 wanted_type = query.get("type", [None])[0]
                 wanted_name = query.get("name", [None])[0]
+                wanted_comment = query.get("comment.exact", [None])[0]
                 found = [
                     r
                     for r in records.values()
                     if (wanted_type is None or r["type"] == wanted_type)
                     and (wanted_name is None or r["name"] == normalise(wanted_name))
+                    # Cloudflare's comment filters ignore case.
+                    and (
+                        wanted_comment is None
+                        or (r["comment"] or "").lower() == wanted_comment.lower()
+                    )
                 ]
                 return ok(found)
             if method == "POST":
@@ -126,7 +135,7 @@ class Handler(BaseHTTPRequestHandler):
                     log(f"create rejected, {record['name']} already exists")
                     return name_conflict()
                 records[record["id"]] = record
-                log(f"created {record['id']} {record['name']} -> {record['content']}")
+                log(f"created {record['id']} {record['name']} -> {record['content']} comment={record['comment']!r}")
                 return ok(record)
 
         match = RECORD_ITEM_PATH.match(url.path)
@@ -141,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
                 if name_taken(record["name"], except_id=record_id):
                     return name_conflict()
                 records[record_id] = record
-                log(f"updated {record_id} {record['name']} -> {record['content']}")
+                log(f"updated {record_id} {record['name']} -> {record['content']} comment={record['comment']!r}")
                 return ok(record)
             if method == "DELETE":
                 removed = records.pop(record_id)

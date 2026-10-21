@@ -30,7 +30,7 @@ Give `DOCKTORNET_DB_PATH` as an absolute path on the `./data:/data` volume. A re
 | `DOCKTORNET_GATUS_CONFIG_DIR` | required | — |
 | `DOCKTORNET_FULL_RESYNC_INTERVAL` | optional (`1h`); the first full resync runs at startup | — |
 | `DOCKTORNET_DRY_RUN` | optional (`true`) | — |
-| `DOCKTORNET_ADOPT_EXISTING` | optional (`false`) | — |
+| `DOCKTORNET_ADOPT_EXISTING` | optional (`false`); enables hostname adoption of unmarked resources, see [Ownership markers](#ownership-markers-and-adoption) | — |
 | `DOCKTORNET_NPM_*` | required | — |
 | `DOCKTORNET_CF_API_TOKEN`, `DOCKTORNET_CF_ZONE_ID` | required | — |
 | `DOCKTORNET_CF_API_URL` | optional (`https://api.cloudflare.com/client/v4`); the dev stack points it at its stub | — |
@@ -39,6 +39,34 @@ Give `DOCKTORNET_DB_PATH` as an absolute path on the `./data:/data` volume. A re
 | `DOCKTORNET_MACHINE_ID` | — | required |
 | `DOCKTORNET_FORWARD_HOST` | — | required |
 | `DOCKTORNET_SOCKETS` | — | required |
+
+## Ownership markers and adoption
+
+The server writes an ownership marker on every NPM proxy host and Cloudflare
+DNS record it manages: the `docktornet` key in the host's `meta`, and the
+comment `docktornet:<machine>/<container>` on the record. The format is fixed
+by [ADR 0001](adr/0001-ownership-markers.md).
+
+- **Losing the database.** When a service has no stored mapping, the server
+  adopts a resource marked with its service ID before it creates one. This
+  needs no flag, so a server started on an empty database takes back what it
+  owned as each agent pushes, without duplicates.
+- **Hostname adoption.** With `DOCKTORNET_ADOPT_EXISTING=true`, a create that
+  fails because the hostname is taken adopts the existing resource, but only
+  if it is unmarked. The server writes the marker as it adopts. It refuses a
+  resource marked for another service and logs both service IDs. If adoption replaces a Cloudflare comment the server did not write, it
+  logs the old text first.
+- **Deletion.** Unchanged: the server deletes only what a stored mapping or
+  pending removal points to, never a marked resource on its own.
+- **Long service IDs.** The server never writes a comment over 100
+  characters. It sends the record an empty comment instead, so the record works
+  as before but has no marker, and it logs a warning on each pass.
+
+> **Upgrading to a version with markers:** the first full resync after the
+> upgrade, which runs at startup, finds every mapped proxy host and DNS record
+> without a marker and updates each one once. Every proxy host update makes NPM
+> reload nginx, so expect one reload per proxy host on that pass. Later resyncs
+> leave marked resources alone.
 
 ## Compose layouts
 

@@ -6,6 +6,31 @@ use url::Url;
 
 use crate::config::NpmConfig;
 
+/// The `meta` key that holds docktornet's ownership marker (ADR 0001).
+pub const MARKER_KEY: &str = "docktornet";
+
+/// The ownership marker docktornet writes in a proxy host's `meta`, naming the
+/// service and NPM index that own the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipMarker {
+    pub service_id: String,
+    pub npm_index: i64,
+}
+
+impl OwnershipMarker {
+    pub fn new(service_id: impl Into<String>, npm_index: impl Into<i64>) -> Self {
+        Self {
+            service_id: service_id.into(),
+            npm_index: npm_index.into(),
+        }
+    }
+
+    /// The marker in a host's `meta`, if it holds a well-formed one.
+    pub fn from_meta(meta: &Value) -> Option<Self> {
+        serde_json::from_value(meta.get(MARKER_KEY)?.clone()).ok()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProxyHostPayload {
     pub domain_names: Vec<String>,
@@ -36,6 +61,39 @@ pub struct Certificate {
 pub struct ProxyHostResponse {
     pub id: i64,
     pub domain_names: Vec<String>,
+    #[serde(default)]
+    pub meta: Value,
+}
+
+impl ProxyHostResponse {
+    pub fn marker(&self) -> Option<OwnershipMarker> {
+        OwnershipMarker::from_meta(&self.meta)
+    }
+
+    /// Record `marker` on this copy of the host, as an adoption would.
+    pub fn set_marker(&mut self, marker: &OwnershipMarker) {
+        if !self.meta.is_object() {
+            self.meta = Value::Object(serde_json::Map::new());
+        }
+        self.meta[MARKER_KEY] = serde_json::json!(marker);
+    }
+}
+
+impl ProxyHostPayload {
+    /// The payload to PUT over a host whose stored `meta` is `existing`. NPM
+    /// replaces `meta` wholesale on update, so carry every existing key and set
+    /// only docktornet's marker.
+    pub fn merged_with_meta(mut self, existing: &Value) -> Self {
+        let mut meta = match existing {
+            Value::Object(map) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        if let Some(marker) = self.meta.get(MARKER_KEY) {
+            meta.insert(MARKER_KEY.to_string(), marker.clone());
+        }
+        self.meta = Value::Object(meta);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,13 +121,16 @@ pub struct ProxyHost {
     pub block_exploits: bool,
     #[serde(default, deserialize_with = "de_bool")]
     pub allow_websocket_upgrade: bool,
+    #[serde(default)]
+    pub meta: Value,
 }
 
 impl ProxyHost {
     /// True when NPM's stored state already matches the payload we would push.
     /// Only the fields we derive from labels are compared; flags we always set
     /// to a constant (caching) can't drift, so skipping them avoids false
-    /// mismatches from NPM normalizing its response.
+    /// mismatches from NPM normalizing its response. Of `meta`, only the
+    /// ownership marker is compared, so NPM's own keys never count as drift.
     pub fn matches_payload(&self, payload: &ProxyHostPayload) -> bool {
         self.certificate_id.unwrap_or_default() == payload.certificate_id
             && self.domain_names == payload.domain_names
@@ -82,6 +143,12 @@ impl ProxyHost {
             && self.hsts_subdomains == payload.hsts_subdomains
             && self.block_exploits == payload.block_exploits
             && self.allow_websocket_upgrade == payload.allow_websocket_upgrade
+            && self.marker_matches(payload)
+    }
+
+    /// True when the host's ownership marker is the one `payload` carries.
+    pub fn marker_matches(&self, payload: &ProxyHostPayload) -> bool {
+        self.meta.get(MARKER_KEY) == payload.meta.get(MARKER_KEY)
     }
 }
 
@@ -205,27 +272,9 @@ impl NpmClient {
         Ok(resp.json::<ProxyHostResponse>().await?)
     }
 
-    /// Find an existing proxy host whose `domain_names` include `domain`
-    /// (case-insensitive). NPM has no server-side filter, so list and match
-    /// locally. Used to adopt a host that already exists when our DB has no
-    /// mapping for it.
-    pub async fn find_proxy_host_by_domain(
-        &self,
-        token: &str,
-        domain: &str,
-    ) -> Result<Option<ProxyHostResponse>, NpmError> {
-        self.find_proxy_host_by_any_domain(token, std::slice::from_ref(&domain.to_string()))
-            .await
-    }
-
-    /// Like `find_proxy_host_by_domain` but matches if *any* of `domains` is
-    /// present on an existing host. A proxy host with several domain names is
-    /// one NPM entry, so finding it by any of its domains lets us adopt it.
-    pub async fn find_proxy_host_by_any_domain(
-        &self,
-        token: &str,
-        domains: &[String],
-    ) -> Result<Option<ProxyHostResponse>, NpmError> {
+    /// Every proxy host in NPM. NPM has no server-side filter, so marker and
+    /// hostname lookups list once and match locally.
+    pub async fn list_proxy_hosts(&self, token: &str) -> Result<Vec<ProxyHostResponse>, NpmError> {
         let resp = self
             .http
             .get(self.endpoint("api/nginx/proxy-hosts"))
@@ -234,14 +283,7 @@ impl NpmClient {
             .await?
             .error_for_status()?;
 
-        let hosts = resp.json::<Vec<ProxyHostResponse>>().await?;
-        Ok(hosts.into_iter().find(|host| {
-            host.domain_names.iter().any(|name| {
-                domains
-                    .iter()
-                    .any(|domain| name.eq_ignore_ascii_case(domain))
-            })
-        }))
+        Ok(resp.json::<Vec<ProxyHostResponse>>().await?)
     }
 
     pub async fn get_proxy_host(
@@ -289,10 +331,39 @@ impl NpmClient {
     }
 }
 
+/// The host marked as owned by `marker`'s service and NPM index.
+pub fn find_by_marker<'a>(
+    hosts: &'a [ProxyHostResponse],
+    marker: &OwnershipMarker,
+) -> Option<&'a ProxyHostResponse> {
+    hosts
+        .iter()
+        .find(|host| host.marker().as_ref() == Some(marker))
+}
+
+/// The first host serving *any* of `domains` (case-insensitive). A proxy host
+/// with several domain names is one NPM entry, so any of them finds it.
+pub fn find_by_any_domain<'a>(
+    hosts: &'a [ProxyHostResponse],
+    domains: &[String],
+) -> Option<&'a ProxyHostResponse> {
+    hosts.iter().find(|host| {
+        host.domain_names.iter().any(|name| {
+            domains
+                .iter()
+                .any(|domain| name.eq_ignore_ascii_case(domain))
+        })
+    })
+}
+
+/// The payload for `host`, owned by `service_id`. Its `meta` holds only the
+/// ownership marker, which is all a create needs; an update merges it over the
+/// stored `meta` with [`ProxyHostPayload::merged_with_meta`].
 pub fn proxy_payload(
     host: &NpmHost,
     forward_host: impl Into<String>,
     cert_id: Option<i64>,
+    service_id: &str,
 ) -> ProxyHostPayload {
     let cert_id = cert_id.unwrap_or_default();
     let ssl_enabled = host.ssl && cert_id > 0;
@@ -320,8 +391,7 @@ pub fn proxy_payload(
         advanced_config: String::new(),
         locations: vec![],
         meta: serde_json::json!({
-            "letsencrypt_agree": false,
-            "dns_challenge": false,
+            MARKER_KEY: OwnershipMarker::new(service_id, host.index),
         }),
     }
 }
@@ -424,7 +494,7 @@ mod tests {
 
     #[test]
     fn ssl_payload_enables_expected_flags() {
-        let payload = proxy_payload(&host(), "web.internal", Some(42));
+        let payload = proxy_payload(&host(), "web.internal", Some(42), "m1/app");
 
         assert_eq!(
             payload,
@@ -445,8 +515,7 @@ mod tests {
                 advanced_config: String::new(),
                 locations: vec![],
                 meta: serde_json::json!({
-                    "letsencrypt_agree": false,
-                    "dns_challenge": false
+                    "docktornet": {"service_id": "m1/app", "npm_index": 0}
                 }),
             }
         );
@@ -459,7 +528,7 @@ mod tests {
             "app.example.com".to_string(),
             "app.mydomain.org".to_string(),
         ];
-        let payload = proxy_payload(&multi, "web.internal", Some(42));
+        let payload = proxy_payload(&multi, "web.internal", Some(42), "m1/app");
 
         assert_eq!(
             payload.domain_names,
@@ -669,7 +738,7 @@ mod tests {
             user: "admin@example.com".to_string(),
             password: "pw".to_string(),
         });
-        let payload = proxy_payload(&host(), "web.internal", Some(42));
+        let payload = proxy_payload(&host(), "web.internal", Some(42), "m1/app");
 
         let response = client.create_proxy_host("abc123", &payload).await.unwrap();
 
@@ -678,15 +747,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_proxy_host_by_domain_matches_case_insensitively() {
+    async fn list_proxy_hosts_reads_each_hosts_marker() {
         let mut server = Server::new_async().await;
         let m = server
             .mock("GET", "/api/nginx/proxy-hosts")
             .match_header("authorization", "Bearer tok")
             .with_status(200)
             .with_body(
-                r#"[{"id":3,"domain_names":["other.example.com"]},
-                    {"id":61,"domain_names":["APP.EXAMPLE.COM"]}]"#,
+                r#"[{"id":3,"domain_names":["other.example.com"],"meta":{"nginx_online":true}},
+                    {"id":61,"domain_names":["app.example.com"],
+                     "meta":{"docktornet":{"service_id":"m1/app","npm_index":1}}}]"#,
             )
             .create_async()
             .await;
@@ -696,35 +766,73 @@ mod tests {
             user: "u".into(),
             password: "p".into(),
         });
-        let got = client
-            .find_proxy_host_by_domain("tok", "app.example.com")
-            .await
-            .unwrap()
-            .unwrap();
+        let hosts = client.list_proxy_hosts("tok").await.unwrap();
         m.assert_async().await;
-        assert_eq!(got.id, 61);
+        assert_eq!(hosts[0].marker(), None);
+        assert_eq!(hosts[1].marker(), Some(OwnershipMarker::new("m1/app", 1u8)));
     }
 
-    #[tokio::test]
-    async fn find_proxy_host_by_domain_returns_none_when_absent() {
-        let mut server = Server::new_async().await;
-        let _m = server
-            .mock("GET", "/api/nginx/proxy-hosts")
-            .with_status(200)
-            .with_body(r#"[{"id":3,"domain_names":["other.example.com"]}]"#)
-            .create_async()
-            .await;
+    fn listed(id: i64, domains: &[&str], meta: Value) -> ProxyHostResponse {
+        ProxyHostResponse {
+            id,
+            domain_names: domains.iter().map(|d| d.to_string()).collect(),
+            meta,
+        }
+    }
 
-        let client = NpmClient::new(crate::config::NpmConfig {
-            url: Url::parse(&server.url()).unwrap(),
-            user: "u".into(),
-            password: "p".into(),
+    #[test]
+    fn find_by_marker_needs_the_service_and_the_index() {
+        let hosts = vec![
+            listed(
+                1,
+                &["a.example.com"],
+                serde_json::json!({"docktornet": {"service_id": "m1/app", "npm_index": 1}}),
+            ),
+            listed(
+                2,
+                &["b.example.com"],
+                serde_json::json!({"docktornet": {"service_id": "m1/app", "npm_index": 0}}),
+            ),
+        ];
+
+        let found = find_by_marker(&hosts, &OwnershipMarker::new("m1/app", 0u8)).unwrap();
+        assert_eq!(found.id, 2);
+        assert!(find_by_marker(&hosts, &OwnershipMarker::new("m1/APP", 0u8)).is_none());
+    }
+
+    #[test]
+    fn find_by_any_domain_matches_case_insensitively() {
+        let hosts = vec![
+            listed(3, &["other.example.com"], Value::Null),
+            listed(61, &["APP.EXAMPLE.COM"], Value::Null),
+        ];
+
+        let found = find_by_any_domain(&hosts, &["app.example.com".to_string()]).unwrap();
+        assert_eq!(found.id, 61);
+        assert!(find_by_any_domain(&hosts, &["missing.example.com".to_string()]).is_none());
+    }
+
+    #[test]
+    fn update_payload_keeps_every_other_meta_key() {
+        let payload = proxy_payload(&host(), "web.internal", Some(42), "m1/app");
+        let stored = serde_json::json!({
+            "nginx_online": true,
+            "nginx_err": null,
+            "dns_challenge": true,
+            "custom": "set in the UI",
+            "docktornet": {"service_id": "m9/stale", "npm_index": 4}
         });
-        let got = client
-            .find_proxy_host_by_domain("tok", "missing.example.com")
-            .await
-            .unwrap();
-        assert!(got.is_none());
+
+        assert_eq!(
+            payload.merged_with_meta(&stored).meta,
+            serde_json::json!({
+                "nginx_online": true,
+                "nginx_err": null,
+                "dns_challenge": true,
+                "custom": "set in the UI",
+                "docktornet": {"service_id": "m1/app", "npm_index": 0}
+            })
+        );
     }
 
     #[tokio::test]

@@ -25,8 +25,10 @@ for the multi-domain NPM workflow and post-v1 reliability and security changes.
 - **Failure-aware integrations:** reconciliation includes request timeouts,
   no-op detection, Cloudflare rate-limit handling, an NPM circuit breaker, and
   atomic Gatus configuration writes.
-- **Guarded adoption:** dry-run is the default and existing resources are only
-  adopted when explicitly enabled.
+- **Ownership markers:** every NPM proxy host and Cloudflare record Docktornet
+  manages names its owning service, so a lost database does not lose ownership.
+  Dry-run is the default, and Docktornet adopts an unmarked resource only when
+  you enable it.
 - **Small deployment shape:** three Rust crates produce an agent and a central
   server, with Compose manifests for each role.
 
@@ -64,6 +66,43 @@ owned resources within about a minute of the grace period ending; failed
 external deletions are persisted and retried on that same minute timer. Gatus
 picks up a removed monitor on its next config check, every 30 seconds.
 
+### Ownership markers
+
+The SQLite database is Docktornet's working copy of what it owns. Each managed
+resource also carries an ownership marker naming the service ID
+(`<machine>/<container>`) that owns it:
+
+- NPM proxy host: the `docktornet` key in the host's `meta`, holding
+  `{"service_id": "<machine>/<container>", "npm_index": <n>}`. Docktornet
+  merges this key into `meta` and leaves every other key alone, including
+  NPM's own and any set in the NPM UI.
+- Cloudflare DNS record: the comment `docktornet:<machine>/<container>`. If
+  that would be longer than 100 characters, Docktornet leaves the comment empty
+  and logs a warning naming the service.
+
+A missing or wrong marker counts as drift, and the next full resync rewrites
+it. When a service has no stored mapping, Docktornet first looks for a resource
+marked with its service ID and adopts it, with no flag needed. That is how it
+recovers ownership after the database is lost. Only then does it create one. A
+marked host that serves domains the labels no longer list loses them on the
+next update, as a label edit would.
+
+Hostname adoption, enabled by `DOCKTORNET_ADOPT_EXISTING=true`, still takes
+over an existing resource whose hostname matches the labels. It now adopts
+only unmarked resources and writes the marker when it does. A resource whose
+marker names another service is never adopted: the reconcile fails and logs
+both the owner and the service that wanted it.
+
+Docktornet deletes only what a stored mapping or pending removal points to. It
+never deletes a marked resource that has no mapping, and dry-run writes no
+markers. See [ADR 0001](docs/adr/0001-ownership-markers.md) for the format.
+
+The first full resync after upgrading to a version with markers runs at startup
+and updates every mapped proxy host and DNS record once to write its marker.
+NPM reloads nginx on each proxy host update, so expect one reload per proxy
+host on that pass. The [deployment guide](docs/deployment.md#ownership-markers-and-adoption)
+has the details.
+
 ## Quick start (local dev)
 
 ```bash
@@ -99,9 +138,10 @@ domains share that entry's port, scheme, SSL and certificate. Use a separate
 > covers every listed domain (exactly or through its wildcard/SAN names). If no
 > certificate covers every domain and `ssl=true`, Docktornet refuses to publish
 > the host instead of silently downgrading it to HTTP. An explicit `cert_id` is
-> used as configured, so ensure it covers every domain. Adoption can find an
-> existing host through any listed domain, but is refused if the update would
-> drop domains that are not present in the Docktornet labels. Use a separate
+> used as configured, so ensure it covers every domain. Hostname adoption can
+> find an existing host through any listed domain, but is refused if the update
+> would drop domains that are not present in the Docktornet labels. Marker
+> adoption is not refused: the host is already Docktornet's. Use a separate
 > `<index>` when domains require different certificates or settings.
 
 | Label | Required | Type | Default | Example | Notes |

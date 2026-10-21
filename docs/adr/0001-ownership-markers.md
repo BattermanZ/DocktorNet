@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Ownership markers live on the resource, in NPM `meta` and the Cloudflare `comment`

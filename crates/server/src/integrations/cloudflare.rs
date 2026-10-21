@@ -17,6 +17,14 @@ const CF_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// header, so we still stop hammering the API for a sensible interval.
 const DEFAULT_CF_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Prefix of the ownership marker docktornet writes as a record's `comment`,
+/// followed by the owning service ID (ADR 0001).
+pub const MARKER_PREFIX: &str = "docktornet:";
+
+/// Longest comment Cloudflare accepts on the Free plan. Docktornet uses it on
+/// every plan.
+pub const COMMENT_MAX_CHARS: usize = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DnsRecordPayload {
     #[serde(rename = "type")]
@@ -25,6 +33,18 @@ pub struct DnsRecordPayload {
     pub content: String,
     pub proxied: bool,
     pub ttl: u32,
+    /// The ownership marker. A PUT overwrites the whole record, so every
+    /// create and update carries `comment`. It is `None` only when the service
+    /// ID is too long for a marker, and is then sent empty, leaving no comment.
+    #[serde(serialize_with = "comment_or_empty")]
+    pub comment: Option<String>,
+}
+
+fn comment_or_empty<S: serde::Serializer>(
+    comment: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(comment.as_deref().unwrap_or_default())
 }
 
 #[derive(Clone)]
@@ -72,6 +92,22 @@ pub struct DnsRecord {
     pub name: String,
     pub content: String,
     pub proxied: bool,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+impl DnsRecord {
+    /// The record's comment, with an empty one read as none.
+    pub fn comment(&self) -> Option<&str> {
+        self.comment
+            .as_deref()
+            .filter(|comment| !comment.is_empty())
+    }
+
+    /// The service ID the record's ownership marker names, if it has one.
+    pub fn marker_owner(&self) -> Option<&str> {
+        self.comment()?.strip_prefix(MARKER_PREFIX)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -192,6 +228,33 @@ impl CloudflareClient {
         Ok(response.result.into_iter().next())
     }
 
+    /// The record whose comment is exactly `comment`. Cloudflare's
+    /// `comment.exact` filter ignores case, so the match is checked again here.
+    pub async fn find_record_by_marker(
+        &self,
+        comment: &str,
+    ) -> Result<Option<DnsRecord>, CloudflareError> {
+        self.check_rate_limit()?;
+        let resp = self
+            .http
+            .get(self.endpoint(&format!("zones/{}/dns_records", self.zone_id)))
+            .query(&[("comment.exact", comment)])
+            .bearer_auth(&self.api_token)
+            .send()
+            .await?;
+        let resp = self.guard_rate_limit(resp)?.error_for_status()?;
+
+        let response = resp.json::<DnsRecordListResponse>().await?;
+        if !response.success {
+            return Err(CloudflareError::Api);
+        }
+
+        Ok(response
+            .result
+            .into_iter()
+            .find(|record| record.comment() == Some(comment)))
+    }
+
     pub async fn create_record(
         &self,
         payload: &DnsRecordPayload,
@@ -310,7 +373,22 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
-pub fn dns_payload(dns: &CloudflareDns, zone_name: &str) -> DnsRecordPayload {
+/// The ownership marker comment for `service_id`, or `None` with a warning
+/// when it would be longer than Cloudflare accepts.
+pub fn marker_comment(service_id: &str) -> Option<String> {
+    let comment = format!("{MARKER_PREFIX}{service_id}");
+    if comment.chars().count() > COMMENT_MAX_CHARS {
+        tracing::warn!(
+            service_id,
+            max_chars = COMMENT_MAX_CHARS,
+            "service ID too long for a Cloudflare ownership marker; the record gets no comment"
+        );
+        return None;
+    }
+    Some(comment)
+}
+
+pub fn dns_payload(dns: &CloudflareDns, zone_name: &str, service_id: &str) -> DnsRecordPayload {
     let name = format!(
         "{}.{}",
         dns.name.trim_end_matches('.'),
@@ -323,6 +401,7 @@ pub fn dns_payload(dns: &CloudflareDns, zone_name: &str) -> DnsRecordPayload {
         content: dns.target.clone(),
         proxied: dns.proxied,
         ttl: 1,
+        comment: marker_comment(service_id),
     }
 }
 
@@ -339,7 +418,7 @@ mod tests {
             proxied: true,
         };
 
-        let payload = dns_payload(&dns, "example.com");
+        let payload = dns_payload(&dns, "example.com", "m1/app");
 
         assert_eq!(
             payload,
@@ -349,6 +428,7 @@ mod tests {
                 content: "home.example.com".to_string(),
                 proxied: true,
                 ttl: 1,
+                comment: Some("docktornet:m1/app".to_string()),
             }
         );
     }
@@ -396,6 +476,7 @@ mod tests {
                 name: "app.example.com".to_string(),
                 content: "target.example.com".to_string(),
                 proxied: true,
+                comment: None,
             })
         );
     }
@@ -571,5 +652,56 @@ mod tests {
         let got = client.get_record("recX").await.unwrap();
         m.assert_async().await;
         assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_record_by_marker_matches_case_sensitively() {
+        // Cloudflare's comment.exact filter ignores case, so it can return a
+        // record marked for a service whose ID differs only in case.
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("GET", "/client/v4/zones/zone-id/dns_records")
+            .match_query(Matcher::UrlEncoded(
+                "comment.exact".into(),
+                "docktornet:m1/app".into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "success": true,
+                    "result": [
+                        {"id": "upper", "name": "a.example.com", "content": "t",
+                         "proxied": false, "comment": "docktornet:m1/APP"},
+                        {"id": "exact", "name": "b.example.com", "content": "t",
+                         "proxied": false, "comment": "docktornet:m1/app"}
+                    ]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "t".to_string(),
+                zone_id: "zone-id".to_string(),
+            },
+            format!("{}/client/v4", server.url()),
+        );
+        let found = client
+            .find_record_by_marker("docktornet:m1/app")
+            .await
+            .unwrap()
+            .unwrap();
+        m.assert_async().await;
+        assert_eq!(found.id, "exact");
+    }
+
+    #[test]
+    fn marker_comment_stops_at_one_hundred_characters() {
+        // "docktornet:" is 11 characters, so an 89-character ID fits exactly.
+        let fits = "m".repeat(89);
+        assert_eq!(marker_comment(&fits).map(|c| c.chars().count()), Some(100));
+        assert_eq!(marker_comment(&"m".repeat(90)), None);
     }
 }

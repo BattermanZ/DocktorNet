@@ -62,6 +62,13 @@ pub struct RemovedService {
     pub cf_record: Option<String>,
 }
 
+/// The NPM proxy-host list for one reconcile pass, fetched on first need and
+/// shared by every unmapped host in the pass.  A hostname adoption writes its
+/// marker into the list, so a later service in the same pass sees the host as
+/// taken.
+#[derive(Default)]
+struct NpmHostList(Mutex<Option<Vec<crate::integrations::npm::ProxyHostResponse>>>);
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ResyncReport {
     pub verified: usize,
@@ -99,6 +106,14 @@ pub enum ReconcileError {
         existing: Vec<String>,
         wanted: Vec<String>,
     },
+    #[error(
+        "{resource} matches {service_id} by hostname but its ownership marker names {owner}; refusing to adopt it"
+    )]
+    MarkedForOtherService {
+        service_id: String,
+        resource: String,
+        owner: String,
+    },
 }
 
 /// Gatus files for containers that temporarily disappear from a snapshot (e.g.
@@ -127,6 +142,7 @@ fn cf_record_matches(
     found.name == intended.name
         && found.content == intended.content
         && found.proxied == intended.proxied
+        && found.comment() == intended.comment.as_deref()
 }
 
 /// Stable hash of the parts of a snapshot that drive the external reconcile:
@@ -226,6 +242,7 @@ impl Reconciler {
         forward_host: &str,
         token: &str,
         certs: &[crate::integrations::npm::Certificate],
+        host_list: &NpmHostList,
     ) -> Result<(), ReconcileError> {
         let Some(client) = &self.npm else {
             tracing::warn!(
@@ -257,83 +274,84 @@ impl Reconciler {
             });
         }
 
-        let payload = crate::integrations::npm::proxy_payload(host, forward_host, cert_id);
+        let payload =
+            crate::integrations::npm::proxy_payload(host, forward_host, cert_id, service_id);
 
-        // Resolve the NPM host id: an existing mapping, a fresh create, or an
-        // adoption of a host that already exists in NPM.
+        // Resolve the NPM host id: an existing mapping, a host marked for this
+        // service, a fresh create, or a hostname adoption.
         let npm_id = match crate::storage::get_npm_host(&self.db, service_id, host.index.into())
             .await?
         {
             Some(id) => id,
-            None => match client.create_proxy_host(token, &payload).await {
-                Ok(created) => {
-                    tracing::info!(service_id, npm_id = created.id, "npm host created");
+            None => {
+                let mut cached = host_list.0.lock().await;
+                if cached.is_none() {
+                    *cached = Some(
+                        client
+                            .list_proxy_hosts(token)
+                            .await
+                            .map_err(|err| ReconcileError::External(err.into()))?,
+                    );
+                }
+                let hosts = cached.as_mut().expect("host list fetched above");
+                let marker = crate::integrations::npm::OwnershipMarker::new(service_id, host.index);
+                if let Some(marked) = crate::integrations::npm::find_by_marker(hosts, &marker) {
+                    // The marker proves ownership, so this needs no flag and
+                    // skips the extra-domains guard: the update below drops
+                    // any domain the labels no longer list, as a label edit
+                    // would.
+                    tracing::info!(service_id, npm_id = marked.id, "npm host adopted by marker");
                     crate::storage::set_npm_host(
                         &self.db,
                         service_id,
                         host.index.into(),
-                        created.id,
+                        marked.id,
                     )
                     .await?;
-                    // A freshly created host already matches the payload.
-                    return Ok(());
-                }
-                Err(err) if self.options.adopt_existing => {
-                    let existing = client
-                        .find_proxy_host_by_any_domain(token, &host.hosts)
-                        .await
-                        .map_err(|e| ReconcileError::External(e.into()))?
-                        .ok_or_else(|| ReconcileError::External(err.into()))?;
+                    marked.id
+                } else {
+                    match client.create_proxy_host(token, &payload).await {
+                        Ok(created) => {
+                            tracing::info!(service_id, npm_id = created.id, "npm host created");
+                            crate::storage::set_npm_host(
+                                &self.db,
+                                service_id,
+                                host.index.into(),
+                                created.id,
+                            )
+                            .await?;
+                            // A freshly created host already matches the payload.
+                            return Ok(());
+                        }
+                        Err(err) if self.options.adopt_existing => {
+                            let existing =
+                                crate::integrations::npm::find_by_any_domain(hosts, &host.hosts)
+                                    .ok_or_else(|| ReconcileError::External(err.into()))?;
+                            self.check_npm_hostname_adoption(service_id, host, existing)?;
+                            let npm_id = existing.id;
 
-                    // The match only requires a single overlapping domain,
-                    // so the existing host may carry others we do not
-                    // manage. Overwriting it with our payload would silently
-                    // drop those domains, so refuse to adopt (and clobber) a
-                    // host that serves more than our labels intend.
-                    let unmanaged: Vec<String> = existing
-                        .domain_names
-                        .iter()
-                        .filter(|name| {
-                            !host
-                                .hosts
-                                .iter()
-                                .any(|wanted| wanted.eq_ignore_ascii_case(name))
-                        })
-                        .cloned()
-                        .collect();
-                    if !unmanaged.is_empty() {
-                        tracing::error!(
-                            service_id,
-                            index = host.index,
-                            npm_id = existing.id,
-                            unmanaged = ?unmanaged,
-                            "refusing to adopt NPM host: it serves domains we do not manage; adopting would drop them"
-                        );
-                        return Err(ReconcileError::AdoptWouldDropDomains {
-                            service_id: service_id.to_string(),
-                            index: host.index,
-                            existing: existing.domain_names.clone(),
-                            wanted: host.hosts.clone(),
-                        });
+                            tracing::info!(service_id, npm_id, "npm host adopted by hostname");
+                            if let Some(adopted) = hosts.iter_mut().find(|h| h.id == npm_id) {
+                                adopted.set_marker(&marker);
+                            }
+                            // Persist the mapping before any further call.  If a later
+                            // step fails (e.g. NPM overloaded), the next reconcile takes
+                            // the get/update path instead of re-adopting, which would
+                            // otherwise loop forever, each adoption triggering an nginx
+                            // reload and keeping NPM pegged.
+                            crate::storage::set_npm_host(
+                                &self.db,
+                                service_id,
+                                host.index.into(),
+                                npm_id,
+                            )
+                            .await?;
+                            npm_id
+                        }
+                        Err(err) => return Err(ReconcileError::External(err.into())),
                     }
-
-                    tracing::info!(service_id, npm_id = existing.id, "npm host adopted");
-                    // Persist the mapping before any further call.  If a later
-                    // step fails (e.g. NPM overloaded), the next reconcile takes
-                    // the get/update path instead of re-adopting — which would
-                    // otherwise loop forever, each adoption triggering an nginx
-                    // reload and keeping NPM pegged.
-                    crate::storage::set_npm_host(
-                        &self.db,
-                        service_id,
-                        host.index.into(),
-                        existing.id,
-                    )
-                    .await?;
-                    existing.id
                 }
-                Err(err) => return Err(ReconcileError::External(err.into())),
-            },
+            }
         };
 
         // Only update — which makes NPM regenerate its config and reload nginx —
@@ -357,13 +375,74 @@ impl Reconciler {
             Some(found) if found.matches_payload(&payload) => {
                 tracing::debug!(service_id, npm_id, "npm host already in sync");
             }
-            Some(_) => {
+            Some(found) => {
                 tracing::info!(service_id, npm_id, "npm host updated");
                 client
-                    .update_proxy_host(token, npm_id, &payload)
+                    .update_proxy_host(token, npm_id, &payload.merged_with_meta(&found.meta))
                     .await
                     .map_err(|err| ReconcileError::External(err.into()))?;
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse a hostname adoption of `existing`, an NPM host found by one of
+    /// `host`'s domains, when it is marked for another service or when
+    /// adopting it would drop domains the labels do not manage.
+    fn check_npm_hostname_adoption(
+        &self,
+        service_id: &str,
+        host: &docktornet_core::labels::NpmHost,
+        existing: &crate::integrations::npm::ProxyHostResponse,
+    ) -> Result<(), ReconcileError> {
+        // A host marked for this service and index was adopted by marker
+        // before the create, so any marker here names another owner: another
+        // service, or this service's host at another index.
+        if let Some(owner) = existing.marker() {
+            let owner = format!("{} (index {})", owner.service_id, owner.npm_index);
+            tracing::error!(
+                service_id,
+                index = host.index,
+                npm_id = existing.id,
+                owner,
+                "refusing to adopt NPM host: its ownership marker names another owner"
+            );
+            return Err(ReconcileError::MarkedForOtherService {
+                service_id: service_id.to_string(),
+                resource: format!("NPM host {}", existing.id),
+                owner,
+            });
+        }
+
+        // The match only requires a single overlapping domain, so the
+        // existing host may carry others we do not manage. Overwriting it
+        // with our payload would silently drop those domains, so refuse to
+        // adopt (and clobber) a host that serves more than our labels intend.
+        let unmanaged: Vec<String> = existing
+            .domain_names
+            .iter()
+            .filter(|name| {
+                !host
+                    .hosts
+                    .iter()
+                    .any(|wanted| wanted.eq_ignore_ascii_case(name))
+            })
+            .cloned()
+            .collect();
+        if !unmanaged.is_empty() {
+            tracing::error!(
+                service_id,
+                index = host.index,
+                npm_id = existing.id,
+                unmanaged = ?unmanaged,
+                "refusing to adopt NPM host: it serves domains we do not manage; adopting would drop them"
+            );
+            return Err(ReconcileError::AdoptWouldDropDomains {
+                service_id: service_id.to_string(),
+                index: host.index,
+                existing: existing.domain_names.clone(),
+                wanted: host.hosts.clone(),
+            });
         }
         Ok(())
     }
@@ -384,7 +463,7 @@ impl Reconciler {
             .zone()
             .await
             .map_err(|err| ReconcileError::External(err.into()))?;
-        let payload = crate::integrations::cloudflare::dns_payload(dns, &zone.name);
+        let payload = crate::integrations::cloudflare::dns_payload(dns, &zone.name, service_id);
         let existing_id = crate::storage::get_cf_dns_record(&self.db, service_id).await?;
 
         if let Some(id) = existing_id {
@@ -421,6 +500,26 @@ impl Reconciler {
             return Ok(());
         }
 
+        // No mapping: a record marked for this service is adopted before any
+        // create, with no flag needed.
+        if let Some(comment) = &payload.comment
+            && let Some(record) = client
+                .find_record_by_marker(comment)
+                .await
+                .map_err(|e| ReconcileError::External(e.into()))?
+        {
+            tracing::info!(service_id, record_id = %record.id, "cf record adopted by marker");
+            crate::storage::set_cf_dns_record(&self.db, service_id, &record.id).await?;
+            if !cf_record_matches(&record, &payload) {
+                tracing::info!(service_id, record_id = %record.id, "cf record drifted, updating");
+                client
+                    .update_record(&record.id, &payload)
+                    .await
+                    .map_err(|e| ReconcileError::External(e.into()))?;
+            }
+            return Ok(());
+        }
+
         match client.create_record(&payload).await {
             Ok(record) => {
                 tracing::info!(service_id, record_id = %record.id, "cf record created");
@@ -433,7 +532,32 @@ impl Reconciler {
                     .await
                     .map_err(|e| ReconcileError::External(e.into()))?
                     .ok_or_else(|| ReconcileError::External(anyhow::anyhow!(err)))?;
-                tracing::info!(service_id, record_id = %record.id, "cf record adopted");
+                if let Some(owner) = record.marker_owner()
+                    && owner != service_id
+                {
+                    tracing::error!(
+                        service_id,
+                        record_id = %record.id,
+                        owner,
+                        "refusing to adopt cf record: its ownership marker names another service"
+                    );
+                    return Err(ReconcileError::MarkedForOtherService {
+                        service_id: service_id.to_string(),
+                        resource: format!("Cloudflare record {} ({})", record.id, record.name),
+                        owner: owner.to_string(),
+                    });
+                }
+                if let Some(old) = record.comment()
+                    && record.marker_owner().is_none()
+                {
+                    tracing::warn!(
+                        service_id,
+                        record_id = %record.id,
+                        old_comment = old,
+                        "cf record adoption replaces a comment docktornet did not write"
+                    );
+                }
+                tracing::info!(service_id, record_id = %record.id, "cf record adopted by hostname");
                 client
                     .update_record(&record.id, &payload)
                     .await
@@ -908,7 +1032,8 @@ impl Reconciler {
             });
         }
 
-        let payload = crate::integrations::npm::proxy_payload(host, forward_host, desired_cert);
+        let payload =
+            crate::integrations::npm::proxy_payload(host, forward_host, desired_cert, service_id);
 
         match existing {
             None => {
@@ -920,15 +1045,19 @@ impl Reconciler {
                 crate::storage::set_npm_host(&self.db, service_id, host.index.into(), created.id)
                     .await?;
             }
-            Some(found) if found.certificate_id != desired_cert => {
+            // NPM reports a host without a certificate as certificate_id 0.
+            Some(found)
+                if found.certificate_id.unwrap_or_default() != payload.certificate_id
+                    || !found.marker_matches(&payload) =>
+            {
                 tracing::info!(
                     service_id,
                     npm_id,
                     ?desired_cert,
-                    "npm cert drifted, updating"
+                    "npm cert or ownership marker drifted, updating"
                 );
                 client
-                    .update_proxy_host(token, npm_id, &payload)
+                    .update_proxy_host(token, npm_id, &payload.merged_with_meta(&found.meta))
                     .await
                     .map_err(|e| ReconcileError::External(e.into()))?;
             }
@@ -957,7 +1086,7 @@ impl Reconciler {
             .zone()
             .await
             .map_err(|e| ReconcileError::External(e.into()))?;
-        let payload = crate::integrations::cloudflare::dns_payload(dns, &zone.name);
+        let payload = crate::integrations::cloudflare::dns_payload(dns, &zone.name, service_id);
         let existing = client
             .get_record(&record_id)
             .await
@@ -1304,6 +1433,9 @@ impl Reconciler {
             }
         }
 
+        // The NPM host list for marker and hostname adoption, fetched at most
+        // once this pass and only if some host has no mapping.
+        let npm_host_list = NpmHostList::default();
         for service in &intended {
             // A service present in the snapshot is live, so any pending NPM
             // removal for it is stale (it briefly disappeared and came back).
@@ -1347,6 +1479,7 @@ impl Reconciler {
                                     &snap.forward_host,
                                     token,
                                     certs,
+                                    &npm_host_list,
                                 )
                                 .await
                             {
@@ -2213,7 +2346,7 @@ mod tests {
             .mock("GET", "/api/nginx/proxy-hosts/50")
             .with_status(200)
             .with_body(
-                r#"{"id":50,"domain_names":["a.example.com"],"forward_scheme":"http","forward_host":"10.0.0.1","forward_port":3000,"certificate_id":0,"ssl_forced":false,"http2_support":false,"hsts_enabled":false,"block_exploits":true,"allow_websocket_upgrade":true,"enabled":true}"#,
+                r#"{"id":50,"domain_names":["a.example.com"],"forward_scheme":"http","forward_host":"10.0.0.1","forward_port":3000,"certificate_id":0,"ssl_forced":false,"http2_support":false,"hsts_enabled":false,"block_exploits":true,"allow_websocket_upgrade":true,"enabled":true,"meta":{"docktornet":{"service_id":"m1/app","npm_index":0}}}"#,
             )
             .create_async()
             .await;
@@ -2628,6 +2761,13 @@ mod tests {
             .expect_at_least(1)
             .create_async()
             .await;
+        // No host is marked for the service, so marker adoption finds nothing.
+        let _list = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
         // One expectation per machine, matching its own forward_host.
         let create_a = npm_server
             .mock("POST", "/api/nginx/proxy-hosts")
@@ -2750,7 +2890,8 @@ mod tests {
                 r#"{"id":50,"domain_names":["a.example.com"],"forward_scheme":"http",
                     "forward_host":"10.0.0.1","forward_port":3000,"certificate_id":0,
                     "ssl_forced":0,"http2_support":0,"hsts_enabled":0,
-                    "hsts_subdomains":0,"block_exploits":1,"allow_websocket_upgrade":1}"#,
+                    "hsts_subdomains":0,"block_exploits":1,"allow_websocket_upgrade":1,
+                    "meta":{"docktornet":{"service_id":"m1/app","npm_index":0}}}"#,
             )
             .expect(1)
             .create_async()
@@ -3587,7 +3728,7 @@ mod tests {
             .mock("GET", "/zones/z/dns_records/rec-1")
             .with_status(200)
             .with_body(
-                r#"{"success":true,"result":{"id":"rec-1","name":"app.example.com","content":"home.example.com","proxied":false}}"#,
+                r#"{"success":true,"result":{"id":"rec-1","name":"app.example.com","content":"home.example.com","proxied":false,"comment":"docktornet:m1/app"}}"#,
             )
             .expect_at_least(1)
             .create_async()
@@ -3752,6 +3893,14 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
+        // No host is marked for the service, so marker adoption finds nothing.
+        let list = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
         let create = npm_server
             .mock("POST", "/api/nginx/proxy-hosts")
             .with_status(200)
@@ -3793,6 +3942,8 @@ mod tests {
 
         token.assert_async().await;
         certs.assert_async().await;
+        // Both hosts are unmapped, but the host list is fetched once per pass.
+        list.assert_async().await;
         create.assert_async().await;
     }
 
@@ -3816,6 +3967,13 @@ mod tests {
             .with_status(200)
             .with_body("[]")
             .expect_at_least(1)
+            .create_async()
+            .await;
+        // No host is marked for the service, so marker adoption finds nothing.
+        let _list = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body("[]")
             .create_async()
             .await;
         // The first service's host creation fails outright.
@@ -3967,6 +4125,13 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
+        // No host is marked for the service, so marker adoption finds nothing.
+        let _list = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
         let create = npm_server
             .mock("POST", "/api/nginx/proxy-hosts")
             .with_status(200)
@@ -4008,7 +4173,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn npm_adopt_skips_update_when_already_in_sync() {
+    async fn npm_adopts_marked_host_without_create_or_flag() {
+        // The database is empty and DOCKTORNET_ADOPT_EXISTING is off, but the
+        // host carries this service's marker, so it is adopted with no create.
         let dir = tempdir().unwrap();
         let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
 
@@ -4027,17 +4194,20 @@ mod tests {
             .expect_at_least(1)
             .create_async()
             .await;
-        let _create = npm_server
+        let create = npm_server
             .mock("POST", "/api/nginx/proxy-hosts")
             .with_status(400)
             .with_body(r#"{"error":{"message":"domain already in use"}}"#)
-            .expect(1)
+            .expect(0)
             .create_async()
             .await;
         let _list = npm_server
             .mock("GET", "/api/nginx/proxy-hosts")
             .with_status(200)
-            .with_body(r#"[{"id":90,"domain_names":["a.example.com"]}]"#)
+            .with_body(
+                r#"[{"id":90,"domain_names":["a.example.com"],
+                     "meta":{"docktornet":{"service_id":"m1/app","npm_index":0}}}]"#,
+            )
             .expect(1)
             .create_async()
             .await;
@@ -4050,7 +4220,8 @@ mod tests {
                 r#"{"id":90,"domain_names":["a.example.com"],"forward_scheme":"http",
                     "forward_host":"10.0.0.1","forward_port":3000,"certificate_id":0,
                     "ssl_forced":0,"http2_support":0,"hsts_enabled":0,
-                    "hsts_subdomains":0,"block_exploits":1,"allow_websocket_upgrade":1}"#,
+                    "hsts_subdomains":0,"block_exploits":1,"allow_websocket_upgrade":1,
+                    "meta":{"docktornet":{"service_id":"m1/app","npm_index":0}}}"#,
             )
             .expect(1)
             .create_async()
@@ -4068,7 +4239,7 @@ mod tests {
             pool.clone(),
             ReconcileOptions {
                 dry_run: false,
-                adopt_existing: true,
+                adopt_existing: false,
                 gatus_config_dir: dir.path().join("gatus"),
             },
             npm,
@@ -4088,7 +4259,8 @@ mod tests {
             .await
             .unwrap();
 
-        // No PUT was issued, but the mapping was still adopted.
+        // No create and no PUT was issued, but the mapping was still adopted.
+        create.assert_async().await;
         update.assert_async().await;
         assert_eq!(
             storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
@@ -4215,6 +4387,13 @@ mod tests {
             .expect_at_least(1)
             .create_async()
             .await;
+        // No host is marked for the service, so marker adoption finds nothing.
+        let _list = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
         // Every create fails.  The breaker (threshold 3) must open after 3
         // failing cycles and stop issuing creates thereafter.
         let create = npm_server
@@ -4330,5 +4509,963 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// An NPM mock answering the token and certificate calls every pass makes.
+    async fn npm_server_with_auth() -> mockito::ServerGuard {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        server
+    }
+
+    fn reconciler_for(
+        pool: Db,
+        dir: &std::path::Path,
+        npm_url: &str,
+        cf_url: &str,
+        dry_run: bool,
+        adopt_existing: bool,
+    ) -> Reconciler {
+        let (npm, cf) = test_clients_with_cf(npm_url, cf_url);
+        Reconciler::with_clients(
+            pool,
+            ReconcileOptions {
+                dry_run,
+                adopt_existing,
+                gatus_config_dir: dir.join("gatus"),
+            },
+            npm,
+            cf,
+        )
+    }
+
+    /// Mocks on `server` that fail the test if any request reaches it.
+    async fn refuse_every_request(server: &mut mockito::ServerGuard) -> Vec<mockito::Mock> {
+        let mut mocks = Vec::new();
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            mocks.push(
+                server
+                    .mock(method, mockito::Matcher::Any)
+                    .with_status(200)
+                    .with_body("{}")
+                    .expect(0)
+                    .create_async()
+                    .await,
+            );
+        }
+        mocks
+    }
+
+    fn snap_with(labels: BTreeMap<String, String>) -> Snapshot {
+        Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at: 1,
+            containers: vec![ContainerEntry {
+                name: "app".into(),
+                labels,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn npm_create_writes_ownership_marker() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut npm_server = npm_server_with_auth().await;
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let create = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "meta": {"docktornet": {"service_id": "m1/app", "npm_index": 0}}
+            })))
+            .with_status(200)
+            .with_body(r#"{"id":5,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &npm_server.url(),
+            &npm_server.url(),
+            false,
+            false,
+        );
+        reconciler
+            .reconcile_snapshot(&snap_with(npm_host_labels("a.example.com")))
+            .await
+            .unwrap();
+
+        create.assert_async().await;
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
+            Some(5)
+        );
+    }
+
+    /// NPM's stored state for host 50 serving `a.example.com` exactly as
+    /// `npm_host_labels` asks, with `meta` as given.
+    fn stored_host_50(meta: serde_json::Value) -> String {
+        serde_json::json!({
+            "id": 50, "domain_names": ["a.example.com"], "forward_scheme": "http",
+            "forward_host": "10.0.0.1", "forward_port": 3000, "certificate_id": 0,
+            "ssl_forced": 0, "http2_support": 0, "hsts_enabled": 0,
+            "hsts_subdomains": 0, "block_exploits": 1, "allow_websocket_upgrade": 1,
+            "meta": meta
+        })
+        .to_string()
+    }
+
+    fn app_marker() -> serde_json::Value {
+        serde_json::json!({"service_id": "m1/app", "npm_index": 0})
+    }
+
+    #[tokio::test]
+    async fn npm_update_keeps_every_other_meta_key() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut npm_server = npm_server_with_auth().await;
+        // The port drifted, so the host is updated; its meta holds NPM's own
+        // keys and one set in the UI.
+        let mut stored: serde_json::Value =
+            serde_json::from_str(&stored_host_50(serde_json::json!({
+                "nginx_online": true,
+                "nginx_err": null,
+                "dns_challenge": true,
+                "custom": "kept",
+                "docktornet": app_marker()
+            })))
+            .unwrap();
+        stored["forward_port"] = 9999.into();
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(stored.to_string())
+            .create_async()
+            .await;
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "forward_port": 3000,
+                "meta": {
+                    "nginx_online": true,
+                    "nginx_err": null,
+                    "dns_challenge": true,
+                    "custom": "kept",
+                    "docktornet": app_marker()
+                }
+            })))
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &npm_server.url(),
+            &npm_server.url(),
+            false,
+            false,
+        );
+        let snap = snap_with(npm_host_labels("a.example.com"));
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+
+        reconciler.reconcile_snapshot(&snap).await.unwrap();
+
+        update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn npm_nginx_status_keys_alone_are_not_drift() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut npm_server = npm_server_with_auth().await;
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(stored_host_50(serde_json::json!({
+                "nginx_online": false,
+                "nginx_err": "nginx: [emerg] something broke",
+                "docktornet": app_marker()
+            })))
+            .create_async()
+            .await;
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &npm_server.url(),
+            &npm_server.url(),
+            false,
+            false,
+        );
+        let snap = snap_with(npm_host_labels("a.example.com"));
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+
+        reconciler.reconcile_snapshot(&snap).await.unwrap();
+        reconciler.full_resync().await.unwrap();
+
+        update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn full_resync_writes_missing_npm_marker_once() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut npm_server = npm_server_with_auth().await;
+        // Before the upgrade the host carries no marker...
+        let unmarked = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(stored_host_50(serde_json::json!({"nginx_online": true})))
+            .expect(1)
+            .create_async()
+            .await;
+        // ...so the first resync writes it, keeping NPM's own key.
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "meta": {"nginx_online": true, "docktornet": app_marker()}
+            })))
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &npm_server.url(),
+            &npm_server.url(),
+            false,
+            false,
+        );
+        let snap = snap_with(npm_host_labels("a.example.com"));
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+
+        let first = reconciler.full_resync().await.unwrap();
+        assert_eq!(first.failed, 0);
+        unmarked.assert_async().await;
+        update.assert_async().await;
+
+        // NPM now holds the marker, and the second resync leaves it alone.
+        unmarked.remove_async().await;
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(stored_host_50(serde_json::json!({
+                "nginx_online": true,
+                "docktornet": app_marker()
+            })))
+            .create_async()
+            .await;
+        let second = reconciler.full_resync().await.unwrap();
+        assert_eq!(second.failed, 0);
+        update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn npm_marker_adoption_drops_domains_the_labels_no_longer_list() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut npm_server = npm_server_with_auth().await;
+        let extra = serde_json::json!({
+            "id": 50, "domain_names": ["a.example.com", "old.example.com"],
+            "forward_scheme": "http", "forward_host": "10.0.0.1", "forward_port": 3000,
+            "certificate_id": 0, "meta": {"docktornet": app_marker()}
+        });
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(format!("[{extra}]"))
+            .create_async()
+            .await;
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(extra.to_string())
+            .create_async()
+            .await;
+        let create = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"{"id":51,"domain_names":["a.example.com"]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "domain_names": ["a.example.com"]
+            })))
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &npm_server.url(),
+            &npm_server.url(),
+            false,
+            false,
+        );
+        reconciler
+            .reconcile_snapshot(&snap_with(npm_host_labels("a.example.com")))
+            .await
+            .unwrap();
+
+        create.assert_async().await;
+        update.assert_async().await;
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
+            Some(50)
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_hostname_adoption_writes_the_marker() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut npm_server = npm_server_with_auth().await;
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"[{"id":50,"domain_names":["a.example.com"],"meta":{}}]"#)
+            .create_async()
+            .await;
+        npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(400)
+            .with_body(r#"{"error":{"message":"domain already in use"}}"#)
+            .create_async()
+            .await;
+        // In sync apart from the missing marker.
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(stored_host_50(serde_json::json!({})))
+            .create_async()
+            .await;
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "meta": {"docktornet": app_marker()}
+            })))
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &npm_server.url(),
+            &npm_server.url(),
+            false,
+            true,
+        );
+        reconciler
+            .reconcile_snapshot(&snap_with(npm_host_labels("a.example.com")))
+            .await
+            .unwrap();
+
+        update.assert_async().await;
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
+            Some(50)
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_hostname_adoption_refuses_a_host_marked_for_another_service() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut npm_server = npm_server_with_auth().await;
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(
+                r#"[{"id":50,"domain_names":["a.example.com"],
+                     "meta":{"docktornet":{"service_id":"m2/other","npm_index":0}}}]"#,
+            )
+            .create_async()
+            .await;
+        npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(400)
+            .with_body(r#"{"error":{"message":"domain already in use"}}"#)
+            .create_async()
+            .await;
+        let get = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(stored_host_50(serde_json::json!({})))
+            .expect(0)
+            .create_async()
+            .await;
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: true,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+        let snap = snap_with(npm_host_labels("a.example.com"));
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        let host = docktornet_core::labels::parse(&npm_host_labels("a.example.com"))
+            .npm
+            .remove(0);
+        let (token, certs) = reconciler.fetch_npm_context().await.unwrap();
+
+        let err = reconciler
+            .reconcile_npm(
+                "m1/app",
+                &host,
+                "10.0.0.1",
+                &token,
+                &certs,
+                &NpmHostList::default(),
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            ReconcileError::MarkedForOtherService {
+                service_id, owner, ..
+            } => {
+                assert_eq!(service_id, "m1/app");
+                assert_eq!(owner, "m2/other (index 0)");
+            }
+            other => panic!("expected MarkedForOtherService, got {other:?}"),
+        }
+        get.assert_async().await;
+        update.assert_async().await;
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_host_adopted_earlier_in_the_pass_is_refused_to_the_next_service() {
+        // Two containers label the same domain and one unmarked host serves
+        // it. The first adopts it by hostname and marks it; the second must
+        // see that marker, though the host list was fetched before it.
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut npm_server = npm_server_with_auth().await;
+        let list = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"[{"id":50,"domain_names":["a.example.com"],"meta":{}}]"#)
+            .expect(1)
+            .create_async()
+            .await;
+        npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(400)
+            .with_body(r#"{"error":{"message":"domain already in use"}}"#)
+            .create_async()
+            .await;
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(stored_host_50(serde_json::json!({})))
+            .create_async()
+            .await;
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "meta": {"docktornet": app_marker()}
+            })))
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &npm_server.url(),
+            &npm_server.url(),
+            false,
+            true,
+        );
+        let mut snap = snap_with(npm_host_labels("a.example.com"));
+        snap.containers.push(ContainerEntry {
+            name: "app2".into(),
+            labels: npm_host_labels("a.example.com"),
+        });
+
+        let result = reconciler.reconcile_snapshot(&snap).await;
+
+        assert!(result.is_err(), "the second service must be refused");
+        list.assert_async().await;
+        update.assert_async().await;
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
+            Some(50)
+        );
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app2", 0).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_writes_no_npm_marker() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut npm_server = mockito::Server::new_async().await;
+        // Dry-run reaches NPM for nothing: no token, no read, no write.
+        let refused = refuse_every_request(&mut npm_server).await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &npm_server.url(),
+            &npm_server.url(),
+            true,
+            true,
+        );
+        let snap = snap_with(npm_host_labels("a.example.com"));
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+
+        reconciler.reconcile_snapshot(&snap).await.unwrap();
+        assert_eq!(reconciler.full_resync().await.unwrap().failed, 0);
+
+        for mock in refused {
+            mock.assert_async().await;
+        }
+    }
+
+    /// A Cloudflare mock answering the zone call every pass makes.
+    async fn cf_server_with_zone() -> mockito::ServerGuard {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/zones/z")
+            .with_status(200)
+            .with_body(r#"{"success":true,"result":{"id":"z","name":"example.com"}}"#)
+            .create_async()
+            .await;
+        server
+    }
+
+    fn cf_list(records: serde_json::Value) -> String {
+        serde_json::json!({"success": true, "result": records}).to_string()
+    }
+
+    fn cf_record(id: &str, comment: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": "app.example.com", "content": "home.example.com",
+            "proxied": false, "comment": comment
+        })
+    }
+
+    fn cf_one(record: serde_json::Value) -> String {
+        serde_json::json!({"success": true, "result": record}).to_string()
+    }
+
+    #[tokio::test]
+    async fn cf_create_writes_ownership_marker() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut cf_server = cf_server_with_zone().await;
+        let lookup = cf_server
+            .mock("GET", "/zones/z/dns_records")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "comment.exact".into(),
+                "docktornet:m1/app".into(),
+            ))
+            .with_status(200)
+            .with_body(cf_list(serde_json::json!([])))
+            .expect(1)
+            .create_async()
+            .await;
+        let create = cf_server
+            .mock("POST", "/zones/z/dns_records")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "name": "app.example.com",
+                "comment": "docktornet:m1/app"
+            })))
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-1", Some("docktornet:m1/app"))))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &cf_server.url(),
+            &cf_server.url(),
+            false,
+            false,
+        );
+        reconciler
+            .reconcile_snapshot(&snap_with(cf_dns_labels("app", "home.example.com")))
+            .await
+            .unwrap();
+
+        lookup.assert_async().await;
+        create.assert_async().await;
+        assert_eq!(
+            storage::get_cf_dns_record(&pool, "m1/app").await.unwrap(),
+            Some("rec-1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn full_resync_writes_missing_cf_marker_once() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut cf_server = cf_server_with_zone().await;
+        let unmarked = cf_server
+            .mock("GET", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-1", None)))
+            .expect(1)
+            .create_async()
+            .await;
+        let update = cf_server
+            .mock("PUT", "/zones/z/dns_records/rec-1")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "comment": "docktornet:m1/app"
+            })))
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-1", Some("docktornet:m1/app"))))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &cf_server.url(),
+            &cf_server.url(),
+            false,
+            false,
+        );
+        let snap = snap_with(cf_dns_labels("app", "home.example.com"));
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
+            .await
+            .unwrap();
+
+        assert_eq!(reconciler.full_resync().await.unwrap().failed, 0);
+        unmarked.assert_async().await;
+        update.assert_async().await;
+
+        unmarked.remove_async().await;
+        cf_server
+            .mock("GET", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-1", Some("docktornet:m1/app"))))
+            .create_async()
+            .await;
+        assert_eq!(reconciler.full_resync().await.unwrap().failed, 0);
+        update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cf_adopts_marked_record_without_create_or_flag() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut cf_server = cf_server_with_zone().await;
+        cf_server
+            .mock("GET", "/zones/z/dns_records")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "comment.exact".into(),
+                "docktornet:m1/app".into(),
+            ))
+            .with_status(200)
+            .with_body(cf_list(serde_json::json!([cf_record(
+                "rec-9",
+                Some("docktornet:m1/app")
+            )])))
+            .create_async()
+            .await;
+        let create = cf_server
+            .mock("POST", "/zones/z/dns_records")
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-new", Some("docktornet:m1/app"))))
+            .expect(0)
+            .create_async()
+            .await;
+        let update = cf_server
+            .mock("PUT", "/zones/z/dns_records/rec-9")
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-9", Some("docktornet:m1/app"))))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &cf_server.url(),
+            &cf_server.url(),
+            false,
+            false,
+        );
+        reconciler
+            .reconcile_snapshot(&snap_with(cf_dns_labels("app", "home.example.com")))
+            .await
+            .unwrap();
+
+        create.assert_async().await;
+        update.assert_async().await;
+        assert_eq!(
+            storage::get_cf_dns_record(&pool, "m1/app").await.unwrap(),
+            Some("rec-9".to_string())
+        );
+    }
+
+    /// A Cloudflare mock where the marker lookup finds nothing, the create
+    /// conflicts, and the name lookup finds `existing`.
+    async fn cf_server_for_hostname_adoption(existing: serde_json::Value) -> mockito::ServerGuard {
+        let mut cf_server = cf_server_with_zone().await;
+        cf_server
+            .mock("GET", "/zones/z/dns_records")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "comment.exact".into(),
+                "docktornet:m1/app".into(),
+            ))
+            .with_status(200)
+            .with_body(cf_list(serde_json::json!([])))
+            .create_async()
+            .await;
+        cf_server
+            .mock("POST", "/zones/z/dns_records")
+            .with_status(400)
+            .with_body(
+                r#"{"success":false,"errors":[{"code":81053,"message":"exists"}],"result":null}"#,
+            )
+            .create_async()
+            .await;
+        cf_server
+            .mock("GET", "/zones/z/dns_records")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "name".into(),
+                "app.example.com".into(),
+            ))
+            .with_status(200)
+            .with_body(cf_list(serde_json::json!([existing])))
+            .create_async()
+            .await;
+        cf_server
+    }
+
+    #[tokio::test]
+    async fn cf_hostname_adoption_writes_the_marker() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut cf_server =
+            cf_server_for_hostname_adoption(cf_record("rec-5", Some("set by hand"))).await;
+        let update = cf_server
+            .mock("PUT", "/zones/z/dns_records/rec-5")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "comment": "docktornet:m1/app"
+            })))
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-5", Some("docktornet:m1/app"))))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &cf_server.url(),
+            &cf_server.url(),
+            false,
+            true,
+        );
+        reconciler
+            .reconcile_snapshot(&snap_with(cf_dns_labels("app", "home.example.com")))
+            .await
+            .unwrap();
+
+        update.assert_async().await;
+        assert_eq!(
+            storage::get_cf_dns_record(&pool, "m1/app").await.unwrap(),
+            Some("rec-5".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cf_hostname_adoption_refuses_a_record_marked_for_another_service() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut cf_server =
+            cf_server_for_hostname_adoption(cf_record("rec-5", Some("docktornet:m2/other"))).await;
+        let update = cf_server
+            .mock("PUT", "/zones/z/dns_records/rec-5")
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-5", Some("docktornet:m1/app"))))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &cf_server.url(),
+            &cf_server.url(),
+            false,
+            true,
+        );
+        let dns = docktornet_core::labels::parse(&cf_dns_labels("app", "home.example.com"))
+            .cf_dns
+            .unwrap();
+        let snap = snap_with(cf_dns_labels("app", "home.example.com"));
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+
+        let err = reconciler
+            .reconcile_cloudflare("m1/app", &dns)
+            .await
+            .unwrap_err();
+
+        match err {
+            ReconcileError::MarkedForOtherService {
+                service_id, owner, ..
+            } => {
+                assert_eq!(service_id, "m1/app");
+                assert_eq!(owner, "m2/other");
+            }
+            other => panic!("expected MarkedForOtherService, got {other:?}"),
+        }
+        update.assert_async().await;
+        assert_eq!(
+            storage::get_cf_dns_record(&pool, "m1/app").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cf_record_for_a_too_long_service_id_is_created_without_comment() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut cf_server = cf_server_with_zone().await;
+        // "docktornet:" + "m1/" + 87 characters is 101 characters.
+        let container = "c".repeat(87);
+        let lookup = cf_server
+            .mock("GET", "/zones/z/dns_records")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(cf_list(serde_json::json!([])))
+            .expect(0)
+            .create_async()
+            .await;
+        let create = cf_server
+            .mock("POST", "/zones/z/dns_records")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "name": "app.example.com",
+                "comment": ""
+            })))
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-1", None)))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &cf_server.url(),
+            &cf_server.url(),
+            false,
+            false,
+        );
+        let mut snap = snap_with(cf_dns_labels("app", "home.example.com"));
+        snap.containers[0].name = container.clone();
+        reconciler.reconcile_snapshot(&snap).await.unwrap();
+
+        lookup.assert_async().await;
+        create.assert_async().await;
+        assert_eq!(
+            storage::get_cf_dns_record(&pool, &format!("m1/{container}"))
+                .await
+                .unwrap(),
+            Some("rec-1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_writes_no_cf_marker() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut cf_server = mockito::Server::new_async().await;
+        let refused = refuse_every_request(&mut cf_server).await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &cf_server.url(),
+            &cf_server.url(),
+            true,
+            true,
+        );
+        let snap = snap_with(cf_dns_labels("app", "home.example.com"));
+        storage::upsert_snapshot(&pool, &snap).await.unwrap();
+        storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
+            .await
+            .unwrap();
+
+        reconciler.reconcile_snapshot(&snap).await.unwrap();
+        assert_eq!(reconciler.full_resync().await.unwrap().failed, 0);
+
+        for mock in refused {
+            mock.assert_async().await;
+        }
     }
 }
