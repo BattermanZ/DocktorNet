@@ -10,8 +10,8 @@ Docktornet ships two images, both rootless and distroless:
 Build locally:
 
 ```bash
-docker build -f crates/server/Dockerfile -t docktornet-server:dev .
-docker build -f crates/agent/Dockerfile  -t docktornet-agent:dev  .
+docker build -f crates/server/Dockerfile -t docktornet-server:<version> .
+docker build -f crates/agent/Dockerfile  -t docktornet-agent:<version>  .
 ```
 
 Publishing images to GHCR is out of scope for v1 — tag and push manually for now.
@@ -282,6 +282,7 @@ first for an exact restore. Gatus picks up the change at its next config check.
 
 ```bash
 cd deploy
+export SERVER_IMAGE=docktornet-server:<version> AGENT_IMAGE=docktornet-agent:<version>
 export DOCKER_GID=$(getent group docker | cut -d: -f3)
 docker compose -f main-host.compose.yaml up -d
 ```
@@ -290,9 +291,17 @@ docker compose -f main-host.compose.yaml up -d
 
 ```bash
 cd deploy
+export AGENT_IMAGE=docktornet-agent:<version>
 export DOCKER_GID=$(getent group docker | cut -d: -f3)
 docker compose -f agent.compose.yaml up -d
 ```
+
+Both compose files require their image variables: `SERVER_IMAGE` and
+`AGENT_IMAGE` on the main host, `AGENT_IMAGE` on an agent-only host. Compose
+refuses every command without them, `down` and `logs` included, so a `.env`
+next to the compose file is a better home than one shell's exports. The check
+only rejects an unset or empty value. Set a release tag, not `latest`, so each
+host runs the build you chose.
 
 For rootless Podman hosts, set `DOCKER_GID` to the gid of the directory containing `podman.sock` (typically the operator's own gid) and adjust the volume path in the compose file.
 

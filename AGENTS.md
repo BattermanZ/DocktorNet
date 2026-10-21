@@ -29,7 +29,8 @@ failure to confirm the cause before changing implementation code, then make it
 pass.
 
 Add a crate with `cargo add`, so the registry writes its current version. The
-compiler is pinned in `rust-toolchain.toml`.
+compiler is pinned in `rust-toolchain.toml`, and the cargo-chef base image in
+both Dockerfiles carries the same Rust version: bump all three together.
 
 ## Live test environment
 

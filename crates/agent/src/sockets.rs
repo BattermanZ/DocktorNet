@@ -18,6 +18,9 @@ pub struct RawContainer {
     pub labels: BTreeMap<String, String>,
 }
 
+// async_trait marks the boxed future it returns `#[must_use]`, which clippy
+// 1.99 reports as a double must_use on code the macro wrote.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ContainerSource: Send + Sync {
     async fn list(&self) -> anyhow::Result<Vec<RawContainer>>;

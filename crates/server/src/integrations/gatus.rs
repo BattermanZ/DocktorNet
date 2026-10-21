@@ -105,8 +105,8 @@ fn gatus_endpoints(service_id: &str, monitors: &[GatusMonitor]) -> Vec<GatusEndp
 pub fn render_gatus_yaml(
     service_id: &str,
     monitors: &[GatusMonitor],
-) -> Result<String, serde_yaml::Error> {
-    serde_yaml::to_string(&GatusFile {
+) -> Result<String, yaml_serde::Error> {
+    yaml_serde::to_string(&GatusFile {
         endpoints: gatus_endpoints(service_id, monitors),
     })
 }
@@ -198,7 +198,7 @@ pub async fn alert_thresholds(config_dir: impl AsRef<Path>) -> AlertThresholds {
                 continue;
             }
         };
-        let doc: serde_yaml::Value = match serde_yaml::from_str(&body) {
+        let doc: yaml_serde::Value = match yaml_serde::from_str(&body) {
             Ok(doc) => doc,
             Err(err) => {
                 tracing::warn!(path = %path.display(), error = %err, "could not parse gatus config file for alert thresholds");
@@ -650,7 +650,7 @@ mod tests {
         touch_reload_trigger(dir.path()).await.unwrap();
 
         let body = std::fs::read_to_string(reload_trigger_path(dir.path())).unwrap();
-        let parsed: serde_yaml::Mapping = serde_yaml::from_str(&body).unwrap();
+        let parsed: yaml_serde::Mapping = yaml_serde::from_str(&body).unwrap();
         assert!(parsed.is_empty());
         // No temp file is left behind.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
