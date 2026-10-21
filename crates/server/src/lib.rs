@@ -1,8 +1,10 @@
+pub mod agent_versions;
 pub mod auth;
 pub mod background;
 pub mod breaker;
 pub mod config;
 pub mod db;
+pub mod db_location;
 pub mod flapping;
 pub mod handlers;
 pub mod integrations;

@@ -53,8 +53,16 @@ flowchart LR
 - [v1.1.0 release notes](https://github.com/BattermanZ/DocktorNet/releases/tag/v1.1.0)
 
 The public `GET /healthz` response contains liveness status and server time.
-Send the configured bearer token to include agent inventory; unauthenticated
-callers do not receive machine IDs, forwarding addresses, or last-seen times.
+Send the configured bearer token to include agent inventory and versions: the
+server's `version`, and each agent's `agent_version` (`null` for an agent that
+predates version reporting). Unauthenticated callers do not receive machine
+IDs, forwarding addresses, last-seen times or versions. The server logs a
+warning once per change when an agent's version differs from its own.
+
+The server refuses a relative `DOCKTORNET_DB_PATH`, and inside a container it
+refuses a database on the container's own filesystem. The
+[deployment guide](docs/deployment.md#the-database-path) has the rules and the
+override.
 
 ### Resource removal lifecycle
 

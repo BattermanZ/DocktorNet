@@ -72,6 +72,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels,

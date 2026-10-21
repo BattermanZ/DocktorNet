@@ -1696,6 +1696,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "127.0.0.1".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".to_string(),
                 labels,
@@ -1734,6 +1735,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels,
@@ -1775,6 +1777,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels,
@@ -1812,6 +1815,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels,
@@ -1862,6 +1866,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".to_string(),
                     labels,
@@ -1879,6 +1884,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 31,
+                agent_version: None,
                 containers: vec![],
             })
             .await
@@ -1915,6 +1921,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".to_string(),
                     labels,
@@ -1931,6 +1938,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: (1 + GATUS_REMOVAL_GRACE_SECS + 1) as u64,
+                agent_version: None,
                 containers: vec![],
             })
             .await
@@ -1973,6 +1981,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "127.0.0.1".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".to_string(),
                 labels,
@@ -1984,6 +1993,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "127.0.0.1".into(),
             taken_at: (1 + GATUS_REMOVAL_GRACE_SECS + 1) as u64,
+            agent_version: None,
             containers: vec![],
         };
 
@@ -2040,6 +2050,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels,
@@ -2056,6 +2067,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 31,
+                agent_version: None,
                 containers: vec![],
             })
             .await
@@ -2103,6 +2115,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels,
@@ -2120,6 +2133,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 31,
+                agent_version: None,
                 containers: vec![],
             })
             .await
@@ -2144,6 +2158,7 @@ mod tests {
                 forward_host: "10.0.0.1".into(),
                 taken_at,
                 containers,
+                agent_version: None,
             })
             .await
             .unwrap();
@@ -2308,6 +2323,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.1".into(),
             taken_at: 31,
+            agent_version: None,
             containers: vec![],
         };
         let ticket = reconciler.ingest_snapshot(&gone).await.unwrap();
@@ -2381,6 +2397,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![app()],
             },
         )
@@ -2401,6 +2418,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 32,
+                agent_version: None,
                 containers: vec![],
             })
             .await;
@@ -2628,6 +2646,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![app()],
             },
         )
@@ -2709,6 +2728,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![app()],
             },
         )
@@ -2827,6 +2847,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels: npm_labels("a.example.com"),
@@ -2840,6 +2861,7 @@ mod tests {
                 machine_id: MachineId::new("m2"),
                 forward_host: "10.0.0.2".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels: npm_labels("b.example.com"),
@@ -2920,6 +2942,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.1".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels: npm_host_labels("a.example.com"),
@@ -3001,6 +3024,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.1".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels: npm_host_labels("a.example.com"),
@@ -3116,6 +3140,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels,
@@ -3176,6 +3201,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.1".into(),
             taken_at: 100,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels: npm_host_labels("a.example.com"),
@@ -3190,6 +3216,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 130,
+                agent_version: None,
                 containers: vec![],
             })
             .await
@@ -3340,6 +3367,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 200,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels: npm_host_labels("a.example.com"),
@@ -3460,6 +3488,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.1".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels: cf_dns_labels("app", "home.example.com"),
@@ -3476,6 +3505,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: (1 + GATUS_REMOVAL_GRACE_SECS + 1) as u64,
+                agent_version: None,
                 containers: vec![],
             })
             .await
@@ -3527,6 +3557,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.1".into(),
             taken_at: 100,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels: cf_dns_labels("app", "home.example.com"),
@@ -3543,6 +3574,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 130,
+                agent_version: None,
                 containers: vec![],
             })
             .await
@@ -3678,6 +3710,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 200,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels: cf_dns_labels("app", "home.example.com"),
@@ -3761,6 +3794,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.1".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels: cf_dns_labels("app", "home.example.com"),
@@ -3853,6 +3887,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels: npm_host_labels("a.example.com"),
@@ -3926,6 +3961,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![
                     ContainerEntry {
                         name: "app-a".into(),
@@ -4016,6 +4052,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![
                     ContainerEntry {
                         name: "app-a".into(),
@@ -4087,6 +4124,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels,
@@ -4160,6 +4198,7 @@ mod tests {
                 name: "app".into(),
                 labels: npm_host_labels("a.example.com"),
             }],
+            agent_version: None,
         };
 
         // Two identical pushes (only taken_at differs, which is not part of the
@@ -4251,6 +4290,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels: npm_host_labels("a.example.com"),
@@ -4347,6 +4387,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![ContainerEntry {
                     name: "app".into(),
                     labels: npm_host_labels("a.example.com"),
@@ -4420,6 +4461,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.1".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels: npm_host_labels("a.example.com"),
@@ -4482,6 +4524,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.1".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels: npm_host_labels("a.example.com"),
@@ -4496,6 +4539,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: (1 + GATUS_REMOVAL_GRACE_SECS + 1) as u64,
+                agent_version: None,
                 containers: vec![],
             })
             .await
@@ -4572,6 +4616,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.1".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels,

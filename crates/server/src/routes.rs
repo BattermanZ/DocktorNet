@@ -36,10 +36,13 @@ mod tests {
     use tempfile::tempdir;
     use tower::ServiceExt;
 
+    use crate::agent_versions::AgentVersionTracker;
     use crate::db;
     use crate::flapping::FlappingTracker;
     use crate::reconcile::{ReconcileOptions, Reconciler};
     use crate::storage::list_services_for_machine;
+
+    const SERVER_VERSION: &str = "1.2.3-test";
 
     async fn make_app() -> (Router, crate::db::Db, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -56,6 +59,7 @@ mod tests {
             reconciler,
             secret: Arc::new("s3cret".into()),
             flapping: Arc::new(FlappingTracker::new(Duration::from_secs(300))),
+            agent_versions: Arc::new(AgentVersionTracker::new(SERVER_VERSION)),
         };
         (build(state), pool, dir)
     }
@@ -72,6 +76,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.10".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "a".into(),
                 labels,
@@ -184,6 +189,7 @@ mod tests {
             reconciler,
             secret: Arc::new("s3cret".into()),
             flapping: Arc::new(FlappingTracker::new(Duration::from_secs(300))),
+            agent_versions: Arc::new(AgentVersionTracker::new(SERVER_VERSION)),
         };
         let app = build(state);
 
@@ -196,6 +202,7 @@ mod tests {
             machine_id: MachineId::new("m1"),
             forward_host: "10.0.0.10".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels,
@@ -231,11 +238,25 @@ mod tests {
         // With a valid bearer token, the agent inventory is disclosed.
         let (app, _pool, _dir) = make_app().await;
 
-        // Push a snapshot for machine "m1".
-        let push = req("POST", Some("s3cret"), &snap());
-        app.clone().oneshot(push).await.unwrap();
+        // Push a snapshot for machine "m1" from an agent reporting 0.9.0, and
+        // one for "m2" from an agent that predates version reporting.
+        let reporting = Snapshot {
+            agent_version: Some("0.9.0".into()),
+            ..snap()
+        };
+        let silent = Snapshot {
+            machine_id: MachineId::new("m2"),
+            ..snap()
+        };
+        for push in [&reporting, &silent] {
+            let resp = app
+                .clone()
+                .oneshot(req("POST", Some("s3cret"), push))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        }
 
-        // Fetch /healthz WITH the bearer token and assert the body contains "m1".
         let get_req = Request::builder()
             .method("GET")
             .uri("/healthz")
@@ -247,10 +268,15 @@ mod tests {
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let body_str = std::str::from_utf8(&body_bytes).unwrap();
-        assert!(
-            body_str.contains("m1"),
-            "authed body should contain machine id m1: {body_str}"
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["version"], SERVER_VERSION, "{body}");
+        assert_eq!(body["agents"][0]["machine_id"], "m1", "{body}");
+        assert_eq!(body["agents"][0]["agent_version"], "0.9.0", "{body}");
+        assert_eq!(body["agents"][1]["machine_id"], "m2", "{body}");
+        assert_eq!(
+            body["agents"][1].get("agent_version"),
+            Some(&serde_json::Value::Null),
+            "{body}"
         );
     }
 
@@ -284,5 +310,10 @@ mod tests {
             !body_str.contains("10.0.0.10"),
             "unauthenticated body must not leak forward address: {body_str}"
         );
+        // No version either: the exact release must not be fingerprintable.
+        let body: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&body_bytes).unwrap();
+        let keys: Vec<&str> = body.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["server_time", "status"], "{body_str}");
     }
 }

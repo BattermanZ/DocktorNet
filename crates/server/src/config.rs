@@ -13,6 +13,8 @@ pub struct ServerConfig {
     pub listen: String,
     pub secret: String,
     pub db_path: PathBuf,
+    /// Start even when the database sits on a container's own filesystem.
+    pub allow_ephemeral_db: bool,
     pub dry_run: bool,
     pub adopt_existing: bool,
     pub gatus_config_dir: PathBuf,
@@ -47,6 +49,10 @@ pub enum ConfigError {
     InvalidUrl { name: &'static str, value: String },
     #[error("invalid duration for '{name}': '{value}'")]
     InvalidDuration { name: &'static str, value: String },
+    #[error("DOCKTORNET_DB_PATH must be absolute, e.g. /data/docktornet.db; got '{0}'")]
+    RelativeDbPath(String),
+    #[error("DOCKTORNET_DB_PATH must name a file, e.g. /data/docktornet.db; got '{0}'")]
+    DbPathNotAFile(String),
 }
 
 impl ServerConfig {
@@ -65,12 +71,32 @@ impl ServerConfig {
             }
         };
 
+        let listen = required("DOCKTORNET_LISTEN")?;
+        let secret = required_non_empty("DOCKTORNET_SECRET")?;
         let dry_run = parse_bool_opt(env.get("DOCKTORNET_DRY_RUN"), "DOCKTORNET_DRY_RUN", true)?;
         let adopt_existing = parse_bool_opt(
             env.get("DOCKTORNET_ADOPT_EXISTING"),
             "DOCKTORNET_ADOPT_EXISTING",
             false,
         )?;
+        let allow_ephemeral_db = parse_bool_opt(
+            env.get("DOCKTORNET_ALLOW_EPHEMERAL_DB"),
+            "DOCKTORNET_ALLOW_EPHEMERAL_DB",
+            false,
+        )?;
+        // A relative path resolves against the image's working directory,
+        // which is the container layer: every recreate would start empty.
+        let db_path = PathBuf::from(required("DOCKTORNET_DB_PATH")?);
+        if !db_path.is_absolute() {
+            return Err(ConfigError::RelativeDbPath(
+                db_path.to_string_lossy().into_owned(),
+            ));
+        }
+        if db_path.as_os_str().as_encoded_bytes().ends_with(b"/") || db_path.file_name().is_none() {
+            return Err(ConfigError::DbPathNotAFile(
+                db_path.to_string_lossy().into_owned(),
+            ));
+        }
         let full_resync_interval = match env.get("DOCKTORNET_FULL_RESYNC_INTERVAL") {
             Some(value) => {
                 humantime::parse_duration(value).map_err(|_| ConfigError::InvalidDuration {
@@ -82,9 +108,10 @@ impl ServerConfig {
         };
 
         Ok(Self {
-            listen: required("DOCKTORNET_LISTEN")?,
-            secret: required_non_empty("DOCKTORNET_SECRET")?,
-            db_path: PathBuf::from(required("DOCKTORNET_DB_PATH")?),
+            listen,
+            secret,
+            db_path,
+            allow_ephemeral_db,
             dry_run,
             adopt_existing,
             gatus_config_dir: PathBuf::from(required("DOCKTORNET_GATUS_CONFIG_DIR")?),
@@ -458,6 +485,48 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_relative_db_path() {
+        let err = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "data/docktornet.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+        ]))
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "DOCKTORNET_DB_PATH must be absolute, e.g. /data/docktornet.db; got 'data/docktornet.db'"
+        );
+    }
+
+    #[test]
+    fn rejects_db_path_naming_a_directory() {
+        let err = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+        ]))
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "DOCKTORNET_DB_PATH must name a file, e.g. /data/docktornet.db; got '/data/'"
+        );
     }
 
     #[test]

@@ -21,6 +21,10 @@ pub struct Snapshot {
     pub forward_host: String,
     pub taken_at: u64,
     pub containers: Vec<ContainerEntry>,
+    /// The agent's release.  Absent from agents that predate version
+    /// reporting.
+    #[serde(default)]
+    pub agent_version: Option<String>,
 }
 
 #[cfg(test)]
@@ -36,6 +40,7 @@ mod tests {
             machine_id: MachineId::new("batterdock"),
             forward_host: "10.0.0.10".into(),
             taken_at: 1716300000,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "myapp".into(),
                 labels,
@@ -48,11 +53,28 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_from_an_agent_without_version_reporting_parses() {
+        let json = r#"{"machine_id":"batterdock","forward_host":"10.0.0.10","taken_at":1716300000,"containers":[]}"#;
+        let snap: Snapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snap.agent_version, None);
+    }
+
+    #[test]
+    fn agent_version_roundtrips_json() {
+        let json = r#"{"machine_id":"batterdock","forward_host":"10.0.0.10","taken_at":1716300000,"containers":[],"agent_version":"1.2.0"}"#;
+        let snap: Snapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snap.agent_version.as_deref(), Some("1.2.0"));
+        let back: Snapshot = serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
     fn empty_snapshot_is_valid() {
         let snap = Snapshot {
             machine_id: MachineId::new("batterdock"),
             forward_host: "10.0.0.10".into(),
             taken_at: 1716300000,
+            agent_version: None,
             containers: vec![],
         };
         let s = serde_json::to_string(&snap).unwrap();

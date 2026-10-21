@@ -73,6 +73,7 @@ pub fn build(machine_id: &MachineId, forward_host: &str, raw: &[RawContainer]) -
         forward_host: forward_host.to_string(),
         taken_at,
         containers,
+        agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     }
 }
 
@@ -143,6 +144,15 @@ mod tests {
             "only the unambiguous container should survive"
         );
         assert_eq!(snap.containers[0].name, "unique");
+    }
+
+    #[test]
+    fn snapshot_carries_the_agent_version() {
+        let snap = build(&MachineId::new("m1"), "10.0.0.10", &[]);
+        assert_eq!(
+            snap.agent_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

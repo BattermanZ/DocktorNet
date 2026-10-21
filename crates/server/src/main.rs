@@ -2,8 +2,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 const FLAPPING_WINDOW: Duration = Duration::from_secs(300);
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use anyhow::Result;
+use docktornet_server::agent_versions::AgentVersionTracker;
+use docktornet_server::db_location::{self, Placement};
 use docktornet_server::flapping::FlappingTracker;
 use docktornet_server::{config, db, routes};
 use tracing::info;
@@ -56,7 +59,18 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::ServerConfig::from_env()?;
-    let pool = db::connect(&cfg.db_path).await?;
+    let location = db_location::prepare(
+        &cfg.db_path,
+        cfg.allow_ephemeral_db,
+        &db_location::Environment::detect(),
+    )?;
+    let pool = db::connect(&location.path).await?;
+    let (on_mount, mount_point) = match &location.placement {
+        Some(Placement::Mounted(mount_point)) => ("yes", mount_point.display().to_string()),
+        Some(Placement::RootFilesystem) => ("no", "/".to_string()),
+        None => ("unknown", "unknown".to_string()),
+    };
+    info!(path = %location.path.display(), on_mount, mount_point, "database ready");
     let npm = docktornet_server::integrations::npm::NpmClient::new(cfg.npm.clone());
     let cloudflare = docktornet_server::integrations::cloudflare::CloudflareClient::with_base_url(
         cfg.cloudflare.clone(),
@@ -76,6 +90,7 @@ async fn main() -> Result<()> {
         reconciler,
         secret: std::sync::Arc::new(cfg.secret),
         flapping: std::sync::Arc::new(FlappingTracker::new(FLAPPING_WINDOW)),
+        agent_versions: std::sync::Arc::new(AgentVersionTracker::new(VERSION)),
     };
     let reconciler_for_resync = app_state.reconciler.clone();
     let app = routes::build(app_state);
@@ -88,7 +103,11 @@ async fn main() -> Result<()> {
     }
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
-    info!(listen = %cfg.listen, "server ready");
+    info!(
+        version = VERSION,
+        listen = %cfg.listen,
+        "server ready"
+    );
 
     docktornet_server::background::spawn(reconciler_for_resync, cfg.full_resync_interval);
 

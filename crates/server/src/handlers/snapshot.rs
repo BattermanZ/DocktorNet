@@ -6,8 +6,9 @@ use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use docktornet_core::Snapshot;
-use tracing::warn;
+use tracing::{info, warn};
 
+use crate::agent_versions::{AgentVersionTracker, VersionNote};
 use crate::flapping::FlappingTracker;
 use crate::reconcile::Reconciler;
 
@@ -16,6 +17,7 @@ pub struct AppState {
     pub reconciler: Reconciler,
     pub secret: Arc<String>,
     pub flapping: Arc<FlappingTracker>,
+    pub agent_versions: Arc<AgentVersionTracker>,
 }
 
 pub async fn ingest(
@@ -33,6 +35,22 @@ pub async fn ingest(
             new_ip = %addr.ip(),
             "machine id seen from multiple source IPs within window"
         );
+    }
+    match state
+        .agent_versions
+        .observe(&snap.machine_id, snap.agent_version.as_deref())
+    {
+        Some(VersionNote::Mismatch { agent_version }) => warn!(
+            machine_id = %snap.machine_id.as_str(),
+            agent_version,
+            server_version = state.agent_versions.server_version(),
+            "agent and server versions differ"
+        ),
+        Some(VersionNote::Predates) => info!(
+            machine_id = %snap.machine_id.as_str(),
+            "agent predates version reporting"
+        ),
+        None => {}
     }
     tracing::debug!(machine = %snap.machine_id.as_str(), containers = snap.containers.len(), "snapshot received");
 

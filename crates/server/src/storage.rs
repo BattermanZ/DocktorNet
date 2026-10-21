@@ -23,15 +23,17 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
     // upsert the machine row so its forward host is available to the DB-only
     // resync path; kept in the same transaction as the services it owns.
     sqlx::query(
-        r#"INSERT INTO machines (machine_id, forward_host, last_seen)
-           VALUES (?, ?, ?)
+        r#"INSERT INTO machines (machine_id, forward_host, last_seen, agent_version)
+           VALUES (?, ?, ?, ?)
            ON CONFLICT(machine_id) DO UPDATE SET
-             forward_host = excluded.forward_host,
-             last_seen    = excluded.last_seen"#,
+             forward_host  = excluded.forward_host,
+             last_seen     = excluded.last_seen,
+             agent_version = excluded.agent_version"#,
     )
     .bind(machine)
     .bind(&snap.forward_host)
     .bind(now)
+    .bind(&snap.agent_version)
     .execute(&mut *tx)
     .await?;
 
@@ -77,10 +79,21 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
     tx.commit().await
 }
 
-pub async fn list_machines(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, String, i64)>> {
-    sqlx::query_as("SELECT machine_id, forward_host, last_seen FROM machines ORDER BY machine_id")
-        .fetch_all(pool)
-        .await
+/// A machine as its latest snapshot left it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct Machine {
+    pub machine_id: String,
+    pub forward_host: String,
+    pub last_seen: i64,
+    pub agent_version: Option<String>,
+}
+
+pub async fn list_machines(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<Machine>> {
+    sqlx::query_as(
+        "SELECT machine_id, forward_host, last_seen, agent_version FROM machines ORDER BY machine_id",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn list_services_for_machine(
@@ -507,6 +520,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
         )
@@ -530,6 +544,7 @@ mod tests {
                 machine_id: m.clone(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
         )
@@ -541,6 +556,7 @@ mod tests {
                 machine_id: m,
                 forward_host: "10.0.0.10".into(),
                 taken_at: 200,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "2")])],
             },
         )
@@ -561,6 +577,7 @@ mod tests {
                 machine_id: m.clone(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![
                     entry("a", &[("docktornet.x", "1")]),
                     entry("b", &[("docktornet.y", "2")]),
@@ -575,6 +592,7 @@ mod tests {
                 machine_id: m,
                 forward_host: "10.0.0.10".into(),
                 taken_at: 200,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
         )
@@ -598,6 +616,7 @@ mod tests {
                 machine_id: m.clone(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
         )
@@ -609,6 +628,7 @@ mod tests {
                 machine_id: m,
                 forward_host: "10.0.0.10".into(),
                 taken_at: 200,
+                agent_version: None,
                 containers: vec![],
             },
         )
@@ -628,6 +648,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
         )
@@ -639,6 +660,7 @@ mod tests {
                 machine_id: MachineId::new("m2"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![],
             },
         )
@@ -659,6 +681,7 @@ mod tests {
                 machine_id: m.clone(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry(
                     "a",
                     &[
@@ -686,6 +709,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("app", &[])],
             },
         )
@@ -706,6 +730,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[]), entry("b", &[])],
             },
         )
@@ -798,6 +823,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![],
             },
         )
@@ -809,6 +835,7 @@ mod tests {
                 machine_id: MachineId::new("m2"),
                 forward_host: "10.0.0.2".into(),
                 taken_at: 200,
+                agent_version: None,
                 containers: vec![],
             },
         )
@@ -816,13 +843,49 @@ mod tests {
         .unwrap();
 
         let machines = list_machines(&p).await.unwrap();
-        assert_eq!(machines.len(), 2);
-        assert_eq!(machines[0].0, "m1");
-        assert_eq!(machines[0].1, "10.0.0.1");
-        assert_eq!(machines[0].2, 100);
-        assert_eq!(machines[1].0, "m2");
-        assert_eq!(machines[1].1, "10.0.0.2");
-        assert_eq!(machines[1].2, 200);
+        assert_eq!(
+            machines,
+            vec![
+                Machine {
+                    machine_id: "m1".into(),
+                    forward_host: "10.0.0.1".into(),
+                    last_seen: 100,
+                    agent_version: None,
+                },
+                Machine {
+                    machine_id: "m2".into(),
+                    forward_host: "10.0.0.2".into(),
+                    last_seen: 200,
+                    agent_version: None,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_keeps_its_latest_agent_version() {
+        let p = pool().await;
+        let snap = |taken_at, agent_version: Option<&str>| Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at,
+            containers: vec![],
+            agent_version: agent_version.map(str::to_string),
+        };
+        upsert_snapshot(&p, &snap(100, Some("1.1.0")))
+            .await
+            .unwrap();
+        upsert_snapshot(&p, &snap(200, Some("1.2.0")))
+            .await
+            .unwrap();
+        assert_eq!(
+            list_machines(&p).await.unwrap()[0].agent_version.as_deref(),
+            Some("1.2.0")
+        );
+
+        // An agent rolled back to a release without version reporting.
+        upsert_snapshot(&p, &snap(300, None)).await.unwrap();
+        assert_eq!(list_machines(&p).await.unwrap()[0].agent_version, None);
     }
 
     #[tokio::test]
@@ -834,6 +897,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
         )
@@ -845,6 +909,7 @@ mod tests {
                 machine_id: MachineId::new("m2"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![entry("b", &[("docktornet.y", "2")])],
             },
         )
@@ -866,6 +931,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 42,
+                agent_version: None,
                 containers: vec![entry("app", &[])],
             },
         )
@@ -902,6 +968,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 42,
+                agent_version: None,
                 containers: vec![entry("app", &[])],
             },
         )
@@ -924,6 +991,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[]), entry("b", &[])],
             },
         )
@@ -948,6 +1016,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("app", &[])],
             },
         )
@@ -971,6 +1040,7 @@ mod tests {
                 machine_id: MachineId::new("m1"),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[]), entry("b", &[])],
             },
         )

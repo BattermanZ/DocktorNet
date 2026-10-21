@@ -20,13 +20,12 @@ Publishing images to GHCR is out of scope for v1 — tag and push manually for n
 
 Both binaries read the same `.env` file. Keys irrelevant to a given role are ignored.
 
-Give `DOCKTORNET_DB_PATH` as an absolute path on the `./data:/data` volume. A relative path resolves against the image's working directory, `/app`, so the database lands in the container layer and every recreate starts it empty.
-
 | Var | Server | Agent |
 | --- | --- | --- |
 | `DOCKTORNET_LISTEN` | required | — |
 | `DOCKTORNET_SECRET` | required | required |
-| `DOCKTORNET_DB_PATH` | required, absolute: `/data/docktornet.db` in the container | — |
+| `DOCKTORNET_DB_PATH` | absolute; the image sets `/data/docktornet.db`, required outside it | — |
+| `DOCKTORNET_ALLOW_EPHEMERAL_DB` | optional (`false`); start even when the database is on the container's own filesystem | — |
 | `DOCKTORNET_GATUS_CONFIG_DIR` | required | — |
 | `DOCKTORNET_FULL_RESYNC_INTERVAL` | optional (`1h`); the first full resync runs at startup | — |
 | `DOCKTORNET_DRY_RUN` | optional (`true`) | — |
@@ -39,6 +38,19 @@ Give `DOCKTORNET_DB_PATH` as an absolute path on the `./data:/data` volume. A re
 | `DOCKTORNET_MACHINE_ID` | — | required |
 | `DOCKTORNET_FORWARD_HOST` | — | required |
 | `DOCKTORNET_SOCKETS` | — | required |
+
+### The database path
+
+The server image sets `DOCKTORNET_DB_PATH=/data/docktornet.db` and ships an empty `/data` owned by uid 65532. Mount a volume there, a bind mount (`./data:/data`) or a named volume, and leave the variable unset. Outside the image the variable is required.
+
+The server checks the path before it opens the database and exits if a check fails:
+
+- **The path must be absolute.** A relative path would resolve against the image's working directory, `/app`, in the container layer.
+- **Inside a container, the database must be on a volume.** The server finds the mount that holds the database directory in `/proc/self/mountinfo`. If it is the container's own root filesystem, every recreate would start the database empty, so the server refuses to start and names the directory to mount a volume at. Set `DOCKTORNET_ALLOW_EPHEMERAL_DB=true` to start anyway, for a throwaway test; the server then logs a warning. The image has no `VOLUME` instruction on purpose: an anonymous volume would hide a forgotten mount from this check. Outside a container, or if mountinfo can't be read, the check is skipped.
+- **The path must name a file**, not end in `/`.
+- **The directory, and any database files already in it, must be writable** by the server's uid. See [Filesystem permissions](#filesystem-permissions).
+
+The `database ready` line in the startup log shows the resolved path, whether it is on a mount, and the mount point.
 
 ## Ownership markers and adoption
 
@@ -90,7 +102,7 @@ For rootless Podman hosts, set `DOCKER_GID` to the gid of the directory containi
 
 ## Filesystem permissions
 
-The server container runs as uid 65532 (`nonroot`). The two bind mounts must be writable by that uid:
+The server container runs as uid 65532 (`nonroot`). The two bind mounts must be writable by that uid, or the server exits naming the directory and its uid:
 
 ```bash
 sudo install -d -o 65532 -g 65532 ./data

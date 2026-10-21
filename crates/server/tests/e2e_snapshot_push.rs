@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use docktornet_core::{ContainerEntry, MachineId, Snapshot};
+use docktornet_server::agent_versions::AgentVersionTracker;
 use docktornet_server::flapping::FlappingTracker;
 use reqwest::Client;
 use tempfile::tempdir;
@@ -25,6 +26,7 @@ async fn agent_push_lands_in_sqlite_via_real_http() {
         reconciler,
         secret: std::sync::Arc::new("s3cret".into()),
         flapping: std::sync::Arc::new(FlappingTracker::new(Duration::from_secs(300))),
+        agent_versions: std::sync::Arc::new(AgentVersionTracker::new("0.0.0")),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -44,6 +46,7 @@ async fn agent_push_lands_in_sqlite_via_real_http() {
         machine_id: MachineId::new("e2e-host"),
         forward_host: "10.0.0.10".into(),
         taken_at: 42,
+        agent_version: None,
         containers: vec![ContainerEntry {
             name: "demo".into(),
             labels,

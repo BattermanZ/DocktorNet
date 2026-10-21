@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
     }
 
     info!(
+        version = env!("CARGO_PKG_VERSION"),
         machine_id = %cfg.machine_id.as_str(),
         sources = sources.len(),
         interval = ?cfg.poll_interval,
