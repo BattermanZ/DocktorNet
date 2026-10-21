@@ -1,6 +1,6 @@
 # Docktornet
 
-Docktornet turns Docker labels on containers into NPM proxy hosts, Cloudflare DNS records and Gatus monitors, and removes them when the containers go away.
+Docktornet turns Docker labels on containers into NPM proxy hosts, Caddy routes, Cloudflare DNS records and Gatus monitors, and removes them when the containers go away.
 
 ## Language
 
@@ -19,13 +19,13 @@ How long a service may be missing from its machine's snapshots before docktornet
 _Avoid_: timeout, debounce
 
 **Pending removal**:
-A managed resource whose service has left, kept until the grace period ends and the deletion succeeds.
+A managed resource docktornet has decided to delete, kept until the deletion succeeds. One whose service has left also waits out the grace period first; a Caddy route whose labels were dropped from a live service waits for none.
 _Avoid_: orphan (that is a resource no mapping points to)
 
 ### Ownership
 
 **Managed resource**:
-An NPM proxy host or Cloudflare DNS record that docktornet owns on behalf of one service.
+An NPM proxy host, Caddy route or Cloudflare DNS record that docktornet owns on behalf of one service.
 _Avoid_: docktornet resource, our host
 
 **Ownership mapping**:
@@ -33,11 +33,11 @@ Docktornet's database record linking a service to its managed resources. It is t
 _Avoid_: ownership table, DB ownership
 
 **Ownership marker**:
-A tag written on the managed resource itself, naming the service ID that owns it. It is the durable proof of ownership and outlives the database.
+A tag written on the managed resource itself, naming the service ID that owns it. It is the durable proof of ownership and outlives the database. A Caddy route's marker is its `@id`, which identifies the service without spelling out its service ID.
 _Avoid_: tag, label (those mean Docker labels here), metadata
 
 **Adoption**:
-Taking over a resource that already exists in NPM or Cloudflare instead of creating a new one. Adoption always writes an ownership marker.
+Taking over a resource that already exists in NPM, Caddy or Cloudflare instead of creating a new one. Adoption always writes an ownership marker.
 _Avoid_: import, claim
 
 **Marker adoption**:
@@ -46,6 +46,16 @@ Adoption of a resource whose ownership marker names the service. Always allowed.
 **Hostname adoption**:
 Adoption of an unmarked resource because its hostname matches a service's labels. Allowed only when `DOCKTORNET_ADOPT_EXISTING` is on, and never for a resource whose marker names another service.
 _Avoid_: legacy adoption
+
+### Caddy
+
+**Caddy route**:
+A route docktornet writes into the operator's Caddy for one `caddy.<index>` label group of a service, sending the group's hostnames to the service's machine.
+_Avoid_: Caddy host, site, proxy host (that is NPM's)
+
+**Anchor route**:
+The one route in the operator's own Caddy config whose sub-routes docktornet owns. Every Caddy route sits inside it, ahead of the operator's hand-written routes.
+_Avoid_: docktornet server block, parent route
 
 ### Monitoring
 

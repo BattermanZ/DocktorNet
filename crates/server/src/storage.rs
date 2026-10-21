@@ -584,6 +584,195 @@ pub async fn delete_cf_dns_record(pool: &Pool<Sqlite>, service_id: &str) -> sqlx
     Ok(())
 }
 
+/// A Caddy route a service owns: its ownership mapping row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaddyRouteRow {
+    pub caddy_index: i64,
+    /// The hosts the route claimed.
+    pub hosts: Vec<String>,
+    /// The route as last rendered after a successful claim.
+    pub route: serde_json::Value,
+}
+
+/// A Caddy route waiting to be deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCaddyRemoval {
+    pub service_id: String,
+    pub caddy_index: i64,
+    /// The hosts the route still holds for the clash check.
+    pub hosts: Vec<String>,
+    pub last_seen: i64,
+}
+
+/// The outcome of claiming a Caddy route's hosts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaddyClaim {
+    /// The mapping row now holds the hosts and route.
+    Claimed,
+    /// Another service holds `host`, through a mapping or a pending removal,
+    /// and keeps it.
+    Clash {
+        host: String,
+        owner: String,
+        owner_index: i64,
+    },
+}
+
+fn decode_json<T: serde::de::DeserializeOwned>(json: &str) -> sqlx::Result<T> {
+    serde_json::from_str(json).map_err(|e| sqlx::Error::Decode(Box::new(e)))
+}
+
+fn encode_json<T: serde::Serialize>(value: &T) -> sqlx::Result<String> {
+    serde_json::to_string(value).map_err(|e| sqlx::Error::Encode(Box::new(e)))
+}
+
+/// Every Caddy route mapping of one service, ordered by index.
+pub async fn list_caddy_routes_for_service(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<Vec<CaddyRouteRow>> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT caddy_index, hosts_json, route_json FROM caddy_routes \
+         WHERE service_id = ? ORDER BY caddy_index",
+    )
+    .bind(service_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(caddy_index, hosts, route)| {
+            Ok(CaddyRouteRow {
+                caddy_index,
+                hosts: decode_json(&hosts)?,
+                route: decode_json(&route)?,
+            })
+        })
+        .collect()
+}
+
+/// Claim `hosts` for a service's Caddy route at `caddy_index` and store the
+/// route.  In one transaction, the hosts are checked, ignoring ASCII case,
+/// against every Caddy mapping and pending removal of other services.  The
+/// service's own rows don't count, so a host can move between its indices.
+/// A successful claim also drops the service's pending removal at this index:
+/// the route is wanted again.
+pub async fn claim_caddy_route(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    caddy_index: i64,
+    hosts: &[String],
+    route: &serde_json::Value,
+) -> sqlx::Result<CaddyClaim> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let held: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT service_id, caddy_index, hosts_json FROM caddy_routes WHERE service_id != ? \
+         UNION ALL \
+         SELECT service_id, caddy_index, hosts_json FROM pending_caddy_removals WHERE service_id != ? \
+         ORDER BY service_id, caddy_index",
+    )
+    .bind(service_id)
+    .bind(service_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (owner, owner_index, held_hosts) in held {
+        let held_hosts: Vec<String> = decode_json(&held_hosts)?;
+        if let Some(host) = hosts
+            .iter()
+            .find(|host| held_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
+        {
+            return Ok(CaddyClaim::Clash {
+                host: host.clone(),
+                owner,
+                owner_index,
+            });
+        }
+    }
+    sqlx::query(
+        r#"INSERT INTO caddy_routes (service_id, caddy_index, hosts_json, route_json)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(service_id, caddy_index) DO UPDATE SET
+             hosts_json = excluded.hosts_json,
+             route_json = excluded.route_json"#,
+    )
+    .bind(service_id)
+    .bind(caddy_index)
+    .bind(encode_json(&hosts)?)
+    .bind(encode_json(route)?)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM pending_caddy_removals WHERE service_id = ? AND caddy_index = ?")
+        .bind(service_id)
+        .bind(caddy_index)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(CaddyClaim::Claimed)
+}
+
+pub async fn delete_caddy_route(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    caddy_index: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM caddy_routes WHERE service_id = ? AND caddy_index = ?")
+        .bind(service_id)
+        .bind(caddy_index)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Move a service's Caddy route mapping to `pending_caddy_removals`, seen
+/// last at `last_seen`, in one transaction.  Its hosts stay claimed.
+pub async fn park_caddy_route(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    caddy_index: i64,
+    hosts: &[String],
+    last_seen: i64,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"INSERT INTO pending_caddy_removals (service_id, caddy_index, hosts_json, last_seen)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(service_id, caddy_index) DO UPDATE SET
+             hosts_json = excluded.hosts_json,
+             last_seen  = excluded.last_seen"#,
+    )
+    .bind(service_id)
+    .bind(caddy_index)
+    .bind(encode_json(&hosts)?)
+    .bind(last_seen)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM caddy_routes WHERE service_id = ? AND caddy_index = ?")
+        .bind(service_id)
+        .bind(caddy_index)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+pub async fn list_pending_caddy_removals(
+    pool: &Pool<Sqlite>,
+) -> sqlx::Result<Vec<PendingCaddyRemoval>> {
+    let rows: Vec<(String, i64, String, i64)> = sqlx::query_as(
+        "SELECT service_id, caddy_index, hosts_json, last_seen FROM pending_caddy_removals \
+         ORDER BY service_id, caddy_index",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(service_id, caddy_index, hosts, last_seen)| {
+            Ok(PendingCaddyRemoval {
+                service_id,
+                caddy_index,
+                hosts: decode_json(&hosts)?,
+                last_seen,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

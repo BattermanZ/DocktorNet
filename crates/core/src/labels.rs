@@ -7,6 +7,7 @@ pub struct ParsedLabels {
     pub npm: Vec<NpmHost>,
     pub cf_dns: Option<CloudflareDns>,
     pub gatus: Vec<GatusMonitor>,
+    pub caddy: Vec<CaddyRoute>,
     /// Diagnostic messages for labels that could not be parsed. The
     /// parsing function never fails; it logs problems here so callers can
     /// surface them without breaking unrelated integrations.
@@ -34,6 +35,26 @@ pub struct NpmHost {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NpmScheme {
+    Http,
+    Https,
+}
+
+/// One `docktornet.caddy.<index>.*` group: a route in Caddy's anchor route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaddyRoute {
+    pub index: u8,
+    /// One or more hostnames the route matches, lowercased: Caddy matches
+    /// hosts without regard to case, and the host clash check compares them
+    /// as strings.
+    pub hosts: Vec<String>,
+    pub port: u16,
+    /// The scheme Caddy uses toward the upstream.
+    pub scheme: CaddyScheme,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaddyScheme {
     Http,
     Https,
 }
@@ -123,10 +144,12 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
         npm: Vec::new(),
         cf_dns: None,
         gatus: Vec::new(),
+        caddy: Vec::new(),
         warnings: Vec::new(),
     };
 
     let mut npm_groups: BTreeMap<u8, BTreeMap<String, String>> = BTreeMap::new();
+    let mut caddy_groups: BTreeMap<u8, BTreeMap<String, String>> = BTreeMap::new();
     let mut gatus_groups: BTreeMap<u8, BTreeMap<String, String>> = BTreeMap::new();
     let mut cf_dns: BTreeMap<String, String> = BTreeMap::new();
 
@@ -171,6 +194,23 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
                     .warnings
                     .push(format!("invalid gatus index in key '{key}'")),
             },
+            ["caddy", idx, field] => match parse_canonical_index(idx) {
+                Ok(index) => {
+                    if is_caddy_field(field) {
+                        caddy_groups
+                            .entry(index)
+                            .or_default()
+                            .insert((*field).to_string(), value.clone());
+                    } else {
+                        out.warnings.push(format!(
+                            "unrecognised caddy.{index}.{field} field in key '{key}'"
+                        ));
+                    }
+                }
+                Err(_) => out
+                    .warnings
+                    .push(format!("invalid caddy index in key '{key}'")),
+            },
             ["cf", "dns", field] => {
                 if is_cf_dns_field(field) {
                     cf_dns.insert((*field).to_string(), value.clone());
@@ -201,6 +241,28 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
         match build_gatus(index, &fields) {
             Ok(monitor) => out.gatus.push(monitor),
             Err(err) => out.warnings.push(format!("gatus.{index}: {err}")),
+        }
+    }
+
+    // Groups come in index order, so a host claimed twice stays on the lower
+    // index: Caddy would match it on whichever route comes first.
+    for (index, fields) in caddy_groups {
+        match build_caddy_route(index, &fields) {
+            Ok(route) => {
+                let taken: Vec<&String> = route
+                    .hosts
+                    .iter()
+                    .filter(|host| out.caddy.iter().any(|r| r.hosts.contains(host)))
+                    .collect();
+                if taken.is_empty() {
+                    out.caddy.push(route);
+                } else {
+                    out.warnings.push(format!(
+                        "caddy.{index}: {taken:?} already routed by a lower caddy index"
+                    ));
+                }
+            }
+            Err(err) => out.warnings.push(format!("caddy.{index}: {err}")),
         }
     }
 
@@ -311,6 +373,39 @@ fn is_npm_field(field: &str) -> bool {
             | "websockets"
             | "cert_id"
     )
+}
+
+fn build_caddy_route(index: u8, fields: &BTreeMap<String, String>) -> Result<CaddyRoute, String> {
+    let hosts: Vec<String> = fields
+        .get("host")
+        .ok_or("missing host")?
+        .split(',')
+        .map(|host| host.trim().to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+        .collect();
+    if hosts.is_empty() {
+        return Err("missing host".to_string());
+    }
+    let port = fields
+        .get("port")
+        .ok_or("missing port")?
+        .parse::<u16>()
+        .map_err(|_| "port must be a u16".to_string())?;
+    let scheme = match fields.get("scheme").map(String::as_str) {
+        None | Some("http") => CaddyScheme::Http,
+        Some("https") => CaddyScheme::Https,
+        Some(other) => return Err(format!("scheme must be http|https, got {other}")),
+    };
+    Ok(CaddyRoute {
+        index,
+        hosts,
+        port,
+        scheme,
+    })
+}
+
+fn is_caddy_field(field: &str) -> bool {
+    matches!(field, "host" | "port" | "scheme")
 }
 
 fn build_cf_dns(fields: &BTreeMap<String, String>) -> Result<CloudflareDns, String> {
@@ -425,6 +520,7 @@ mod tests {
         assert!(p.npm.is_empty());
         assert!(p.cf_dns.is_none());
         assert!(p.gatus.is_empty());
+        assert!(p.caddy.is_empty());
         assert!(p.warnings.is_empty());
     }
 
@@ -620,6 +716,133 @@ mod tests {
             "non-canonical index must produce a warning, got {:?}",
             p.warnings
         );
+    }
+
+    #[test]
+    fn caddy_route_parses_with_scheme_defaulting_to_http() {
+        let p = parse(&lbl(&[
+            ("docktornet.caddy.0.host", "a.example.com"),
+            ("docktornet.caddy.0.port", "3000"),
+        ]));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(
+            p.caddy,
+            vec![CaddyRoute {
+                index: 0,
+                hosts: vec!["a.example.com".to_string()],
+                port: 3000,
+                scheme: CaddyScheme::Http,
+            }]
+        );
+    }
+
+    #[test]
+    fn caddy_route_takes_https_scheme() {
+        let p = parse(&lbl(&[
+            ("docktornet.caddy.0.host", "a.example.com"),
+            ("docktornet.caddy.0.port", "8443"),
+            ("docktornet.caddy.0.scheme", "https"),
+        ]));
+        assert_eq!(p.caddy[0].scheme, CaddyScheme::Https);
+    }
+
+    #[test]
+    fn caddy_route_splits_comma_separated_hosts_and_lowercases_them() {
+        let p = parse(&lbl(&[
+            (
+                "docktornet.caddy.0.host",
+                "App.Example.com, b.EXAMPLE.org ,",
+            ),
+            ("docktornet.caddy.0.port", "3000"),
+        ]));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(
+            p.caddy[0].hosts,
+            vec!["app.example.com".to_string(), "b.example.org".to_string()]
+        );
+    }
+
+    #[test]
+    fn caddy_route_missing_a_required_field_is_dropped_with_a_warning() {
+        for labels in [
+            vec![("docktornet.caddy.0.port", "3000")],
+            vec![
+                ("docktornet.caddy.0.host", " , "),
+                ("docktornet.caddy.0.port", "3000"),
+            ],
+            vec![("docktornet.caddy.0.host", "a.example.com")],
+        ] {
+            let p = parse(&lbl(&labels));
+            assert!(p.caddy.is_empty(), "{labels:?}");
+            assert_eq!(p.warnings.len(), 1, "{labels:?}: {:?}", p.warnings);
+            assert!(p.warnings[0].contains("caddy.0"), "{:?}", p.warnings);
+        }
+    }
+
+    #[test]
+    fn malformed_caddy_group_is_dropped_while_the_rest_parses() {
+        let p = parse(&lbl(&[
+            ("docktornet.caddy.0.host", "a.example.com"),
+            ("docktornet.caddy.0.port", "not-a-port"),
+            ("docktornet.caddy.1.host", "b.example.com"),
+            ("docktornet.caddy.1.port", "3000"),
+            ("docktornet.caddy.2.host", "c.example.com"),
+            ("docktornet.caddy.2.port", "3000"),
+            ("docktornet.caddy.2.scheme", "ftp"),
+            ("docktornet.npm.0.host", "a.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "false"),
+        ]));
+        assert_eq!(p.caddy.len(), 1);
+        assert_eq!(p.caddy[0].index, 1);
+        assert_eq!(p.npm.len(), 1);
+        assert_eq!(p.warnings.len(), 2, "{:?}", p.warnings);
+        assert!(p.warnings.iter().any(|w| w.contains("caddy.0")));
+        assert!(p.warnings.iter().any(|w| w.contains("caddy.2")));
+    }
+
+    #[test]
+    fn unknown_caddy_field_warns_without_dropping_the_route() {
+        let p = parse(&lbl(&[
+            ("docktornet.caddy.0.host", "a.example.com"),
+            ("docktornet.caddy.0.port", "3000"),
+            ("docktornet.caddy.0.tls", "true"),
+        ]));
+        assert_eq!(p.caddy.len(), 1);
+        assert_eq!(p.warnings.len(), 1);
+        assert!(p.warnings[0].contains("caddy.0.tls"), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn caddy_non_canonical_index_is_rejected() {
+        let p = parse(&lbl(&[
+            ("docktornet.caddy.00.host", "a.example.com"),
+            ("docktornet.caddy.00.port", "3000"),
+        ]));
+        assert!(p.caddy.is_empty());
+        assert!(
+            p.warnings.iter().any(|w| w.contains("00")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn host_repeated_across_caddy_groups_stays_on_the_lower_index() {
+        let p = parse(&lbl(&[
+            ("docktornet.caddy.0.host", "a.example.com"),
+            ("docktornet.caddy.0.port", "3000"),
+            ("docktornet.caddy.1.host", "b.example.com, A.example.com"),
+            ("docktornet.caddy.1.port", "4000"),
+            ("docktornet.caddy.2.host", "c.example.com"),
+            ("docktornet.caddy.2.port", "5000"),
+        ]));
+        let indices: Vec<u8> = p.caddy.iter().map(|r| r.index).collect();
+        assert_eq!(indices, vec![0, 2]);
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        assert!(p.warnings[0].contains("caddy.1"), "{:?}", p.warnings);
+        assert!(p.warnings[0].contains("a.example.com"), "{:?}", p.warnings);
     }
 
     #[test]

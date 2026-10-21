@@ -57,6 +57,30 @@ pub fn sanitize_service_id(id: &str) -> String {
     format!("{}__{}", slug(machine), slug(container))
 }
 
+/// A 64-bit FNV-1a hash of the exact service id.  It tells apart service ids
+/// that [`sanitize_service_id`] slugs the same, in Gatus filenames and Caddy
+/// route markers, so it must never change.
+pub fn stable_service_hash(service_id: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    service_id.as_bytes().iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+/// The ownership marker of a service's Caddy route at `index`: the route's
+/// `@id` and its address under Caddy's `/id/` admin endpoint (ADR 0001).  It
+/// holds only ASCII alphanumerics, `_` and `-`, so it is a URL path segment
+/// as it stands.  It can't be read back into a service id.
+pub fn caddy_route_marker(service_id: &str, index: u8) -> String {
+    format!(
+        "docktornet--{}--{:016x}--{index}",
+        sanitize_service_id(service_id),
+        stable_service_hash(service_id)
+    )
+}
+
 fn slug(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -82,6 +106,37 @@ mod tests {
     #[test]
     fn sanitize_handles_missing_slash() {
         assert_eq!(sanitize_service_id("foo"), "foo");
+    }
+
+    #[test]
+    fn caddy_route_marker_slugs_the_service_and_appends_hash_and_index() {
+        // FNV-1a 64 of "batter-dock/my.app", the hash Gatus filenames use.
+        assert_eq!(
+            caddy_route_marker("batter-dock/my.app", 3),
+            "docktornet--batter_dock__my_app--124aa377e42a99c1--3"
+        );
+    }
+
+    #[test]
+    fn caddy_route_markers_differ_for_service_ids_that_slug_the_same() {
+        let a = caddy_route_marker("m-1/app", 0);
+        let b = caddy_route_marker("m.1/app", 0);
+        assert!(a.starts_with("docktornet--m_1__app--"), "{a}");
+        assert!(b.starts_with("docktornet--m_1__app--"), "{b}");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn caddy_route_marker_is_a_plain_path_segment_for_any_machine_id() {
+        for machine in ["a#b", "a?b", "a%2Fb", "a:b", "ü"] {
+            let marker = caddy_route_marker(&format!("{machine}/app"), 0);
+            assert!(
+                marker
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{machine}: {marker}"
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,9 @@ use crate::db::Db;
 const NPM_BREAKER_THRESHOLD: u32 = 3;
 /// How long the NPM breaker stays open before probing again.
 const NPM_BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
+/// The Caddy breaker trips and cools down like NPM's.
+const CADDY_BREAKER_THRESHOLD: u32 = NPM_BREAKER_THRESHOLD;
+const CADDY_BREAKER_COOLDOWN: Duration = NPM_BREAKER_COOLDOWN;
 
 #[derive(Clone)]
 pub struct Reconciler {
@@ -20,8 +23,11 @@ pub struct Reconciler {
     options: ReconcileOptions,
     npm: Option<crate::integrations::npm::NpmClient>,
     cloudflare: Option<crate::integrations::cloudflare::CloudflareClient>,
+    /// `None` when Caddy isn't configured; set with [`Reconciler::with_caddy`].
+    caddy: Option<crate::integrations::caddy::CaddyClient>,
     lock: Arc<Mutex<()>>,
     npm_breaker: Arc<CircuitBreaker>,
+    caddy_breaker: Arc<CircuitBreaker>,
     /// Hash of the last successfully-reconciled intent per machine.  Lets an
     /// unchanged snapshot skip the external reconcile entirely (drift is still
     /// caught by the periodic `full_resync`).
@@ -339,10 +345,15 @@ impl Reconciler {
             options,
             npm: None,
             cloudflare: None,
+            caddy: None,
             lock: Arc::new(Mutex::new(())),
             npm_breaker: Arc::new(CircuitBreaker::new(
                 NPM_BREAKER_THRESHOLD,
                 NPM_BREAKER_COOLDOWN,
+            )),
+            caddy_breaker: Arc::new(CircuitBreaker::new(
+                CADDY_BREAKER_THRESHOLD,
+                CADDY_BREAKER_COOLDOWN,
             )),
             last_reconciled: Arc::new(Mutex::new(HashMap::new())),
             applies: Arc::default(),
@@ -362,10 +373,15 @@ impl Reconciler {
             options,
             npm: Some(npm),
             cloudflare: Some(cloudflare),
+            caddy: None,
             lock: Arc::new(Mutex::new(())),
             npm_breaker: Arc::new(CircuitBreaker::new(
                 NPM_BREAKER_THRESHOLD,
                 NPM_BREAKER_COOLDOWN,
+            )),
+            caddy_breaker: Arc::new(CircuitBreaker::new(
+                CADDY_BREAKER_THRESHOLD,
+                CADDY_BREAKER_COOLDOWN,
             )),
             last_reconciled: Arc::new(Mutex::new(HashMap::new())),
             applies: Arc::default(),
@@ -1853,6 +1869,12 @@ impl Reconciler {
             }
         }
 
+        // Caddy runs whatever NPM's outcome, so an NPM outage never stalls it.
+        let caddy = self
+            .apply_caddy(&intended, &snap.forward_host, ingested_at)
+            .await?;
+        failures += caddy.failures;
+
         // Feed the breaker only when we actually exercised NPM this cycle.
         if needs_npm && !skip_npm {
             if npm_failed {
@@ -1868,9 +1890,10 @@ impl Reconciler {
                 "{failures} service(s) failed to reconcile"
             )));
         }
-        // Record success only when NPM actually ran (not when skipped by the
-        // breaker), so a breaker-skipped cycle still retries once it closes.
-        if !skip_npm {
+        // Record success only when NPM and Caddy actually ran (not when
+        // skipped by a breaker), so a breaker-skipped cycle still retries once
+        // it closes.
+        if !skip_npm && !caddy.skipped {
             self.last_reconciled
                 .lock()
                 .await
@@ -2034,5 +2057,10 @@ impl Reconciler {
     }
 }
 
+mod caddy;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod caddy_tests;

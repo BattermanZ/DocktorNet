@@ -207,7 +207,7 @@ pub enum NpmError {
 /// Per-request timeout for NPM API calls.  Without it a hung NPM (as opposed to
 /// a refused connection) would block a reconcile indefinitely, holding the
 /// reconcile lock and stalling every machine's updates.
-const NPM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const NPM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl NpmClient {
     pub fn new(config: NpmConfig) -> Self {

@@ -144,6 +144,15 @@ async fn serve() -> Result<()> {
         npm,
         cloudflare,
     );
+    let reconciler = match cfg.caddy.clone() {
+        Some(caddy) => {
+            info!(admin_url = %caddy.admin_url, anchor = %caddy.anchor_id, "caddy integration enabled");
+            reconciler.with_caddy(docktornet_server::integrations::caddy::CaddyClient::new(
+                caddy,
+            ))
+        }
+        None => reconciler,
+    };
     let app_state = docktornet_server::handlers::snapshot::AppState {
         reconciler,
         secret: std::sync::Arc::new(cfg.secret.expose().to_owned()),

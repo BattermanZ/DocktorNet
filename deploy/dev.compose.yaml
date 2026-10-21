@@ -2,7 +2,8 @@
 #
 # Labelled test containers run inside the `dind` daemon, never on the host
 # daemon, so an agent on the host cannot pick them up. NPM is a throwaway
-# instance, Cloudflare is a stub, and every credential here is fake.
+# instance, Cloudflare is a stub, and every credential here is fake. Caddy is
+# real; the server writes its routes into the bootstrap config's anchor route.
 name: docktornet-dev
 
 services:
@@ -50,6 +51,18 @@ services:
     volumes:
       - ./dev/cf-stub.py:/stub/cf-stub.py:ro
 
+  caddy:
+    image: caddy:2.11.7
+    restart: unless-stopped
+    # --resume keeps the routes the server wrote across a restart. The admin
+    # API listens on the compose network only: its port is never published.
+    command: ["caddy", "run", "--config", "/etc/caddy/bootstrap.json", "--resume"]
+    ports:
+      - "127.0.0.1:18087:80"
+    volumes:
+      - ./dev/caddy-bootstrap.json:/etc/caddy/bootstrap.json:ro
+      - caddy-config:/config
+
   # Docker creates missing bind-mount dirs as root. Hand dev-data to the
   # server's uid so a fresh checkout starts, and `rm -rf dev-data` works.
   dev-data-init:
@@ -96,6 +109,7 @@ services:
       DOCKTORNET_CF_API_URL: http://cf-stub:8080/client/v4
       DOCKTORNET_CF_API_TOKEN: dev-cf-token
       DOCKTORNET_CF_ZONE_ID: dev-zone
+      DOCKTORNET_CADDY_ADMIN_URL: http://caddy:2019
       RUST_LOG: info,docktornet_server=debug
     ports:
       - "127.0.0.1:15363:5363"
@@ -117,6 +131,8 @@ services:
       npm:
         condition: service_started
       cf-stub:
+        condition: service_started
+      caddy:
         condition: service_started
 
   docktornet-agent:
@@ -149,3 +165,4 @@ volumes:
   dind-data:
   npm-data:
   npm-letsencrypt:
+  caddy-config:

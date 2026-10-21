@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use docktornet_core::{
     labels::{Area, GatusMonitor, Severity},
-    sanitize_service_id,
+    sanitize_service_id, stable_service_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -406,15 +406,6 @@ fn service_temp_file_path(target: &std::path::Path) -> PathBuf {
         .unwrap_or_else(|| "gatus.yaml".into());
 
     target.with_file_name(format!("{file_name}.tmp-{pid}-{nanos}-{counter}"))
-}
-
-fn stable_service_hash(service_id: &str) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001b3;
-
-    service_id.as_bytes().iter().fold(FNV_OFFSET, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
-    })
 }
 
 pub async fn write_service_file(

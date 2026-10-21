@@ -11,7 +11,10 @@ pub struct IntendedService {
 /// Whether parsed labels ask docktornet for any resource.  A container without
 /// any is not a service docktornet reconciles.
 pub fn has_intent(parsed: &ParsedLabels) -> bool {
-    !parsed.npm.is_empty() || parsed.cf_dns.is_some() || !parsed.gatus.is_empty()
+    !parsed.npm.is_empty()
+        || parsed.cf_dns.is_some()
+        || !parsed.gatus.is_empty()
+        || !parsed.caddy.is_empty()
 }
 
 pub fn intended_services(
@@ -129,5 +132,21 @@ mod tests {
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].service_id, "m1/app");
         assert_eq!(services[0].labels.npm[0].hosts, vec!["app.example.com"]);
+    }
+
+    #[test]
+    fn a_container_with_only_caddy_labels_is_a_service() {
+        let services = intended_services(
+            &MachineId::new("m1").unwrap(),
+            &[entry(
+                "app",
+                &[
+                    ("docktornet.caddy.0.host", "app.example.com"),
+                    ("docktornet.caddy.0.port", "3000"),
+                ],
+            )],
+        );
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].labels.caddy[0].hosts, vec!["app.example.com"]);
     }
 }

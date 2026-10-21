@@ -35,7 +35,8 @@ both Dockerfiles carries the same Rust version: bump all three together.
 ## Live test environment
 
 `deploy/dev.compose.yaml` is the live test environment: a throwaway NPM, a
-Cloudflare API stub, Gatus, and a server and agent built from the working tree.
+Cloudflare API stub, a real Caddy, Gatus, and a server and agent built from the
+working tree.
 Production NPM and Cloudflare are never a test environment.
 
 Run labelled test containers inside the stack's `dind` daemon only. A
@@ -50,12 +51,14 @@ Cloudflare.
    docker compose -f deploy/dev.compose.yaml exec dind docker run -d --name whoami -p 18080:80 \
      -l docktornet.npm.0.host=whoami.dev.test -l docktornet.npm.0.port=18080 \
      -l docktornet.npm.0.scheme=http -l docktornet.npm.0.ssl=false \
+     -l docktornet.caddy.0.host=whoami.dev.test -l docktornet.caddy.0.port=18080 \
      -l docktornet.cf.dns.name=whoami -l docktornet.cf.dns.target=dev.test -l docktornet.cf.dns.proxied=false \
      -l docktornet.gatus.0.url=http://dind:18080 -l docktornet.gatus.0.interval=10s \
      traefik/whoami:v1.10.3
    ```
 3) Read the result. The agent polls every 5s.
    - NPM: `T=$(curl -s -X POST 127.0.0.1:18081/api/tokens -H 'Content-Type: application/json' -d '{"identity":"dev@example.com","secret":"dev-npm-password"}' | jq -r .token); curl -s 127.0.0.1:18081/api/nginx/proxy-hosts -H "Authorization: Bearer $T"`, and the proxy itself: `curl -H 'Host: whoami.dev.test' 127.0.0.1:18080`
+   - Caddy: `docker compose -f deploy/dev.compose.yaml exec caddy curl -s localhost:2019/id/docktornet/handle/0/routes` lists the anchor's routes (the admin port is not published), and the proxy itself: `curl -H 'Host: whoami.dev.test' 127.0.0.1:18087`
    - Cloudflare stub: `curl -s 127.0.0.1:18086/_stub/records`
    - Gatus: `ls dev-data/gatus-config` and `curl -s 127.0.0.1:18085/api/v1/endpoints/statuses`
    - Server log: `docker compose -f deploy/dev.compose.yaml logs docktornet-server`

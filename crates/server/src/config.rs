@@ -22,6 +22,18 @@ pub struct ServerConfig {
     pub npm: NpmConfig,
     pub cloudflare: CloudflareConfig,
     pub cloudflare_api_url: Url,
+    /// `None` when `DOCKTORNET_CADDY_ADMIN_URL` is unset: the integration is off.
+    pub caddy: Option<CaddyConfig>,
+}
+
+/// The `@id` of the anchor route unless `DOCKTORNET_CADDY_ANCHOR_ID` sets one.
+pub const DEFAULT_CADDY_ANCHOR_ID: &str = "docktornet";
+
+#[derive(Debug, Clone)]
+pub struct CaddyConfig {
+    pub admin_url: Url,
+    /// The `@id` of the anchor route, the only place docktornet writes routes.
+    pub anchor_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +61,8 @@ pub enum ConfigError {
     InvalidUrl { name: &'static str, value: String },
     #[error("invalid duration for '{name}': '{value}'")]
     InvalidDuration { name: &'static str, value: String },
+    #[error("DOCKTORNET_CADDY_ANCHOR_ID must be a non-empty id without '/'; got '{0}'")]
+    InvalidCaddyAnchorId(String),
     #[error("DOCKTORNET_DB_PATH must be absolute, e.g. /data/docktornet.db; got '{0}'")]
     RelativeDbPath(String),
     #[error("DOCKTORNET_DB_PATH must name a file, e.g. /data/docktornet.db; got '{0}'")]
@@ -111,6 +125,7 @@ impl ServerConfig {
                     .cloned()
                     .unwrap_or_else(|| CLOUDFLARE_API_URL.to_string()),
             )?,
+            caddy: parse_caddy_config(&env)?,
         })
     }
 }
@@ -179,6 +194,25 @@ fn parse_url(value: String, name: &'static str) -> Result<Url, ConfigError> {
         "http" | "https" => Ok(url),
         _ => Err(ConfigError::InvalidUrl { name, value }),
     }
+}
+
+fn parse_caddy_config(env: &HashMap<String, String>) -> Result<Option<CaddyConfig>, ConfigError> {
+    let Some(admin_url) = env.get("DOCKTORNET_CADDY_ADMIN_URL") else {
+        return Ok(None);
+    };
+    let admin_url = parse_url(admin_url.clone(), "DOCKTORNET_CADDY_ADMIN_URL")?;
+    let anchor_id = env
+        .get("DOCKTORNET_CADDY_ANCHOR_ID")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_CADDY_ANCHOR_ID.to_string());
+    // The id is one segment of an admin API path.
+    if anchor_id.is_empty() || anchor_id.contains('/') {
+        return Err(ConfigError::InvalidCaddyAnchorId(anchor_id));
+    }
+    Ok(Some(CaddyConfig {
+        admin_url,
+        anchor_id,
+    }))
 }
 
 /// Like [`parse_url`], but the path must be the v4 API root.  Cloudflare
@@ -531,6 +565,84 @@ mod tests {
                 assert_eq!(value, "https://api.cloudflare.com");
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// The required variables plus `extra`.
+    fn required_env_with(extra: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut pairs = vec![
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", SECRET),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+        ];
+        pairs.extend_from_slice(extra);
+        env(&pairs)
+    }
+
+    #[test]
+    fn caddy_is_off_without_an_admin_url() {
+        let c =
+            ServerConfig::from_map(required_env_with(&[("DOCKTORNET_CADDY_ANCHOR_ID", "edge")]))
+                .unwrap();
+        assert!(c.caddy.is_none());
+    }
+
+    #[test]
+    fn caddy_anchor_id_defaults_to_docktornet() {
+        let c = ServerConfig::from_map(required_env_with(&[(
+            "DOCKTORNET_CADDY_ADMIN_URL",
+            "http://caddy:2019",
+        )]))
+        .unwrap();
+        let caddy = c.caddy.unwrap();
+        assert_eq!(caddy.admin_url.as_str(), "http://caddy:2019/");
+        assert_eq!(caddy.anchor_id, "docktornet");
+    }
+
+    #[test]
+    fn caddy_anchor_id_can_be_set() {
+        let c = ServerConfig::from_map(required_env_with(&[
+            ("DOCKTORNET_CADDY_ADMIN_URL", "http://caddy:2019"),
+            ("DOCKTORNET_CADDY_ANCHOR_ID", "edge"),
+        ]))
+        .unwrap();
+        assert_eq!(c.caddy.unwrap().anchor_id, "edge");
+    }
+
+    #[test]
+    fn rejects_invalid_caddy_config() {
+        let err = ServerConfig::from_map(required_env_with(&[(
+            "DOCKTORNET_CADDY_ADMIN_URL",
+            "caddy:2019",
+        )]))
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidUrl {
+                    name: "DOCKTORNET_CADDY_ADMIN_URL",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        for bad in ["", "a/b"] {
+            let err = ServerConfig::from_map(required_env_with(&[
+                ("DOCKTORNET_CADDY_ADMIN_URL", "http://caddy:2019"),
+                ("DOCKTORNET_CADDY_ANCHOR_ID", bad),
+            ]))
+            .unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidCaddyAnchorId(ref v) if v == bad),
+                "{bad:?}: {err:?}"
+            );
         }
     }
 
