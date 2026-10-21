@@ -271,7 +271,7 @@ pub fn report_outcome(
 
 /// `e` and its causes, joined by `: `. A cause is left out when the message
 /// before it already holds its text, as the client errors' `http: {0}` does.
-fn describe(e: &anyhow::Error) -> String {
+pub(crate) fn describe(e: &anyhow::Error) -> String {
     let mut parts: Vec<String> = Vec::new();
     for cause in e.chain() {
         let message = cause.to_string();

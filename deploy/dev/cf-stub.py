@@ -3,7 +3,9 @@
 Serves the calls CloudflareClient makes (zone, list the whole zone or by
 type, name or exact comment, create, update, get, delete) with Cloudflare's
 response envelope, keeps records in memory, and logs every write. A list is
-always one page. GET /_stub/records lists what it holds.
+always one page. It also answers the token check and the zone settings read
+that scripts/backup_external_state.sh makes.
+GET /_stub/records lists what it holds.
 
 Standard library only, so it runs on a stock python image.
 """
@@ -22,6 +24,8 @@ ZONE_ID = os.environ.get("CF_STUB_ZONE_ID", "dev-zone")
 ZONE_NAME = os.environ.get("CF_STUB_ZONE_NAME", "dev.test")
 PORT = int(os.environ.get("CF_STUB_PORT", "8080"))
 
+TOKEN_VERIFY_PATH = "/client/v4/user/tokens/verify"
+ZONE_SETTINGS_PATH = re.compile(rf"^/client/v4/zones/{re.escape(ZONE_ID)}/settings$")
 RECORD_LIST_PATH = re.compile(rf"^/client/v4/zones/{re.escape(ZONE_ID)}/dns_records/?$")
 RECORD_ITEM_PATH = re.compile(rf"^/client/v4/zones/{re.escape(ZONE_ID)}/dns_records/([^/]+)$")
 ZONE_PATH = re.compile(rf"^/client/v4/zones/{re.escape(ZONE_ID)}$")
@@ -108,8 +112,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send(*self.route(method, url))
 
     def route(self, method, url):
+        if url.path == TOKEN_VERIFY_PATH and method == "GET":
+            return ok({"id": "dev-token", "status": "active"})
+
         if ZONE_PATH.match(url.path) and method == "GET":
             return ok({"id": ZONE_ID, "name": ZONE_NAME})
+
+        if ZONE_SETTINGS_PATH.match(url.path) and method == "GET":
+            return ok([])
 
         if RECORD_LIST_PATH.match(url.path):
             if method == "GET":
@@ -128,7 +138,15 @@ class Handler(BaseHTTPRequestHandler):
                         or (r["comment"] or "").lower() == wanted_comment.lower()
                     )
                 ]
-                return ok(found)
+                status, payload = ok(found)
+                payload["result_info"] = {
+                    "page": 1,
+                    "per_page": len(found),
+                    "count": len(found),
+                    "total_count": len(found),
+                    "total_pages": 1,
+                }
+                return status, payload
             if method == "POST":
                 record = record_from(self.body(), uuid.uuid4().hex)
                 if name_taken(record["name"]):

@@ -78,19 +78,7 @@ impl ServerConfig {
             "DOCKTORNET_ALLOW_EPHEMERAL_DB",
             false,
         )?;
-        // A relative path resolves against the image's working directory,
-        // which is the container layer: every recreate would start empty.
-        let db_path = PathBuf::from(required("DOCKTORNET_DB_PATH")?);
-        if !db_path.is_absolute() {
-            return Err(ConfigError::RelativeDbPath(
-                db_path.to_string_lossy().into_owned(),
-            ));
-        }
-        if db_path.as_os_str().as_encoded_bytes().ends_with(b"/") || db_path.file_name().is_none() {
-            return Err(ConfigError::DbPathNotAFile(
-                db_path.to_string_lossy().into_owned(),
-            ));
-        }
+        let db_path = DbConfig::from_map(&env)?.db_path;
         let full_resync_interval = match env.get("DOCKTORNET_FULL_RESYNC_INTERVAL") {
             Some(value) => {
                 humantime::parse_duration(value).map_err(|_| ConfigError::InvalidDuration {
@@ -125,6 +113,38 @@ impl ServerConfig {
                     .unwrap_or_else(|| CLOUDFLARE_API_URL.to_string()),
             )?,
         })
+    }
+}
+
+/// The database settings alone, for a command that needs nothing else.
+#[derive(Debug, Clone)]
+pub struct DbConfig {
+    pub db_path: PathBuf,
+}
+
+impl DbConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_map(&std::env::vars().collect())
+    }
+
+    pub fn from_map(env: &HashMap<String, String>) -> Result<Self, ConfigError> {
+        // A relative path resolves against the image's working directory,
+        // which is the container layer: every recreate would start empty.
+        let db_path = PathBuf::from(
+            env.get("DOCKTORNET_DB_PATH")
+                .ok_or(ConfigError::Missing("DOCKTORNET_DB_PATH"))?,
+        );
+        if !db_path.is_absolute() {
+            return Err(ConfigError::RelativeDbPath(
+                db_path.to_string_lossy().into_owned(),
+            ));
+        }
+        if db_path.as_os_str().as_encoded_bytes().ends_with(b"/") || db_path.file_name().is_none() {
+            return Err(ConfigError::DbPathNotAFile(
+                db_path.to_string_lossy().into_owned(),
+            ));
+        }
+        Ok(Self { db_path })
     }
 }
 
@@ -579,5 +599,24 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn db_config_reads_the_database_path_alone() {
+        let c = DbConfig::from_map(&env(&[("DOCKTORNET_DB_PATH", "/data/x.db")])).unwrap();
+        assert_eq!(c.db_path, PathBuf::from("/data/x.db"));
+
+        assert!(matches!(
+            DbConfig::from_map(&env(&[])),
+            Err(ConfigError::Missing("DOCKTORNET_DB_PATH"))
+        ));
+        assert!(matches!(
+            DbConfig::from_map(&env(&[("DOCKTORNET_DB_PATH", "x.db")])),
+            Err(ConfigError::RelativeDbPath(_))
+        ));
+        assert!(matches!(
+            DbConfig::from_map(&env(&[("DOCKTORNET_DB_PATH", "/data/")])),
+            Err(ConfigError::DbPathNotAFile(_))
+        ));
     }
 }

@@ -183,8 +183,97 @@ The audit lists NPM and Cloudflare first and then reads the database in one
 transaction. A service that is created or removed while the audit runs can
 still show up in a list, so run it again before acting on a finding.
 
-Running the binary with no argument starts the server as before. Any other
+Running the binary with no argument starts the server as before.
+`docktornet-server backup` is described under [Backups](#backups). Any other
 argument exits 2 with a usage line.
+
+## Backups
+
+`scripts/backup_external_state.sh` takes everything needed to put the main
+host back as it was, in one directory per run. Run it on the main host, from
+the repository checkout, with the server running. Its one argument is an env
+file holding the server's NPM and Cloudflare keys, such as `deploy/server.env`:
+
+```bash
+./scripts/backup_external_state.sh deploy/server.env
+```
+
+Each run writes `docktornet-backups/<stamp>/`, where the stamp is the UTC start
+time as `YYYYMMDDTHHMMSSZ`:
+
+| Path | What it holds |
+| --- | --- |
+| `npm/*.json` | NPM proxy hosts, certificates, redirection hosts, dead hosts, streams, access lists and settings |
+| `cloudflare/*.json` | The token check, the zone, its settings (skipped with a warning when the token gets a 403) and every DNS record |
+| `docktornet.db` | A consistent copy of the server's database, with the ownership mappings and pending removals |
+| `gatus-config.tar.gz` | The whole Gatus config directory, base config included |
+
+The database copy comes from `docktornet-server backup`, which the script runs
+with `docker exec -i <container> docktornet-server backup > docktornet.db`. The
+subcommand reads only `DOCKTORNET_DB_PATH`, opens the database read-only and
+takes the copy with SQLite's `VACUUM INTO`, so it is safe next to the live
+server. It stages the copy in a temporary file next to the database, removes
+that file whether or not the copy succeeds, and writes the copy to stdout.
+Errors go to stderr, and it exits 1 on any failure. A backup killed by a
+signal mid-copy cannot clean up, and leaves a `.docktornet-backup-*.db` file
+next to the database. Delete it; the server never reads it.
+
+The script works in `<stamp>.partial` and renames it to `<stamp>` only after
+every part has succeeded. On a failure it exits non-zero, prints
+`backup FAILED` and leaves the `.partial` directory for inspection. The server
+can replace a Gatus file while `tar` reads the directory. The script accepts
+`tar`'s exit 1 for that case, since every file is written under a temporary
+name and renamed into place, so the archive holds each file whole.
+
+After a successful run it keeps the newest `DOCKTORNET_BACKUP_KEEP` stamped
+directories and deletes the older ones. It only counts and deletes directories
+whose names match the stamp format, so `.partial` directories and anything else
+in the backup directory are left alone. A failed run prunes nothing.
+
+These optional settings come from the env file or the environment:
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `DOCKTORNET_BACKUP_DIR` | `docktornet-backups` in the checkout | Where the stamped directories go |
+| `DOCKTORNET_BACKUP_SERVER_CONTAINER` | `docktornet-server` | The server container `docker exec` runs in |
+| `DOCKTORNET_BACKUP_GATUS_DIR` | `/etc/gatus/config.d` | The Gatus config directory on the host |
+| `DOCKTORNET_BACKUP_KEEP` | `14` | How many stamped directories to keep |
+| `DOCKTORNET_CF_API_URL` | `https://api.cloudflare.com/client/v4` | The Cloudflare API, as for the server |
+
+The script needs `curl`, `jq`, `tar` and access to `docker`. Nothing schedules
+it. A daily cron line for the user that owns the checkout looks like this:
+
+```cron
+30 3 * * * cd /path/to/docktornet && ./scripts/backup_external_state.sh deploy/server.env >> "$HOME/docktornet-backup.log" 2>&1
+```
+
+### Restoring the database
+
+Stop the server, remove the database's `-wal` and `-shm` files so SQLite does
+not replay a stale log onto the restored file, put the copy in place owned by
+uid 65532, then start the server. With the `./data` bind mount of
+`deploy/main-host.compose.yaml`, from the repository root:
+
+```bash
+backup=docktornet-backups/<stamp>
+docker compose -f deploy/main-host.compose.yaml stop docktornet-server
+sudo rm -f deploy/data/docktornet.db-wal deploy/data/docktornet.db-shm
+sudo install -o 65532 -g 65532 -m 0600 "$backup/docktornet.db" deploy/data/docktornet.db
+docker compose -f deploy/main-host.compose.yaml start docktornet-server
+```
+
+With a named volume, do the same in the volume's directory, which
+`docker volume inspect` prints as `Mountpoint`.
+
+### Restoring the Gatus config directory
+
+```bash
+sudo tar -xzf docktornet-backups/<stamp>/gatus-config.tar.gz -C /etc/gatus/config.d
+```
+
+Extracting as root keeps the files' owners from the archive. It adds and
+overwrites files but leaves any file created since the backup, so remove those
+first for an exact restore. Gatus picks up the change at its next config check.
 
 ## Compose layouts
 

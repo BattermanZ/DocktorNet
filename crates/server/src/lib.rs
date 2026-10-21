@@ -2,6 +2,7 @@ pub mod agent_versions;
 pub mod audit;
 pub mod auth;
 pub mod background;
+pub mod backup;
 pub mod breaker;
 pub mod config;
 pub mod db;

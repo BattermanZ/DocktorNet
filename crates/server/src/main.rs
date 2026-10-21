@@ -7,9 +7,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use anyhow::Result;
 use docktornet_server::agent_versions::AgentVersionTracker;
-use docktornet_server::audit;
 use docktornet_server::db_location::{self, Placement};
 use docktornet_server::flapping::FlappingTracker;
+use docktornet_server::{audit, backup};
 use docktornet_server::{config, db, routes};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -34,13 +34,14 @@ fn bind_exposes_plaintext(listen: &str) -> bool {
     }
 }
 
-const USAGE: &str = "usage: docktornet-server [audit]";
+const USAGE: &str = "usage: docktornet-server [audit | backup]";
 
 /// What the server binary was asked to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Serve,
     Audit,
+    Backup,
 }
 
 /// The command named by the arguments after the program name, or the usage
@@ -50,6 +51,7 @@ fn parse_command<I: IntoIterator<Item = OsString>>(args: I) -> Result<Command, &
     match (args.next(), args.next()) {
         (None, _) => Ok(Command::Serve),
         (Some(arg), None) if arg == "audit" => Ok(Command::Audit),
+        (Some(arg), None) if arg == "backup" => Ok(Command::Backup),
         _ => Err(USAGE),
     }
 }
@@ -77,20 +79,28 @@ async fn main() -> Result<()> {
     match parse_command(std::env::args_os().skip(1)) {
         Ok(Command::Serve) => serve().await,
         Ok(Command::Audit) => {
-            // stdout carries the report alone, so logs go to stderr.
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-                )
-                .with_writer(std::io::stderr)
-                .init();
+            init_stderr_logging();
             std::process::exit(audit::cli().await)
+        }
+        Ok(Command::Backup) => {
+            init_stderr_logging();
+            std::process::exit(backup::cli().await)
         }
         Err(usage) => {
             eprintln!("{usage}");
             std::process::exit(2)
         }
     }
+}
+
+/// Logging for a subcommand whose stdout carries its output alone.
+fn init_stderr_logging() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 async fn serve() -> Result<()> {
@@ -171,15 +181,17 @@ mod tests {
     }
 
     #[test]
-    fn no_argument_serves_and_audit_audits() {
+    fn no_argument_serves_and_subcommands_are_recognised() {
         assert_eq!(parse_command(args(&[])), Ok(Command::Serve));
         assert_eq!(parse_command(args(&["audit"])), Ok(Command::Audit));
+        assert_eq!(parse_command(args(&["backup"])), Ok(Command::Backup));
     }
 
     #[test]
     fn unknown_or_extra_arguments_are_usage_errors() {
         assert_eq!(parse_command(args(&["bogus"])), Err(USAGE));
         assert_eq!(parse_command(args(&["audit", "--only", "npm"])), Err(USAGE));
+        assert_eq!(parse_command(args(&["backup", "out.db"])), Err(USAGE));
     }
 
     #[test]
