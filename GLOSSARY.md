@@ -19,7 +19,7 @@ How long a service may be missing from its machine's snapshots before docktornet
 _Avoid_: timeout, debounce
 
 **Pending removal**:
-A managed resource docktornet has decided to delete, kept until the deletion succeeds. One whose service has left also waits out the grace period first; a Caddy route whose labels were dropped from a live service waits for none.
+A managed resource docktornet has decided to delete, kept until the deletion succeeds. One whose service has left also waits out the grace period first; an NPM proxy host or Caddy route whose labels were dropped from a live service waits for none.
 _Avoid_: orphan (that is a resource no mapping points to)
 
 ### Ownership

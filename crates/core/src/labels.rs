@@ -8,6 +8,11 @@ pub struct ParsedLabels {
     pub cf_dns: Option<CloudflareDns>,
     pub gatus: Vec<GatusMonitor>,
     pub caddy: Vec<CaddyRoute>,
+    /// The indices of `npm.<index>` groups the labels hold but that did not
+    /// parse.  The group is still there, so its proxy host is kept, not
+    /// deleted as a dropped group's would be.
+    #[serde(default)]
+    pub npm_malformed: Vec<u8>,
     /// Diagnostic messages for labels that could not be parsed. The
     /// parsing function never fails; it logs problems here so callers can
     /// surface them without breaking unrelated integrations.
@@ -145,6 +150,7 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
         cf_dns: None,
         gatus: Vec::new(),
         caddy: Vec::new(),
+        npm_malformed: Vec::new(),
         warnings: Vec::new(),
     };
 
@@ -162,11 +168,9 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
         match parts.as_slice() {
             ["npm", idx, field] => match parse_canonical_index(idx) {
                 Ok(index) => {
+                    let group = npm_groups.entry(index).or_default();
                     if is_npm_field(field) {
-                        npm_groups
-                            .entry(index)
-                            .or_default()
-                            .insert((*field).to_string(), value.clone());
+                        group.insert((*field).to_string(), value.clone());
                     } else {
                         out.warnings.push(format!(
                             "unrecognised npm.{index}.{field} field in key '{key}'"
@@ -233,7 +237,10 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
                     out.warnings.push(format!("npm.{index}: {warning}"));
                 }
             }
-            Err(err) => out.warnings.push(format!("npm.{index}: {err}")),
+            Err(err) => {
+                out.npm_malformed.push(index);
+                out.warnings.push(format!("npm.{index}: {err}"));
+            }
         }
     }
 
@@ -545,6 +552,23 @@ mod tests {
         assert_eq!(h.websockets, None);
         assert_eq!(h.cert_id, None);
         assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_npm_group_is_listed_by_index() {
+        let p = parse(&lbl(&[
+            ("docktornet.npm.0.host", "a.example.com"),
+            ("docktornet.npm.0.port", "3000"),
+            ("docktornet.npm.0.scheme", "http"),
+            ("docktornet.npm.0.ssl", "false"),
+            ("docktornet.npm.1.host", "b.example.com"),
+            ("docktornet.npm.1.port", "80a"),
+            ("docktornet.npm.1.scheme", "http"),
+            ("docktornet.npm.1.ssl", "false"),
+            ("docktornet.npm.2.hosts", "c.example.com"),
+        ]));
+        assert_eq!(p.npm.iter().map(|h| h.index).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(p.npm_malformed, vec![1, 2]);
     }
 
     #[test]

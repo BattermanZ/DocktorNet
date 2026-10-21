@@ -272,6 +272,16 @@ fn past_grace(last_seen: i64, now: i64) -> bool {
     now.saturating_sub(last_seen) >= GATUS_REMOVAL_GRACE_SECS
 }
 
+/// Whether `labels` hold a `docktornet.npm.<npm_index>` group.  A malformed
+/// group counts while the labels still ask for a resource: it is still there,
+/// so its host is kept.  Labels that ask for nothing are a service that left.
+fn lists_npm_index(labels: &docktornet_core::labels::ParsedLabels, npm_index: i64) -> bool {
+    let is_index = |index: u8| i64::from(index) == npm_index;
+    labels.npm.iter().any(|host| is_index(host.index))
+        || (crate::integrations::intended::has_intent(labels)
+            && labels.npm_malformed.iter().any(|&index| is_index(index)))
+}
+
 fn cf_record_matches(
     found: &crate::integrations::cloudflare::DnsRecord,
     intended: &crate::integrations::cloudflare::DnsRecordPayload,
@@ -894,10 +904,14 @@ impl Reconciler {
         let now = self.clock.now();
         let npm_due = self.npm.is_some() && {
             let mut due = false;
-            for (service_id, _, _, last_seen) in
+            for (service_id, npm_index, _, last_seen) in
                 crate::storage::list_pending_npm_removals(&self.db).await?
             {
-                if past_grace(last_seen, now) && !self.stored_again(&service_id).await {
+                if past_grace(last_seen, now)
+                    && !self
+                        .stored_again(&service_id, |labels| lists_npm_index(labels, npm_index))
+                        .await
+                {
                     due = true;
                     break;
                 }
@@ -1189,18 +1203,19 @@ impl Reconciler {
     }
 
     /// Whether a service with a pending removal is back: stored for its
-    /// machine again, with labels that ask for resources.  It came back in a
-    /// snapshot whose apply has not run yet, and that apply restores the
-    /// removal's resources, so no sweep may delete them.  When the store
-    /// cannot tell, the removal is kept for a later sweep.
-    async fn stored_again(&self, service_id: &str) -> bool {
+    /// machine again, with labels that `wants` says still ask for the
+    /// removal's resource.  It came back in a snapshot whose apply has not run
+    /// yet, and that apply restores the resource, so no sweep may delete it.
+    /// When the store cannot tell, the removal is kept for a later sweep.
+    async fn stored_again(
+        &self,
+        service_id: &str,
+        wants: impl Fn(&docktornet_core::labels::ParsedLabels) -> bool,
+    ) -> bool {
         match crate::storage::get_service_labels(&self.db, service_id).await {
             Ok(labels) => {
-                let back = labels.is_some_and(|labels| {
-                    crate::integrations::intended::has_intent(&docktornet_core::labels::parse(
-                        &labels,
-                    ))
-                });
+                let back =
+                    labels.is_some_and(|labels| wants(&docktornet_core::labels::parse(&labels)));
                 if back {
                     tracing::debug!(
                         service_id,
@@ -1250,7 +1265,10 @@ impl Reconciler {
                 // sweep); a later sweep will pick it up.
                 continue;
             }
-            if self.stored_again(&service_id).await {
+            if self
+                .stored_again(&service_id, |labels| lists_npm_index(labels, npm_index))
+                .await
+            {
                 continue;
             }
             match client.delete_proxy_host(token, npm_id).await {
@@ -1304,7 +1322,10 @@ impl Reconciler {
                 // sweep); a later sweep will pick it up.
                 continue;
             }
-            if self.stored_again(&service_id).await {
+            if self
+                .stored_again(&service_id, crate::integrations::intended::has_intent)
+                .await
+            {
                 continue;
             }
             match client.delete_record(&record_id).await {
@@ -1675,11 +1696,17 @@ impl Reconciler {
             failures += 1;
         }
 
+        // The mapped NPM hosts of live services whose index the labels no
+        // longer list.  Pending rows restored below are all still labelled, so
+        // they never add to this.
+        let dropped_npm = self.dropped_npm_hosts(&intended).await?;
+
         // Fetch the NPM token + certificate list once for the whole snapshot,
         // shared across every host below.  If the circuit breaker is open
         // (NPM has been failing), skip NPM entirely this cycle so we stop
         // adding load to a struggling dependency.
-        let has_npm_removals = removed.iter().any(|r| !r.npm_hosts.is_empty());
+        let has_npm_removals =
+            removed.iter().any(|r| !r.npm_hosts.is_empty()) || !dropped_npm.is_empty();
         let needs_npm = self.npm.is_some()
             && (has_npm_removals || intended.iter().any(|s| !s.labels.npm.is_empty()));
         let now = std::time::Instant::now();
@@ -1750,6 +1777,49 @@ impl Reconciler {
             }
         }
 
+        // Dropped indices next, before any host is created: a dropped group is
+        // a label edit, so its host goes in this apply with no grace period,
+        // and its domains are free in NPM before another group takes them.
+        // A host that can't go now is parked already past grace, so the next
+        // sweep retries the delete.
+        for (service_id, npm_index, npm_id) in &dropped_npm {
+            let deleted = match &npm_ctx {
+                Some((token, _)) => {
+                    let client = self.npm.as_ref().expect("npm_ctx implies npm client");
+                    match client.delete_proxy_host(token, *npm_id).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                service_id,
+                                npm_index,
+                                npm_id,
+                                "npm host deleted: its labels are gone"
+                            );
+                            true
+                        }
+                        Err(err) => {
+                            tracing::warn!(service_id, npm_index, npm_id, error = %err, "npm host delete failed; deferring");
+                            npm_failed = true;
+                            failures += 1;
+                            false
+                        }
+                    }
+                }
+                None => false,
+            };
+            if deleted {
+                crate::storage::delete_npm_host(&self.db, service_id, *npm_index).await?;
+            } else {
+                crate::storage::park_npm_host(
+                    &self.db,
+                    service_id,
+                    *npm_index,
+                    *npm_id,
+                    ingested_at.saturating_sub(GATUS_REMOVAL_GRACE_SECS),
+                )
+                .await?;
+            }
+        }
+
         // Delete Cloudflare DNS records for services that left the snapshot.
         // Past the grace period we delete immediately; within it we defer (a
         // brief container restart should not tear down a live public record).
@@ -1806,15 +1876,24 @@ impl Reconciler {
             // None and create a SECOND proxy host for the same domain, orphaning
             // the original.  So restore the mapping first, then clear the
             // pending row — reconcile then updates the existing host in place.
+            // Only indices the labels still list come back; the rest stay
+            // pending and the sweep deletes them past grace.
             for (npm_index, npm_id) in
                 crate::storage::get_pending_npm_removals_for_service(&self.db, &service.service_id)
                     .await?
             {
+                if !lists_npm_index(&service.labels, npm_index) {
+                    continue;
+                }
                 crate::storage::set_npm_host(&self.db, &service.service_id, npm_index, npm_id)
                     .await?;
-            }
-            crate::storage::clear_pending_npm_removals_for_service(&self.db, &service.service_id)
+                crate::storage::delete_pending_npm_removal(
+                    &self.db,
+                    &service.service_id,
+                    npm_index,
+                )
                 .await?;
+            }
             // Likewise for a pending Cloudflare removal: a returning service's
             // record must never be deleted, and its record_id must be restored
             // (the cf_dns_records mapping was cascade-deleted too) so reconcile
@@ -1900,6 +1979,28 @@ impl Reconciler {
                 .insert(machine, intent_hash);
         }
         Ok(())
+    }
+
+    /// The `(service_id, npm_index, npm_id)` mappings of `intended` services
+    /// whose index their labels no longer list.
+    async fn dropped_npm_hosts(
+        &self,
+        intended: &[crate::integrations::intended::IntendedService],
+    ) -> Result<Vec<(String, i64, i64)>, ReconcileError> {
+        let ids: Vec<String> = intended.iter().map(|s| s.service_id.clone()).collect();
+        let labels: HashMap<&str, &docktornet_core::labels::ParsedLabels> = intended
+            .iter()
+            .map(|s| (s.service_id.as_str(), &s.labels))
+            .collect();
+        Ok(crate::storage::get_npm_hosts_for_services(&self.db, &ids)
+            .await?
+            .into_iter()
+            .filter(|(service_id, npm_index, _)| {
+                labels
+                    .get(service_id.as_str())
+                    .is_some_and(|labels| !lists_npm_index(labels, *npm_index))
+            })
+            .collect())
     }
 
     /// Write (or remove) the Gatus config file for a single current service.

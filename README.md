@@ -78,6 +78,12 @@ owned resources within about a minute of the grace period ending; failed
 external deletions are persisted and retried on that same minute timer. Gatus
 picks up a removed monitor on its next config check, every 30 seconds.
 
+A running service that drops a `docktornet.npm.<n>` group loses that proxy host
+in the same update, with no grace period, because a label edit is not a
+restart. Docktornet retries a failed delete on the same minute timer. A group
+that is still there but fails to parse keeps its proxy host. A service that
+returns after a removal gets back only the proxy hosts its labels still list.
+
 ### Ownership markers
 
 The SQLite database is Docktornet's working copy of what it owns. Each managed

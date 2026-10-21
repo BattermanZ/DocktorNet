@@ -358,17 +358,35 @@ pub async fn get_pending_npm_removals_for_service(
     .await
 }
 
-/// Drop every pending removal for a service.  Called when a service reappears,
-/// so a host that is live again is never pruned.
-pub async fn clear_pending_npm_removals_for_service(
+/// Move a service's NPM host mapping to `pending_npm_removals`, seen last at
+/// `last_seen`, in one transaction.
+pub async fn park_npm_host(
     pool: &Pool<Sqlite>,
     service_id: &str,
+    npm_index: i64,
+    npm_id: i64,
+    last_seen: i64,
 ) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM pending_npm_removals WHERE service_id = ?")
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"INSERT INTO pending_npm_removals (service_id, npm_index, npm_id, last_seen)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(service_id, npm_index) DO UPDATE SET
+             npm_id    = excluded.npm_id,
+             last_seen = excluded.last_seen"#,
+    )
+    .bind(service_id)
+    .bind(npm_index)
+    .bind(npm_id)
+    .bind(last_seen)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM npm_hosts WHERE service_id = ? AND npm_index = ?")
         .bind(service_id)
-        .execute(pool)
+        .bind(npm_index)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await
 }
 
 /// Return every `(service_id, record_id)` Cloudflare mapping for the given
@@ -1088,13 +1106,6 @@ mod tests {
                 ("m1/b".to_string(), 0, 20, 150),
             ]
         );
-
-        // Clearing by service removes all of that service's pending entries.
-        clear_pending_npm_removals_for_service(&p, "m1/a")
-            .await
-            .unwrap();
-        let pending = list_pending_npm_removals(&p).await.unwrap();
-        assert_eq!(pending, vec![("m1/b".to_string(), 0, 20, 150)]);
     }
 
     #[tokio::test]

@@ -598,9 +598,30 @@ async fn a_service_back_in_the_newest_snapshot_keeps_its_resources() {
     let dir = tempdir().unwrap();
     let gatus_dir = dir.path().join("gatus");
     let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
-    let (server, deletes) = x_resources_server(0).await;
+    let (mut server, deletes) = x_resources_server(0).await;
+    // x's NPM host, in sync with its npm.0 group.
+    server
+        .mock("GET", "/api/nginx/proxy-hosts/50")
+        .with_status(200)
+        .with_body(
+            serde_json::json!({
+                "id": 50, "domain_names": ["x.example.com"], "forward_scheme": "http",
+                "forward_host": "10.0.0.1", "forward_port": 3000, "certificate_id": 0,
+                "ssl_forced": 0, "http2_support": 0, "hsts_enabled": 0,
+                "hsts_subdomains": 0, "block_exploits": 1, "allow_websocket_upgrade": 1,
+                "meta": {"docktornet": {"service_id": "m1/x", "npm_index": 0}}
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
     let reconciler = reconciler_on(pool.clone(), &gatus_dir, &server);
-    storage::upsert_snapshot(&pool, &m1_snapshot(vec![x_entry()]), 1)
+    let x = || {
+        let mut x = x_entry();
+        x.labels.extend(npm_host_labels("x.example.com"));
+        x
+    };
+    storage::upsert_snapshot(&pool, &m1_snapshot(vec![x()]), 1)
         .await
         .unwrap();
     storage::set_npm_host(&pool, "m1/x", 0, 50).await.unwrap();
@@ -613,7 +634,7 @@ async fn a_service_back_in_the_newest_snapshot_keeps_its_resources() {
         .await
         .unwrap();
     assert!(
-        ingest_at(&reconciler, past_grace + 5, &m1_snapshot(vec![x_entry()]))
+        ingest_at(&reconciler, past_grace + 5, &m1_snapshot(vec![x()]))
             .await
             .is_none()
     );
@@ -805,8 +826,20 @@ async fn sweep_keeps_a_pending_removal_of_a_service_that_is_back() {
         npm,
         cf,
     );
-    // x is stored again, and its removal waits for the apply to restore it.
-    push(&reconciler, 1, vec![gatus_entry("x")]).await;
+    // x is stored again still labelling npm.0, and its removal waits for the
+    // apply to restore it.
+    let mut labels = gatus_labels();
+    labels.extend(npm_host_labels("x.example.com"));
+    storage::upsert_snapshot(
+        &pool,
+        &m1_snapshot(vec![ContainerEntry {
+            name: "x".into(),
+            labels,
+        }]),
+        1,
+    )
+    .await
+    .unwrap();
     storage::add_pending_npm_removal(&pool, "m1/x", 0, 50, 1)
         .await
         .unwrap();
@@ -5304,4 +5337,298 @@ async fn dry_run_writes_no_cf_marker() {
     for mock in refused {
         mock.assert_async().await;
     }
+}
+
+/// Labels for `npm.0` on `a.example.com` and, when `with_second`, `npm.1` on
+/// `b.example.com`.
+fn two_npm_labels(with_second: bool) -> BTreeMap<String, String> {
+    let mut labels = npm_host_labels("a.example.com");
+    if with_second {
+        for (key, value) in npm_host_labels("b.example.com") {
+            labels.insert(key.replace(".npm.0.", ".npm.1."), value);
+        }
+    }
+    labels
+}
+
+fn app_with_npm(with_second: bool) -> ContainerEntry {
+    ContainerEntry {
+        name: "app".into(),
+        labels: two_npm_labels(with_second),
+    }
+}
+
+/// An NPM mock answering auth and holding index 0's host 50 in sync.
+async fn npm_server_holding_host_50() -> mockito::ServerGuard {
+    let mut server = npm_server_with_auth().await;
+    server
+        .mock("GET", "/api/nginx/proxy-hosts/50")
+        .with_status(200)
+        .with_body(stored_host_50(
+            serde_json::json!({ "docktornet": app_marker() }),
+        ))
+        .create_async()
+        .await;
+    server
+}
+
+/// Store `m1/app` at t=1 labelling `npm.0` (host 50) and `npm.1` (host 51).
+async fn seed_two_npm_hosts(pool: &Db) {
+    storage::upsert_snapshot(pool, &m1_snapshot(vec![app_with_npm(true)]), 1)
+        .await
+        .unwrap();
+    storage::set_npm_host(pool, "m1/app", 0, 50).await.unwrap();
+    storage::set_npm_host(pool, "m1/app", 1, 51).await.unwrap();
+}
+
+fn npm_reconciler(pool: Db, dir: &std::path::Path, npm_url: &str) -> Reconciler {
+    reconciler_for(pool, dir, npm_url, npm_url, false, false)
+}
+
+#[tokio::test]
+async fn npm_host_deleted_when_a_running_container_drops_its_npm_group() {
+    let dir = tempdir().unwrap();
+    let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+    let mut npm_server = npm_server_holding_host_50().await;
+    let delete = npm_server
+        .mock("DELETE", "/api/nginx/proxy-hosts/51")
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+    let reconciler = npm_reconciler(pool.clone(), dir.path(), &npm_server.url());
+    seed_two_npm_hosts(&pool).await;
+
+    // The container keeps running with only its npm.0 group.
+    push(&reconciler, 31, vec![app_with_npm(false)]).await;
+
+    delete.assert_async().await;
+    assert_eq!(
+        storage::list_npm_hosts(&pool).await.unwrap(),
+        vec![("m1/app".to_string(), 0, 50)],
+        "the dropped index's mapping goes with its host"
+    );
+    assert!(
+        storage::list_pending_npm_removals(&pool)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a label edit owes no pending removal"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_npm_group_whose_delete_fails_is_swept_next() {
+    let dir = tempdir().unwrap();
+    let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+    let mut npm_server = npm_server_holding_host_50().await;
+    let failing = npm_server
+        .mock("DELETE", "/api/nginx/proxy-hosts/51")
+        .with_status(500)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+    let reconciler = npm_reconciler(pool.clone(), dir.path(), &npm_server.url());
+    seed_two_npm_hosts(&pool).await;
+
+    reconciler.set_now(31);
+    let err = reconciler
+        .reconcile_snapshot(&m1_snapshot(vec![app_with_npm(false)]))
+        .await;
+
+    assert!(err.is_err(), "a failed delete fails the apply");
+    failing.assert_async().await;
+    failing.remove_async().await;
+    assert_eq!(
+        storage::list_npm_hosts(&pool).await.unwrap(),
+        vec![("m1/app".to_string(), 0, 50)]
+    );
+    assert_eq!(
+        storage::list_pending_npm_removals(&pool).await.unwrap(),
+        vec![("m1/app".to_string(), 1, 51, 31 - GATUS_REMOVAL_GRACE_SECS)],
+        "the host is parked already past grace"
+    );
+
+    let delete = npm_server
+        .mock("DELETE", "/api/nginx/proxy-hosts/51")
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    delete.assert_async().await;
+    assert!(
+        storage::list_pending_npm_removals(&pool)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_npm_group_is_parked_while_the_breaker_is_open() {
+    let dir = tempdir().unwrap();
+    let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+    let mut npm_server = npm_server_holding_host_50().await;
+    let delete = npm_server
+        .mock("DELETE", "/api/nginx/proxy-hosts/51")
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+    let reconciler = npm_reconciler(pool.clone(), dir.path(), &npm_server.url());
+    seed_two_npm_hosts(&pool).await;
+    reconciler.trip_npm_breaker();
+
+    push(&reconciler, 31, vec![app_with_npm(false)]).await;
+
+    assert_eq!(
+        storage::list_npm_hosts(&pool).await.unwrap(),
+        vec![("m1/app".to_string(), 0, 50)]
+    );
+    assert_eq!(
+        storage::list_pending_npm_removals(&pool).await.unwrap(),
+        vec![("m1/app".to_string(), 1, 51, 31 - GATUS_REMOVAL_GRACE_SECS)],
+        "the host is parked already past grace"
+    );
+
+    // A reconciler whose breaker is closed, as this one's will be once its
+    // cooldown ends.
+    let recovered = npm_reconciler(pool.clone(), dir.path(), &npm_server.url());
+    recovered.set_now(31);
+    recovered.sweep_pending_removals().await.unwrap();
+
+    delete.assert_async().await;
+    assert!(
+        storage::list_pending_npm_removals(&pool)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_returning_service_gets_back_only_the_npm_groups_it_still_labels() {
+    let dir = tempdir().unwrap();
+    let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+    let mut npm_server = npm_server_holding_host_50().await;
+    let delete = npm_server
+        .mock("DELETE", "/api/nginx/proxy-hosts/51")
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+    let reconciler = npm_reconciler(pool.clone(), dir.path(), &npm_server.url());
+    seed_two_npm_hosts(&pool).await;
+
+    // It leaves, then returns within grace labelling only npm.0.
+    push(&reconciler, 31, vec![]).await;
+    push(&reconciler, 61, vec![app_with_npm(false)]).await;
+
+    assert_eq!(
+        storage::list_npm_hosts(&pool).await.unwrap(),
+        vec![("m1/app".to_string(), 0, 50)],
+        "only the still-labelled index gets its mapping back"
+    );
+    assert_eq!(
+        storage::list_pending_npm_removals(&pool).await.unwrap(),
+        vec![("m1/app".to_string(), 1, 51, 1)],
+        "the dropped index stays pending from its departure"
+    );
+
+    reconciler.set_now(1 + GATUS_REMOVAL_GRACE_SECS);
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    delete.assert_async().await;
+    assert!(
+        storage::list_pending_npm_removals(&pool)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the sweep deletes it though its service is stored again"
+    );
+    assert_eq!(
+        storage::list_npm_hosts(&pool).await.unwrap(),
+        vec![("m1/app".to_string(), 0, 50)]
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_npm_group_keeps_its_host() {
+    let dir = tempdir().unwrap();
+    let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+    let mut npm_server = npm_server_holding_host_50().await;
+    let delete = npm_server
+        .mock("DELETE", "/api/nginx/proxy-hosts/51")
+        .with_status(200)
+        .with_body("{}")
+        .expect(0)
+        .create_async()
+        .await;
+    let reconciler = npm_reconciler(pool.clone(), dir.path(), &npm_server.url());
+    seed_two_npm_hosts(&pool).await;
+
+    // A typo in npm.1's port: the group is still there, just unparsable.
+    let mut app = app_with_npm(true);
+    app.labels
+        .insert("docktornet.npm.1.port".to_string(), "80a".to_string());
+    push(&reconciler, 31, vec![app]).await;
+    reconciler.set_now(31 + GATUS_REMOVAL_GRACE_SECS);
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    delete.assert_async().await;
+    assert_eq!(
+        storage::list_npm_hosts(&pool).await.unwrap(),
+        vec![("m1/app".to_string(), 0, 50), ("m1/app".to_string(), 1, 51)],
+        "a malformed group is not a dropped one"
+    );
+    assert!(
+        storage::list_pending_npm_removals(&pool)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn sweep_keeps_the_pending_host_of_a_returning_service_with_a_malformed_npm_group() {
+    let dir = tempdir().unwrap();
+    let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+    let mut server = mockito::Server::new_async().await;
+    let untouched = refuse_every_request(&mut server).await;
+    let reconciler = npm_reconciler(pool.clone(), dir.path(), &server.url());
+    // app is stored again with a typo in npm.0's port, before its apply runs.
+    let mut labels = gatus_labels();
+    labels.extend(npm_host_labels("a.example.com"));
+    labels.insert("docktornet.npm.0.port".to_string(), "80a".to_string());
+    storage::upsert_snapshot(
+        &pool,
+        &m1_snapshot(vec![ContainerEntry {
+            name: "app".into(),
+            labels,
+        }]),
+        1,
+    )
+    .await
+    .unwrap();
+    storage::add_pending_npm_removal(&pool, "m1/app", 0, 50, 1)
+        .await
+        .unwrap();
+    reconciler.set_now(1 + GATUS_REMOVAL_GRACE_SECS + 60);
+
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    for mock in untouched {
+        mock.assert_async().await;
+    }
+    assert_eq!(
+        storage::list_pending_npm_removals(&pool).await.unwrap(),
+        vec![("m1/app".to_string(), 0, 50, 1)]
+    );
 }
