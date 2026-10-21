@@ -89,8 +89,13 @@ pub struct DnsRecordResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DnsRecord {
     pub id: String,
+    #[serde(rename = "type", default)]
+    pub record_type: String,
     pub name: String,
+    // Defaults, so one unusual record in a whole-zone listing cannot fail it.
+    #[serde(default)]
     pub content: String,
+    #[serde(default)]
     pub proxied: bool,
     #[serde(default)]
     pub comment: Option<String>,
@@ -114,7 +119,19 @@ impl DnsRecord {
 pub struct DnsRecordListResponse {
     pub success: bool,
     pub result: Vec<DnsRecord>,
+    #[serde(default)]
+    pub result_info: Option<ResultInfo>,
 }
+
+/// The page a list response holds, out of how many.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ResultInfo {
+    pub page: u32,
+    pub total_pages: u32,
+}
+
+/// Records asked for per page when listing the whole zone.
+const LIST_PAGE_SIZE: u32 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct DeleteResponse {
@@ -253,6 +270,38 @@ impl CloudflareClient {
             .result
             .into_iter()
             .find(|record| record.comment() == Some(comment)))
+    }
+
+    /// Every DNS record in the zone, of any type, following Cloudflare's
+    /// pagination. A response without `result_info` is read as the only page.
+    pub async fn list_records(&self) -> Result<Vec<DnsRecord>, CloudflareError> {
+        let mut records = Vec::new();
+        let mut page = 1u32;
+        loop {
+            self.check_rate_limit()?;
+            let resp = self
+                .http
+                .get(self.endpoint(&format!("zones/{}/dns_records", self.zone_id)))
+                .query(&[
+                    ("page", page.to_string()),
+                    ("per_page", LIST_PAGE_SIZE.to_string()),
+                ])
+                .bearer_auth(&self.api_token)
+                .send()
+                .await?;
+            let resp = self.guard_rate_limit(resp)?.error_for_status()?;
+
+            let response = resp.json::<DnsRecordListResponse>().await?;
+            if !response.success {
+                return Err(CloudflareError::Api);
+            }
+            let empty = response.result.is_empty();
+            records.extend(response.result);
+            match response.result_info {
+                Some(info) if !empty && info.page < info.total_pages => page = info.page + 1,
+                _ => return Ok(records),
+            }
+        }
     }
 
     pub async fn create_record(
@@ -473,12 +522,92 @@ mod tests {
             record,
             Some(DnsRecord {
                 id: "rec-1".to_string(),
+                record_type: String::new(),
                 name: "app.example.com".to_string(),
                 content: "target.example.com".to_string(),
                 proxied: true,
                 comment: None,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn list_records_follows_every_page() {
+        let mut server = Server::new_async().await;
+        let page = |n: u32, id: &str, name: &str| {
+            serde_json::json!({
+                "success": true,
+                "result": [{
+                    "id": id,
+                    "type": "A",
+                    "name": name,
+                    "content": "192.0.2.1",
+                    "proxied": false,
+                    "comment": null
+                }],
+                "result_info": {"page": n, "per_page": 1000, "total_pages": 2, "count": 1, "total_count": 2}
+            })
+            .to_string()
+        };
+        let first = server
+            .mock("GET", "/client/v4/zones/zone-123/dns_records")
+            .match_header("authorization", "Bearer token-abc")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("page".into(), "1".into()),
+                Matcher::UrlEncoded("per_page".into(), "1000".into()),
+            ]))
+            .with_status(200)
+            .with_body(page(1, "rec-1", "a.example.com"))
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/client/v4/zones/zone-123/dns_records")
+            .match_query(Matcher::UrlEncoded("page".into(), "2".into()))
+            .with_status(200)
+            .with_body(page(2, "rec-2", "b.example.com"))
+            .create_async()
+            .await;
+
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "token-abc".to_string(),
+                zone_id: "zone-123".to_string(),
+            },
+            format!("{}/client/v4", server.url()),
+        );
+
+        let records = client.list_records().await.unwrap();
+        first.assert_async().await;
+        second.assert_async().await;
+        let ids: Vec<_> = records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["rec-1", "rec-2"]);
+        assert_eq!(records[0].record_type, "A");
+    }
+
+    #[tokio::test]
+    async fn list_records_reads_a_response_without_result_info_as_one_page() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("GET", "/client/v4/zones/zone-123/dns_records")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"success":true,"result":[{"id":"rec-1","type":"CNAME","name":"a.example.com","content":"t","proxied":false}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "token-abc".to_string(),
+                zone_id: "zone-123".to_string(),
+            },
+            format!("{}/client/v4", server.url()),
+        );
+
+        assert_eq!(client.list_records().await.unwrap().len(), 1);
+        m.assert_async().await;
     }
 
     #[tokio::test]

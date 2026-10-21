@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use docktornet_core::{Snapshot, service_id};
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, Sqlite, SqliteExecutor};
 
 /// Maximum number of bind parameters to place in a single statement. SQLite's
 /// compile-time `SQLITE_MAX_VARIABLE_NUMBER` defaults to 32766; staying well
@@ -88,11 +88,11 @@ pub struct Machine {
     pub agent_version: Option<String>,
 }
 
-pub async fn list_machines(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<Machine>> {
+pub async fn list_machines(db: impl SqliteExecutor<'_>) -> sqlx::Result<Vec<Machine>> {
     sqlx::query_as(
         "SELECT machine_id, forward_host, last_seen, agent_version FROM machines ORDER BY machine_id",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await
 }
 
@@ -242,6 +242,16 @@ pub async fn get_npm_hosts_for_services(
     Ok(out)
 }
 
+/// Every `(service_id, npm_index, npm_id)` ownership mapping, ordered by
+/// `(service_id, npm_index)`.
+pub async fn list_npm_hosts(db: impl SqliteExecutor<'_>) -> sqlx::Result<Vec<(String, i64, i64)>> {
+    sqlx::query_as(
+        "SELECT service_id, npm_index, npm_id FROM npm_hosts ORDER BY service_id, npm_index",
+    )
+    .fetch_all(db)
+    .await
+}
+
 /// Record an NPM proxy host whose service has left a snapshot but whose grace
 /// period has not yet elapsed, so it can be pruned later by the pending-removal sweep.
 pub async fn add_pending_npm_removal(
@@ -268,13 +278,13 @@ pub async fn add_pending_npm_removal(
 }
 
 pub async fn list_pending_npm_removals(
-    pool: &Pool<Sqlite>,
+    db: impl SqliteExecutor<'_>,
 ) -> sqlx::Result<Vec<(String, i64, i64, i64)>> {
     sqlx::query_as(
         "SELECT service_id, npm_index, npm_id, last_seen FROM pending_npm_removals \
          ORDER BY service_id, npm_index",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await
 }
 
@@ -380,13 +390,13 @@ pub async fn add_pending_cf_removal(
 }
 
 pub async fn list_pending_cf_removals(
-    pool: &Pool<Sqlite>,
+    db: impl SqliteExecutor<'_>,
 ) -> sqlx::Result<Vec<(String, String, i64)>> {
     sqlx::query_as(
         "SELECT service_id, record_id, last_seen FROM pending_cf_removals \
          ORDER BY service_id",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await
 }
 
@@ -499,6 +509,15 @@ pub async fn get_cf_dns_record(
         .fetch_optional(pool)
         .await
         .map(|row| row.map(|(record_id,)| record_id))
+}
+
+/// Every `(service_id, record_id)` ownership mapping, ordered by `service_id`.
+pub async fn list_cf_dns_records(
+    db: impl SqliteExecutor<'_>,
+) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as("SELECT service_id, record_id FROM cf_dns_records ORDER BY service_id")
+        .fetch_all(db)
+        .await
 }
 
 pub async fn set_cf_dns_record(

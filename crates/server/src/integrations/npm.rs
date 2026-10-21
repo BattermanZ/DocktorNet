@@ -126,6 +126,10 @@ pub struct ProxyHost {
 }
 
 impl ProxyHost {
+    pub fn marker(&self) -> Option<OwnershipMarker> {
+        OwnershipMarker::from_meta(&self.meta)
+    }
+
     /// True when NPM's stored state already matches the payload we would push.
     /// Only the fields we derive from labels are compared; flags we always set
     /// to a constant (caching) can't drift, so skipping them avoids false
@@ -275,6 +279,19 @@ impl NpmClient {
     /// Every proxy host in NPM. NPM has no server-side filter, so marker and
     /// hostname lookups list once and match locally.
     pub async fn list_proxy_hosts(&self, token: &str) -> Result<Vec<ProxyHostResponse>, NpmError> {
+        self.list_all_proxy_hosts(token).await
+    }
+
+    /// Every proxy host in NPM with its upstream, for callers that need
+    /// `forward_host` and `forward_port` as well as the marker.
+    pub async fn list_proxy_host_details(&self, token: &str) -> Result<Vec<ProxyHost>, NpmError> {
+        self.list_all_proxy_hosts(token).await
+    }
+
+    async fn list_all_proxy_hosts<T: serde::de::DeserializeOwned>(
+        &self,
+        token: &str,
+    ) -> Result<Vec<T>, NpmError> {
         let resp = self
             .http
             .get(self.endpoint("api/nginx/proxy-hosts"))
@@ -283,7 +300,7 @@ impl NpmClient {
             .await?
             .error_for_status()?;
 
-        Ok(resp.json::<Vec<ProxyHostResponse>>().await?)
+        Ok(resp.json::<Vec<T>>().await?)
     }
 
     pub async fn get_proxy_host(
@@ -770,6 +787,33 @@ mod tests {
         m.assert_async().await;
         assert_eq!(hosts[0].marker(), None);
         assert_eq!(hosts[1].marker(), Some(OwnershipMarker::new("m1/app", 1u8)));
+    }
+
+    #[tokio::test]
+    async fn list_proxy_host_details_reads_upstream_and_marker() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .match_header("authorization", "Bearer tok")
+            .with_status(200)
+            .with_body(
+                r#"[{"id":61,"domain_names":["app.example.com"],"forward_host":"10.0.0.5",
+                     "forward_port":8080,"ssl_forced":1,
+                     "meta":{"docktornet":{"service_id":"m1/app","npm_index":1}}}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = NpmClient::new(crate::config::NpmConfig {
+            url: Url::parse(&server.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let hosts = client.list_proxy_host_details("tok").await.unwrap();
+        m.assert_async().await;
+        assert_eq!(hosts[0].forward_host, "10.0.0.5");
+        assert_eq!(hosts[0].forward_port, 8080);
+        assert_eq!(hosts[0].marker(), Some(OwnershipMarker::new("m1/app", 1u8)));
     }
 
     fn listed(id: i64, domains: &[&str], meta: Value) -> ProxyHostResponse {

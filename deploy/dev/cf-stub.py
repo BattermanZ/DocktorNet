@@ -1,9 +1,9 @@
 """Stateful stand-in for the Cloudflare DNS API, for the dev stack only.
 
-Serves the calls CloudflareClient makes (zone, list by type, name or exact
-comment, create, update, get, delete) with Cloudflare's response envelope,
-keeps records in memory, and logs every write. GET /_stub/records lists what
-it holds.
+Serves the calls CloudflareClient makes (zone, list the whole zone or by
+type, name or exact comment, create, update, get, delete) with Cloudflare's
+response envelope, keeps records in memory, and logs every write. A list is
+always one page. GET /_stub/records lists what it holds.
 
 Standard library only, so it runs on a stock python image.
 """

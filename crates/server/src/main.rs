@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use anyhow::Result;
 use docktornet_server::agent_versions::AgentVersionTracker;
+use docktornet_server::audit;
 use docktornet_server::db_location::{self, Placement};
 use docktornet_server::flapping::FlappingTracker;
 use docktornet_server::{config, db, routes};
@@ -32,6 +34,26 @@ fn bind_exposes_plaintext(listen: &str) -> bool {
     }
 }
 
+const USAGE: &str = "usage: docktornet-server [audit]";
+
+/// What the server binary was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Serve,
+    Audit,
+}
+
+/// The command named by the arguments after the program name, or the usage
+/// line when they name none the binary knows.
+fn parse_command<I: IntoIterator<Item = OsString>>(args: I) -> Result<Command, &'static str> {
+    let mut args = args.into_iter();
+    match (args.next(), args.next()) {
+        (None, _) => Ok(Command::Serve),
+        (Some(arg), None) if arg == "audit" => Ok(Command::Audit),
+        _ => Err(USAGE),
+    }
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.ok();
@@ -52,6 +74,26 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
+    match parse_command(std::env::args_os().skip(1)) {
+        Ok(Command::Serve) => serve().await,
+        Ok(Command::Audit) => {
+            // stdout carries the report alone, so logs go to stderr.
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+            std::process::exit(audit::cli().await)
+        }
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::exit(2)
+        }
+    }
+}
+
+async fn serve() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -123,6 +165,22 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn no_argument_serves_and_audit_audits() {
+        assert_eq!(parse_command(args(&[])), Ok(Command::Serve));
+        assert_eq!(parse_command(args(&["audit"])), Ok(Command::Audit));
+    }
+
+    #[test]
+    fn unknown_or_extra_arguments_are_usage_errors() {
+        assert_eq!(parse_command(args(&["bogus"])), Err(USAGE));
+        assert_eq!(parse_command(args(&["audit", "--only", "npm"])), Err(USAGE));
+    }
 
     #[test]
     fn wildcard_and_lan_binds_are_flagged_as_plaintext_exposed() {

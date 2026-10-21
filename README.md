@@ -105,6 +105,11 @@ Docktornet deletes only what a stored mapping or pending removal points to. It
 never deletes a marked resource that has no mapping, and dry-run writes no
 markers. See [ADR 0001](docs/adr/0001-ownership-markers.md) for the format.
 
+To find orphans, run `docker exec docktornet-server docktornet-server audit`.
+It prints, as JSON, the resources no mapping points to and the mappings whose
+resource is gone or unmarked. The
+[deployment guide](docs/deployment.md#auditing-ownership) explains the output.
+
 The first full resync after upgrading to a version with markers runs at startup
 and updates every mapped proxy host and DNS record once to write its marker.
 NPM reloads nginx on each proxy host update, so expect one reload per proxy

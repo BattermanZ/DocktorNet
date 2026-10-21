@@ -23,6 +23,19 @@ pub async fn connect(db_path: &Path) -> anyhow::Result<Db> {
     Ok(pool)
 }
 
+/// Open an existing database read-only, without creating it or running
+/// migrations, so a command can read it next to a live server.
+pub async fn connect_read_only(db_path: &Path) -> anyhow::Result<Db> {
+    let opts = SqliteConnectOptions::new()
+        .filename(db_path)
+        .read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await?;
+    Ok(pool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,6 +65,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row.0, 0);
+    }
+
+    #[tokio::test]
+    async fn read_only_connection_refuses_writes_and_a_missing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        connect(&path).await.unwrap().close().await;
+
+        let pool = connect_read_only(&path).await.unwrap();
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM machines")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 0);
+        sqlx::query(
+            "INSERT INTO machines (machine_id, forward_host, last_seen) VALUES ('m1', 'h', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
+
+        assert!(
+            connect_read_only(&dir.path().join("missing.db"))
+                .await
+                .is_err()
+        );
+        assert!(!dir.path().join("missing.db").exists());
     }
 
     #[tokio::test]

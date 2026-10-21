@@ -80,6 +80,77 @@ by [ADR 0001](adr/0001-ownership-markers.md).
 > reload nginx, so expect one reload per proxy host on that pass. Later resyncs
 > leave marked resources alone.
 
+## Auditing ownership
+
+`docktornet-server audit` compares NPM and Cloudflare with the server's
+ownership mappings and prints what does not line up. It changes nothing. It
+opens the database read-only and runs no migrations. Apart from the NPM token
+request it sends only GET requests, whatever `DOCKTORNET_DRY_RUN` says. It reads
+the same environment as the server, so run it inside the server container,
+next to the live server. The image has no shell, so call the binary directly:
+
+```bash
+docker exec docktornet-server docktornet-server audit > audit.json
+```
+
+The upstream probes below go out from the container, over the server's
+network. Logs and errors go to stderr, and stdout carries only the report: one
+JSON document with every key present, as an empty list when there is nothing
+to report.
+
+```json
+{
+  "npm": {
+    "marked_unmapped": [],
+    "pending_removal": [],
+    "mapped_missing": [],
+    "mapped_unmarked": [],
+    "unmarked_unreachable": []
+  },
+  "cloudflare": {
+    "marked_unmapped": [],
+    "pending_removal": [],
+    "mapped_missing": [],
+    "mapped_unmarked": [],
+    "unmarked_unmapped": []
+  }
+}
+```
+
+Every entry has the resource's `id`. Where the resource still exists, NPM
+entries add `domain_names` and Cloudflare entries add `name`, plus `type`
+everywhere except `pending_removal`.
+Times are unix seconds, and each `*_secs_ago` counts back from when the audit
+ran.
+
+| Category | What it lists | Extra fields |
+| --- | --- | --- |
+| `marked_unmapped` | A resource whose marker names a service, but no mapping or pending removal points to it. A recent `machine_last_seen` means the machine still reports and the service has gone, so the resource is an orphan. | `service_id`, `npm_index` (NPM), `machine_last_seen` and `machine_last_seen_secs_ago`, null when the database does not know the machine |
+| `pending_removal` | A row in `pending_npm_removals` or `pending_cf_removals`: a resource waiting out its grace period, or one whose deletion keeps failing. | `service_id`, `npm_index` (NPM), `last_seen`, `last_seen_secs_ago`, and `exists`, false when the resource is already gone |
+| `mapped_missing` | A mapping that points to a proxy host or record that no longer exists. | `service_id`, `npm_index` (NPM) |
+| `mapped_unmarked` | A mapped resource with no marker, or a marker naming another service or index. | `service_id`, `npm_index` (NPM), and what the resource carries: `marker` (NPM) or `comment` (Cloudflare) |
+| `unmarked_unreachable` (NPM) | A proxy host with no marker and no mapping whose `forward_host:forward_port` does not take a TCP connect within 2 seconds: refused, unresolvable, unroutable or silent. At most 8 probes run at once. | `forward_host`, `forward_port` |
+| `unmarked_unmapped` (Cloudflare) | A record of any type with no marker and no mapping. It is listed without a probe, since a record does not say which port to try, so hand-made records show up here too. | `content` |
+
+A record whose service ID is too long for a marker (see
+[Long service IDs](#ownership-markers-and-adoption)) is listed under
+`mapped_unmarked`.
+
+The exit code says what the audit found:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Every list is empty. |
+| `1` | At least one list has entries. |
+| `2` | The audit failed, for example on config, opening the database, the NPM login or an API error. The error goes to stderr and stdout stays empty. |
+
+The audit lists NPM and Cloudflare first and then reads the database in one
+transaction. A service that is created or removed while the audit runs can
+still show up in a list, so run it again before acting on a finding.
+
+Running the binary with no argument starts the server as before. Any other
+argument exits 2 with a usage line.
+
 ## Compose layouts
 
 **Main host (server + agent in one stack):** `deploy/main-host.compose.yaml`
