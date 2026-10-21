@@ -56,6 +56,9 @@ pub struct CloudflareClient {
     /// Instant until which further calls are suppressed after a 429.  Shared
     /// across clones so every reconcile honours the same back-off window.
     rate_limited_until: Arc<Mutex<Option<Instant>>>,
+    /// The configured zone, once a fetch has succeeded. It never changes for a
+    /// zone id, so every later call, on every clone, reads it from here.
+    zone: Arc<Mutex<Option<Zone>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -164,6 +167,7 @@ impl CloudflareClient {
             base_url,
             http,
             rate_limited_until: Arc::new(Mutex::new(None)),
+            zone: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -209,7 +213,17 @@ impl CloudflareClient {
         Ok(resp)
     }
 
+    /// The configured zone. Only the first successful call reaches Cloudflare;
+    /// a failed fetch is not cached, so the next call tries again.
     pub async fn zone(&self) -> Result<Zone, CloudflareError> {
+        if let Some(zone) = self
+            .zone
+            .lock()
+            .expect("cloudflare zone mutex poisoned")
+            .clone()
+        {
+            return Ok(zone);
+        }
         self.check_rate_limit()?;
         let resp = self
             .http
@@ -220,7 +234,9 @@ impl CloudflareClient {
         let resp = self.guard_rate_limit(resp)?.error_for_status()?;
 
         let response = resp.json::<ZoneResponse>().await?;
-        response.result_if_success()
+        let zone = response.result_if_success()?;
+        *self.zone.lock().expect("cloudflare zone mutex poisoned") = Some(zone.clone());
+        Ok(zone)
     }
 
     pub async fn find_record_by_name(
@@ -480,6 +496,43 @@ mod tests {
                 comment: Some("docktornet:m1/app".to_string()),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn zone_retries_a_failed_fetch_and_then_serves_the_cached_zone() {
+        let mut server = Server::new_async().await;
+        let failing = server
+            .mock("GET", "/zones/z")
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "t".to_string(),
+                zone_id: "z".to_string(),
+            },
+            server.url(),
+        );
+
+        client.zone().await.unwrap_err();
+        failing.assert_async().await;
+        failing.remove_async().await;
+
+        let working = server
+            .mock("GET", "/zones/z")
+            .with_status(200)
+            .with_body(r#"{"success":true,"result":{"id":"z","name":"example.com"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let expected = Zone {
+            id: "z".to_string(),
+            name: "example.com".to_string(),
+        };
+        assert_eq!(client.zone().await.unwrap(), expected);
+        assert_eq!(client.clone().zone().await.unwrap(), expected);
+        working.assert_async().await;
     }
 
     #[tokio::test]

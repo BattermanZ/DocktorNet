@@ -99,6 +99,18 @@ pub struct ResyncReport {
     pub failed: usize,
 }
 
+impl ResyncReport {
+    /// Count one resource the resync reached without error: `repaired` when
+    /// it wrote to it, `verified` when it left it alone.
+    fn count(&mut self, repaired: bool) {
+        if repaired {
+            self.repaired += 1;
+        } else {
+            self.verified += 1;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReconcileOptions {
     pub dry_run: bool,
@@ -656,37 +668,33 @@ impl Reconciler {
 
             if !skip_npm {
                 for host in &parsed.npm {
-                    if let Err(err) = self
+                    match self
                         .resync_npm_host(&service_id, host, &forward_host, npm_ctx.as_ref())
                         .await
                     {
-                        tracing::warn!(service_id, index = host.index, error = %err, "npm resync failed");
-                        npm_failed = true;
-                        report.failed += 1;
-                    } else {
-                        report.verified += 1;
+                        Ok(repaired) => report.count(repaired),
+                        Err(err) => {
+                            tracing::warn!(service_id, index = host.index, error = %err, "npm resync failed");
+                            npm_failed = true;
+                            report.failed += 1;
+                        }
                     }
                 }
             }
 
             if let Some(dns) = &parsed.cf_dns {
-                if let Err(err) = self.resync_cloudflare(&service_id, dns).await {
-                    tracing::warn!(service_id, error = %err, "cloudflare resync failed");
-                    report.failed += 1;
-                } else {
-                    report.verified += 1;
+                match self.resync_cloudflare(&service_id, dns).await {
+                    Ok(repaired) => report.count(repaired),
+                    Err(err) => {
+                        tracing::warn!(service_id, error = %err, "cloudflare resync failed");
+                        report.failed += 1;
+                    }
                 }
             }
 
             if !parsed.gatus.is_empty() {
                 match self.resync_gatus(&service_id, &parsed.gatus).await {
-                    Ok(rewrote) => {
-                        if rewrote {
-                            report.repaired += 1
-                        } else {
-                            report.verified += 1
-                        }
-                    }
+                    Ok(repaired) => report.count(repaired),
                     Err(err) => {
                         tracing::warn!(service_id, error = %err, "gatus resync failed");
                         report.failed += 1;
@@ -1139,18 +1147,18 @@ impl Reconciler {
         host: &docktornet_core::labels::NpmHost,
         forward_host: &str,
         npm_ctx: Option<&(String, Vec<crate::integrations::npm::Certificate>)>,
-    ) -> Result<(), ReconcileError> {
+    ) -> Result<bool, ReconcileError> {
         let Some(client) = &self.npm else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(npm_id) =
             crate::storage::get_npm_host(&self.db, service_id, host.index.into()).await?
         else {
-            return Ok(());
+            return Ok(false);
         };
         if self.options.dry_run {
             tracing::debug!(service_id, npm_id, "dry-run: would verify npm host");
-            return Ok(());
+            return Ok(false);
         }
         let Some((token, certs)) = npm_ctx else {
             return Err(ReconcileError::External(anyhow::anyhow!(
@@ -1195,42 +1203,39 @@ impl Reconciler {
                     .map_err(|e| ReconcileError::External(e.into()))?;
                 crate::storage::set_npm_host(&self.db, service_id, host.index.into(), created.id)
                     .await?;
+                Ok(true)
             }
-            // NPM reports a host without a certificate as certificate_id 0.
-            Some(found)
-                if found.certificate_id.unwrap_or_default() != payload.certificate_id
-                    || !found.marker_matches(&payload) =>
-            {
+            Some(found) if !found.matches_payload(&payload) => {
                 tracing::info!(
                     service_id,
                     npm_id,
                     ?desired_cert,
-                    "npm cert or ownership marker drifted, updating"
+                    "npm host drifted, updating"
                 );
                 client
                     .update_proxy_host(token, npm_id, &payload.merged_with_meta(&found.meta))
                     .await
                     .map_err(|e| ReconcileError::External(e.into()))?;
+                Ok(true)
             }
-            Some(_) => {}
+            Some(_) => Ok(false),
         }
-        Ok(())
     }
 
     async fn resync_cloudflare(
         &self,
         service_id: &str,
         dns: &docktornet_core::labels::CloudflareDns,
-    ) -> Result<(), ReconcileError> {
+    ) -> Result<bool, ReconcileError> {
         let Some(client) = &self.cloudflare else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(record_id) = crate::storage::get_cf_dns_record(&self.db, service_id).await? else {
-            return Ok(());
+            return Ok(false);
         };
         if self.options.dry_run {
             tracing::debug!(service_id, record_id = %record_id, "dry-run: would verify cf record");
-            return Ok(());
+            return Ok(false);
         }
 
         let zone = client
@@ -1251,6 +1256,7 @@ impl Reconciler {
                     .await
                     .map_err(|e| ReconcileError::External(e.into()))?;
                 crate::storage::set_cf_dns_record(&self.db, service_id, &created.id).await?;
+                Ok(true)
             }
             Some(found) if !cf_record_matches(&found, &payload) => {
                 tracing::info!(service_id, "cf record drifted, updating");
@@ -1258,10 +1264,10 @@ impl Reconciler {
                     .update_record(&record_id, &payload)
                     .await
                     .map_err(|e| ReconcileError::External(e.into()))?;
+                Ok(true)
             }
-            Some(_) => {}
+            Some(_) => Ok(false),
         }
-        Ok(())
     }
 
     async fn resync_gatus(
@@ -5070,7 +5076,8 @@ mod tests {
     }
 
     /// NPM's stored state for host 50 serving `a.example.com` exactly as
-    /// `npm_host_labels` asks, with `meta` as given.
+    /// `npm_host_labels` asks, with `meta` as given. `certificate_id` 0 is how
+    /// NPM stores a host with no certificate.
     fn stored_host_50(meta: serde_json::Value) -> String {
         serde_json::json!({
             "id": 50, "domain_names": ["a.example.com"], "forward_scheme": "http",
@@ -5189,6 +5196,112 @@ mod tests {
         update.assert_async().await;
     }
 
+    /// A reconciler over `m1/app` serving `host` as NPM host 50, with NPM
+    /// answering `stored` for that host and expecting `puts` updates.
+    async fn npm_resync_fixture(
+        dir: &std::path::Path,
+        host: &str,
+        stored: String,
+        puts: usize,
+    ) -> (Reconciler, mockito::ServerGuard, mockito::Mock) {
+        let pool = db::connect(&dir.join("t.db")).await.unwrap();
+        let mut npm_server = npm_server_with_auth().await;
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(stored)
+            .create_async()
+            .await;
+        let update = npm_server
+            .mock("PUT", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(r#"{"id":50,"domain_names":["a.example.com"]}"#)
+            .expect(puts)
+            .create_async()
+            .await;
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir,
+            &npm_server.url(),
+            &npm_server.url(),
+            false,
+            false,
+        );
+        let snap = snap_with(npm_host_labels(host));
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+        (reconciler, npm_server, update)
+    }
+
+    #[tokio::test]
+    async fn full_resync_repairs_drifted_npm_forward_port() {
+        let dir = tempdir().unwrap();
+        let mut stored: serde_json::Value = serde_json::from_str(&stored_host_50(
+            serde_json::json!({"docktornet": app_marker()}),
+        ))
+        .unwrap();
+        stored["forward_port"] = 9999.into();
+        let (reconciler, _npm_server, update) =
+            npm_resync_fixture(dir.path(), "a.example.com", stored.to_string(), 1).await;
+
+        let report = reconciler.full_resync().await.unwrap();
+
+        update.assert_async().await;
+        assert_eq!(
+            report,
+            ResyncReport {
+                verified: 0,
+                repaired: 1,
+                failed: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn full_resync_leaves_npm_host_in_sync_alone() {
+        let dir = tempdir().unwrap();
+        let stored = stored_host_50(serde_json::json!({"docktornet": app_marker()}));
+        let (reconciler, _npm_server, update) =
+            npm_resync_fixture(dir.path(), "a.example.com", stored, 0).await;
+
+        let report = reconciler.full_resync().await.unwrap();
+
+        update.assert_async().await;
+        assert_eq!(
+            report,
+            ResyncReport {
+                verified: 1,
+                repaired: 0,
+                failed: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn full_resync_ignores_npm_sorting_the_domain_names() {
+        let dir = tempdir().unwrap();
+        // NPM sorts domain_names on every write, whatever order the labels use.
+        let mut stored: serde_json::Value = serde_json::from_str(&stored_host_50(
+            serde_json::json!({"docktornet": app_marker()}),
+        ))
+        .unwrap();
+        stored["domain_names"] = serde_json::json!(["a.example.com", "b.example.com"]);
+        let (reconciler, _npm_server, update) = npm_resync_fixture(
+            dir.path(),
+            "b.example.com,a.example.com",
+            stored.to_string(),
+            0,
+        )
+        .await;
+
+        let report = reconciler.full_resync().await.unwrap();
+
+        update.assert_async().await;
+        assert_eq!(report.verified, 1);
+    }
+
     #[tokio::test]
     async fn full_resync_writes_missing_npm_marker_once() {
         let dir = tempdir().unwrap();
@@ -5229,9 +5342,16 @@ mod tests {
         storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
 
         let first = reconciler.full_resync().await.unwrap();
-        assert_eq!(first.failed, 0);
         unmarked.assert_async().await;
         update.assert_async().await;
+        assert_eq!(
+            first,
+            ResyncReport {
+                verified: 0,
+                repaired: 1,
+                failed: 0
+            }
+        );
 
         // NPM now holds the marker, and the second resync leaves it alone.
         unmarked.remove_async().await;
@@ -5245,8 +5365,63 @@ mod tests {
             .create_async()
             .await;
         let second = reconciler.full_resync().await.unwrap();
-        assert_eq!(second.failed, 0);
         update.assert_async().await;
+        assert_eq!(
+            second,
+            ResyncReport {
+                verified: 1,
+                repaired: 0,
+                failed: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn full_resync_counts_a_recreated_npm_host_as_repaired() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut npm_server = npm_server_with_auth().await;
+        npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(404)
+            .create_async()
+            .await;
+        let create = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body(r#"{"id":51,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &npm_server.url(),
+            &npm_server.url(),
+            false,
+            false,
+        );
+        let snap = snap_with(npm_host_labels("a.example.com"));
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+
+        let report = reconciler.full_resync().await.unwrap();
+
+        create.assert_async().await;
+        assert_eq!(
+            report,
+            ResyncReport {
+                verified: 0,
+                repaired: 1,
+                failed: 0
+            }
+        );
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
+            Some(51)
+        );
     }
 
     #[tokio::test]
@@ -5661,9 +5836,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(reconciler.full_resync().await.unwrap().failed, 0);
+        let first = reconciler.full_resync().await.unwrap();
         unmarked.assert_async().await;
         update.assert_async().await;
+        assert_eq!(
+            first,
+            ResyncReport {
+                verified: 0,
+                repaired: 1,
+                failed: 0
+            }
+        );
 
         unmarked.remove_async().await;
         cf_server
@@ -5672,8 +5855,183 @@ mod tests {
             .with_body(cf_one(cf_record("rec-1", Some("docktornet:m1/app"))))
             .create_async()
             .await;
-        assert_eq!(reconciler.full_resync().await.unwrap().failed, 0);
+        let second = reconciler.full_resync().await.unwrap();
         update.assert_async().await;
+        assert_eq!(
+            second,
+            ResyncReport {
+                verified: 1,
+                repaired: 0,
+                failed: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn full_resync_counts_a_recreated_cf_record_as_repaired() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut cf_server = cf_server_with_zone().await;
+        cf_server
+            .mock("GET", "/zones/z/dns_records/rec-1")
+            .with_status(404)
+            .create_async()
+            .await;
+        let create = cf_server
+            .mock("POST", "/zones/z/dns_records")
+            .with_status(200)
+            .with_body(cf_one(cf_record("rec-2", Some("docktornet:m1/app"))))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &cf_server.url(),
+            &cf_server.url(),
+            false,
+            false,
+        );
+        let snap = snap_with(cf_dns_labels("app", "home.example.com"));
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
+        storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
+            .await
+            .unwrap();
+
+        let report = reconciler.full_resync().await.unwrap();
+
+        create.assert_async().await;
+        assert_eq!(
+            report,
+            ResyncReport {
+                verified: 0,
+                repaired: 1,
+                failed: 0
+            }
+        );
+    }
+
+    /// A snapshot of `m1/app` and `m1/web`, each asking for a Cloudflare record.
+    fn two_cf_services_snap() -> Snapshot {
+        let mut snap = snap_with(cf_dns_labels("app", "home.example.com"));
+        snap.containers.push(ContainerEntry {
+            name: "web".into(),
+            labels: cf_dns_labels("web", "home.example.com"),
+        });
+        snap
+    }
+
+    /// The Cloudflare record `id` for service `m1/<name>`, as its labels want it.
+    fn cf_service_record(id: &str, name: &str) -> String {
+        cf_one(serde_json::json!({
+            "id": id, "name": format!("{name}.example.com"), "content": "home.example.com",
+            "proxied": false, "comment": format!("docktornet:m1/{name}")
+        }))
+    }
+
+    /// A Cloudflare mock holding `rec-app` and `rec-web` as
+    /// `two_cf_services_snap` wants them, and expecting one zone fetch.
+    async fn cf_server_with_two_records() -> (mockito::ServerGuard, mockito::Mock) {
+        let mut cf_server = mockito::Server::new_async().await;
+        let zone = cf_server
+            .mock("GET", "/zones/z")
+            .with_status(200)
+            .with_body(r#"{"success":true,"result":{"id":"z","name":"example.com"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        for name in ["app", "web"] {
+            cf_server
+                .mock("GET", format!("/zones/z/dns_records/rec-{name}").as_str())
+                .with_status(200)
+                .with_body(cf_service_record(&format!("rec-{name}"), name))
+                .create_async()
+                .await;
+        }
+        (cf_server, zone)
+    }
+
+    #[tokio::test]
+    async fn full_resync_fetches_the_cf_zone_once_for_two_services() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let (cf_server, zone) = cf_server_with_two_records().await;
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &cf_server.url(),
+            &cf_server.url(),
+            false,
+            false,
+        );
+        let snap = two_cf_services_snap();
+        storage::upsert_snapshot(&pool, &snap, snap.taken_at as i64)
+            .await
+            .unwrap();
+        for name in ["app", "web"] {
+            storage::set_cf_dns_record(&pool, &format!("m1/{name}"), &format!("rec-{name}"))
+                .await
+                .unwrap();
+        }
+
+        let report = reconciler.full_resync().await.unwrap();
+
+        zone.assert_async().await;
+        assert_eq!(
+            report,
+            ResyncReport {
+                verified: 2,
+                repaired: 0,
+                failed: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cf_apply_then_resync_fetches_the_zone_once() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let (mut cf_server, zone) = cf_server_with_two_records().await;
+        cf_server
+            .mock("GET", "/zones/z/dns_records")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(cf_list(serde_json::json!([])))
+            .create_async()
+            .await;
+        for name in ["app", "web"] {
+            cf_server
+                .mock("POST", "/zones/z/dns_records")
+                .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                    "name": format!("{name}.example.com")
+                })))
+                .with_status(200)
+                .with_body(cf_service_record(&format!("rec-{name}"), name))
+                .expect(1)
+                .create_async()
+                .await;
+        }
+        let reconciler = reconciler_for(
+            pool.clone(),
+            dir.path(),
+            &cf_server.url(),
+            &cf_server.url(),
+            false,
+            false,
+        );
+
+        reconciler
+            .reconcile_snapshot(&two_cf_services_snap())
+            .await
+            .unwrap();
+        let report = reconciler.full_resync().await.unwrap();
+
+        zone.assert_async().await;
+        assert_eq!(report.verified, 2);
+        assert_eq!(report.failed, 0);
     }
 
     /// `m1/app` with NPM host 50, Cloudflare record `rec-1` and a Gatus monitor.

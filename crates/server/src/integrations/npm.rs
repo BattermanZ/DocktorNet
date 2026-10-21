@@ -135,9 +135,10 @@ impl ProxyHost {
     /// to a constant (caching) can't drift, so skipping them avoids false
     /// mismatches from NPM normalizing its response. Of `meta`, only the
     /// ownership marker is compared, so NPM's own keys never count as drift.
+    /// NPM sorts `domain_names` on every write, so their order is not compared.
     pub fn matches_payload(&self, payload: &ProxyHostPayload) -> bool {
         self.certificate_id.unwrap_or_default() == payload.certificate_id
-            && self.domain_names == payload.domain_names
+            && sorted(&self.domain_names) == sorted(&payload.domain_names)
             && self.forward_scheme == payload.forward_scheme
             && self.forward_host == payload.forward_host
             && self.forward_port == payload.forward_port
@@ -151,21 +152,34 @@ impl ProxyHost {
     }
 
     /// True when the host's ownership marker is the one `payload` carries.
-    pub fn marker_matches(&self, payload: &ProxyHostPayload) -> bool {
+    fn marker_matches(&self, payload: &ProxyHostPayload) -> bool {
         self.meta.get(MARKER_KEY) == payload.meta.get(MARKER_KEY)
     }
 }
 
+fn sorted(names: &[String]) -> Vec<&str> {
+    let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    names
+}
+
 /// NPM serializes boolean columns as integers (0/1) in some versions and as
-/// JSON booleans in others; accept either.
+/// JSON booleans in others; accept either, plus their string spellings, and
+/// read `null` as `false`. Anything else is an error: reading it as
+/// `false` would hide drift or rewrite the host on every pass.
 fn de_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     match Value::deserialize(deserializer)? {
         Value::Bool(b) => Ok(b),
-        Value::Number(n) => Ok(n.as_i64().unwrap_or(0) != 0),
-        _ => Ok(false),
+        Value::Number(n) => Ok(n.as_f64().is_some_and(|f| f != 0.0)),
+        Value::String(s) if s == "true" || s == "1" => Ok(true),
+        Value::String(s) if s == "false" || s == "0" => Ok(false),
+        Value::Null => Ok(false),
+        other => Err(serde::de::Error::custom(format!(
+            "expected an NPM boolean, got {other}"
+        ))),
     }
 }
 
@@ -492,6 +506,56 @@ mod tests {
     use docktornet_core::labels::{NpmHost, NpmScheme};
     use mockito::Server;
     use url::Url;
+
+    fn ssl_forced_from(value: serde_json::Value) -> Result<bool, serde_json::Error> {
+        serde_json::from_value::<ProxyHost>(serde_json::json!({"id": 1, "ssl_forced": value}))
+            .map(|host| host.ssl_forced)
+    }
+
+    #[test]
+    fn proxy_host_reads_every_true_spelling_as_true() {
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!(1),
+            serde_json::json!(1.0),
+            serde_json::json!("true"),
+            serde_json::json!("1"),
+        ] {
+            assert!(ssl_forced_from(value.clone()).unwrap(), "{value}");
+        }
+    }
+
+    #[test]
+    fn proxy_host_reads_every_false_spelling_and_null_as_false() {
+        for value in [
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!(0.0),
+            serde_json::json!("false"),
+            serde_json::json!("0"),
+            serde_json::Value::Null,
+        ] {
+            assert!(!ssl_forced_from(value.clone()).unwrap(), "{value}");
+        }
+    }
+
+    #[test]
+    fn proxy_host_rejects_a_boolean_it_cannot_read() {
+        for value in [
+            serde_json::json!("yes"),
+            serde_json::json!(""),
+            serde_json::json!([true]),
+            serde_json::json!({"value": true}),
+        ] {
+            assert!(ssl_forced_from(value.clone()).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn proxy_host_without_a_boolean_field_defaults_it_to_false() {
+        let host: ProxyHost = serde_json::from_value(serde_json::json!({"id": 1})).unwrap();
+        assert!(!host.ssl_forced);
+    }
 
     fn host() -> NpmHost {
         NpmHost {

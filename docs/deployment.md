@@ -78,7 +78,8 @@ by [ADR 0001](adr/0001-ownership-markers.md).
 > upgrade, which runs at startup, finds every mapped proxy host and DNS record
 > without a marker and updates each one once. Every proxy host update makes NPM
 > reload nginx, so expect one reload per proxy host on that pass. Later resyncs
-> leave marked resources alone.
+> update a resource only when a field Docktornet sets, the marker included,
+> has drifted.
 
 ## Auditing ownership
 
