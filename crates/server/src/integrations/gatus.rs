@@ -160,16 +160,50 @@ pub fn is_managed_service_file(path: &std::path::Path) -> bool {
     }
 }
 
+/// Removes a service's file.  Returns whether a file was deleted, so the caller
+/// knows to [`touch_reload_trigger`].
 pub async fn remove_service_file(
     config_dir: impl AsRef<std::path::Path>,
     service_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let target = service_file_path(config_dir, service_id);
     match tokio::fs::remove_file(&target).await {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err.into()),
     }
+}
+
+/// A docktornet-owned file in the Gatus config directory whose only job is to
+/// make Gatus reload.  Its name has no `--{hash}` suffix, so the orphan sweep
+/// never treats it as a service file.
+pub fn reload_trigger_path(config_dir: impl AsRef<std::path::Path>) -> PathBuf {
+    config_dir.as_ref().join("docktornet-reload.yaml")
+}
+
+/// Gatus deep-merges every `.yaml` in the directory, so the trigger is an empty
+/// mapping: it parses and adds nothing.
+const RELOAD_TRIGGER_YAML: &str =
+    "# Rewritten by docktornet after it deletes a service file, so Gatus reloads.\n{}\n";
+
+/// Make Gatus reload after service files were deleted.  Gatus reloads when a
+/// `.yaml` file's mtime, in whole seconds, is newer than its last load, and a
+/// deletion leaves no such file.  The mtime is set one second ahead so a touch
+/// in the same second as Gatus's last load still counts; Gatus sleeps a second
+/// inside its reload, so the next load is never older than the trigger.
+pub async fn touch_reload_trigger(config_dir: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
+    let target = reload_trigger_path(config_dir);
+    let tmp = service_temp_file_path(&target);
+    tokio::fs::write(&tmp, RELOAD_TRIGGER_YAML).await?;
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)
+        .await?
+        .into_std()
+        .await
+        .set_modified(SystemTime::now() + std::time::Duration::from_secs(1))?;
+    tokio::fs::rename(&tmp, &target).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -280,6 +314,51 @@ mod tests {
 
         remove_service_file(dir.path(), "m1/app").await.unwrap();
         remove_service_file(dir.path(), "m1/app").await.unwrap();
+    }
+
+    #[test]
+    fn reload_trigger_is_not_a_managed_service_file() {
+        let dir = tempdir().unwrap();
+        assert!(!is_managed_service_file(&reload_trigger_path(dir.path())));
+    }
+
+    #[tokio::test]
+    async fn reload_trigger_lands_in_a_later_second_than_the_touch() {
+        // Gatus reloads only when a file's whole-second mtime is newer than its
+        // last load, so a touch in the same second as that load must still count.
+        let dir = tempdir().unwrap();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        touch_reload_trigger(dir.path()).await.unwrap();
+
+        let mtime = std::fs::metadata(reload_trigger_path(dir.path()))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            mtime > before,
+            "mtime {mtime} must be after second {before}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_trigger_merges_into_gatus_config_as_a_no_op() {
+        // Gatus deep-merges every .yaml in the directory; the trigger must parse
+        // and contribute no keys.
+        let dir = tempdir().unwrap();
+        touch_reload_trigger(dir.path()).await.unwrap();
+
+        let body = std::fs::read_to_string(reload_trigger_path(dir.path())).unwrap();
+        let parsed: serde_yaml::Mapping = serde_yaml::from_str(&body).unwrap();
+        assert!(parsed.is_empty());
+        // No temp file is left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

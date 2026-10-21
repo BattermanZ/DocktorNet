@@ -60,8 +60,9 @@ When a service disappears from an agent snapshot, Docktornet preserves its
 managed NPM proxy hosts, Cloudflare DNS record, and Gatus configuration for a
 five-minute restart grace period. If the service returns, its stored external
 resource mappings are restored. If it remains absent, Docktornet removes the
-owned resources; failed external deletions are persisted and retried during
-full resync.
+owned resources within about a minute of the grace period ending; failed
+external deletions are persisted and retried on that same minute timer. Gatus
+picks up a removed monitor on its next config check, every 30 seconds.
 
 ## Quick start (local dev)
 

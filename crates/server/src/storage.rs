@@ -230,7 +230,7 @@ pub async fn get_npm_hosts_for_services(
 }
 
 /// Record an NPM proxy host whose service has left a snapshot but whose grace
-/// period has not yet elapsed, so it can be pruned later by the resync sweep.
+/// period has not yet elapsed, so it can be pruned later by the pending-removal sweep.
 pub async fn add_pending_npm_removal(
     pool: &Pool<Sqlite>,
     service_id: &str,
@@ -344,7 +344,7 @@ pub async fn get_cf_records_for_services(
 
 /// Record a Cloudflare DNS record whose service has left a snapshot but whose
 /// grace period has not yet elapsed (or whose deletion failed), so it can be
-/// deleted later by the resync sweep.
+/// deleted later by the pending-removal sweep.
 pub async fn add_pending_cf_removal(
     pool: &Pool<Sqlite>,
     service_id: &str,
@@ -395,6 +395,43 @@ pub async fn get_pending_cf_removal(
 
 pub async fn delete_pending_cf_removal(pool: &Pool<Sqlite>, service_id: &str) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM pending_cf_removals WHERE service_id = ?")
+        .bind(service_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Record when a service whose Gatus file is kept through the grace period left
+/// its snapshot, in server time, so the pending-removal sweep knows when the
+/// grace period ends.
+pub async fn add_pending_gatus_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    left_at: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO pending_gatus_removals (service_id, left_at)
+           VALUES (?, ?)
+           ON CONFLICT(service_id) DO UPDATE SET left_at = excluded.left_at"#,
+    )
+    .bind(service_id)
+    .bind(left_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_pending_gatus_removals(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, i64)>> {
+    sqlx::query_as("SELECT service_id, left_at FROM pending_gatus_removals ORDER BY service_id")
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn delete_pending_gatus_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM pending_gatus_removals WHERE service_id = ?")
         .bind(service_id)
         .execute(pool)
         .await?;
@@ -994,6 +1031,25 @@ mod tests {
         assert_eq!(
             list_pending_cf_removals(&p).await.unwrap(),
             vec![("m1/b".to_string(), "rec-b".to_string(), 150)]
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_gatus_removals_round_trip() {
+        let p = pool().await;
+        add_pending_gatus_removal(&p, "m1/b", 150).await.unwrap();
+        add_pending_gatus_removal(&p, "m1/a", 100).await.unwrap();
+        // Leaving again moves left_at rather than erroring.
+        add_pending_gatus_removal(&p, "m1/a", 200).await.unwrap();
+        assert_eq!(
+            list_pending_gatus_removals(&p).await.unwrap(),
+            vec![("m1/a".to_string(), 200), ("m1/b".to_string(), 150)]
+        );
+
+        delete_pending_gatus_removal(&p, "m1/a").await.unwrap();
+        assert_eq!(
+            list_pending_gatus_removals(&p).await.unwrap(),
+            vec![("m1/b".to_string(), 150)]
         );
     }
 }

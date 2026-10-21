@@ -28,7 +28,7 @@ Give `DOCKTORNET_DB_PATH` as an absolute path on the `./data:/data` volume. A re
 | `DOCKTORNET_SECRET` | required | required |
 | `DOCKTORNET_DB_PATH` | required, absolute: `/data/docktornet.db` in the container | — |
 | `DOCKTORNET_GATUS_CONFIG_DIR` | required | — |
-| `DOCKTORNET_FULL_RESYNC_INTERVAL` | optional (`1h`) | — |
+| `DOCKTORNET_FULL_RESYNC_INTERVAL` | optional (`1h`); the first full resync runs at startup | — |
 | `DOCKTORNET_DRY_RUN` | optional (`true`) | — |
 | `DOCKTORNET_ADOPT_EXISTING` | optional (`false`) | — |
 | `DOCKTORNET_NPM_*` | required | — |

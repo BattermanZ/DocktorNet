@@ -90,17 +90,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     info!(listen = %cfg.listen, "server ready");
 
-    let resync_interval = cfg.full_resync_interval;
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(resync_interval);
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            if let Err(err) = reconciler_for_resync.full_resync().await {
-                tracing::warn!(error = %err, "full resync failed; will retry next cycle");
-            }
-        }
-    });
+    docktornet_server::background::spawn(reconciler_for_resync, cfg.full_resync_interval);
 
     axum::serve(
         listener,

@@ -104,9 +104,21 @@ pub enum ReconcileError {
 /// Gatus files for containers that temporarily disappear from a snapshot (e.g.
 /// during a restart) are kept for this many seconds before being deleted.  This
 /// prevents Gatus from resetting alert state and skipping recovery notifications.
-/// Truly-removed services that fall within the grace window are cleaned up by the
-/// periodic orphan sweep in `full_resync`.
+/// A file kept through the grace window is a pending removal, deleted by
+/// `sweep_pending_removals` (every minute) once the window ends.
 const GATUS_REMOVAL_GRACE_SECS: i64 = 300;
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(i64::MAX)
+}
+
+/// Whether a pending removal last seen at `last_seen` has outlived the grace period.
+fn past_grace(last_seen: i64, now: i64) -> bool {
+    now.saturating_sub(last_seen) >= GATUS_REMOVAL_GRACE_SECS
+}
 
 fn cf_record_matches(
     found: &crate::integrations::cloudflare::DnsRecord,
@@ -436,7 +448,6 @@ impl Reconciler {
     pub async fn full_resync(&self) -> Result<ResyncReport, ReconcileError> {
         let _guard = self.lock.lock().await;
         let mut report = ResyncReport::default();
-        let mut expected_gatus_files = std::collections::HashSet::new();
 
         let services = crate::storage::list_all_services(&self.db).await?;
 
@@ -509,21 +520,13 @@ impl Reconciler {
                         report.failed += 1;
                     }
                 }
-                expected_gatus_files.insert(crate::integrations::gatus::service_file_path(
-                    &self.options.gatus_config_dir,
-                    &service_id,
-                ));
             }
         }
 
-        // Remove gatus files that are no longer backed by a DB service.  These
-        // are left behind when reconcile_snapshot skips deletion due to the
-        // grace period (see GATUS_REMOVAL_GRACE_SECS).
         if !self.options.dry_run {
-            self.sweep_orphan_gatus_files(&expected_gatus_files).await;
-            self.sweep_pending_npm_removals(npm_ctx.as_ref(), &mut report)
+            let expected = self.expected_gatus_files().await?;
+            self.sweep_removals(&expected, npm_ctx.as_ref(), &mut report)
                 .await;
-            self.sweep_pending_cf_removals(&mut report).await;
         }
 
         tracing::info!(
@@ -533,6 +536,105 @@ impl Reconciler {
             "full resync complete"
         );
         Ok(report)
+    }
+
+    /// Delete what services that left their snapshot still own once their grace
+    /// period is over: Gatus files kept through it, then pending NPM and
+    /// Cloudflare removals.  The server runs this on a short timer so a
+    /// removal lands soon after its grace period ends, rather than on the next
+    /// `full_resync`.  Unlike `full_resync`, it never re-verifies live services.
+    pub async fn sweep_pending_removals(&self) -> Result<ResyncReport, ReconcileError> {
+        let _guard = self.lock.lock().await;
+        let mut report = ResyncReport::default();
+        if self.options.dry_run {
+            return Ok(report);
+        }
+        let expected = self.expected_gatus_files().await?;
+
+        // Only reach NPM when a pending removal is due, and never while the
+        // breaker is open.  Most sweeps have nothing to do.
+        let now = unix_now();
+        let npm_due = self.npm.is_some()
+            && crate::storage::list_pending_npm_removals(&self.db)
+                .await?
+                .iter()
+                .any(|&(_, _, _, last_seen)| past_grace(last_seen, now));
+        let npm_ctx = if npm_due {
+            if self.npm_breaker.is_open(std::time::Instant::now()) {
+                tracing::warn!("npm circuit breaker open; deferring pending npm removals");
+                None
+            } else {
+                match self.fetch_npm_context().await {
+                    Ok(ctx) => Some(ctx),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "pending npm removals skipped: token/cert fetch failed");
+                        self.npm_breaker.record_failure(std::time::Instant::now());
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        let npm_failed = self
+            .sweep_removals(&expected, npm_ctx.as_ref(), &mut report)
+            .await;
+        if npm_ctx.is_some() {
+            if npm_failed {
+                self.npm_breaker.record_failure(std::time::Instant::now());
+            } else {
+                self.npm_breaker.record_success();
+            }
+        }
+
+        if report != ResyncReport::default() {
+            tracing::info!(
+                removed = report.repaired,
+                failed = report.failed,
+                "pending removal sweep complete"
+            );
+        }
+        Ok(report)
+    }
+
+    /// The removal sweeps shared by `full_resync` and `sweep_pending_removals`.
+    /// Returns whether an NPM delete failed, for the caller's breaker.
+    async fn sweep_removals(
+        &self,
+        expected_gatus_files: &std::collections::HashSet<PathBuf>,
+        npm_ctx: Option<&(String, Vec<crate::integrations::npm::Certificate>)>,
+        report: &mut ResyncReport,
+    ) -> bool {
+        // Gatus files no longer backed by a DB service, kept by apply_inner
+        // through the grace period.
+        self.sweep_orphan_gatus_files(expected_gatus_files).await;
+        let npm_failed = self.sweep_pending_npm_removals(npm_ctx, report).await;
+        self.sweep_pending_cf_removals(report).await;
+        npm_failed
+    }
+
+    /// The Gatus file paths of every stored service that has Gatus labels.  A
+    /// managed file outside this set is an orphan.
+    async fn expected_gatus_files(
+        &self,
+    ) -> Result<std::collections::HashSet<PathBuf>, ReconcileError> {
+        let mut expected = std::collections::HashSet::new();
+        for (service_id, labels_json, _) in crate::storage::list_all_services(&self.db).await? {
+            // A row with malformed labels has no intent to keep, as in full_resync.
+            let Ok(raw) =
+                serde_json::from_str::<std::collections::BTreeMap<String, String>>(&labels_json)
+            else {
+                continue;
+            };
+            if !docktornet_core::labels::parse(&raw).gatus.is_empty() {
+                expected.insert(crate::integrations::gatus::service_file_path(
+                    &self.options.gatus_config_dir,
+                    &service_id,
+                ));
+            }
+        }
+        Ok(expected)
     }
 
     async fn sweep_orphan_gatus_files(
@@ -547,6 +649,32 @@ impl Reconciler {
                 return;
             }
         };
+        // Respect the removal grace period.  A container that briefly leaves a
+        // snapshot (e.g. a restart) has its service row cascade-deleted, so it
+        // is no longer "expected", yet apply_inner deliberately keeps its file
+        // and records when it left.  Deleting a still-in-grace file here would
+        // reset alert state — exactly what the grace period exists to prevent.
+        let pending = match crate::storage::list_pending_gatus_removals(&self.db).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(error = %err, "could not list pending gatus removals; skipping orphan sweep");
+                return;
+            }
+        };
+        let mut left_at: HashMap<PathBuf, (String, i64)> = pending
+            .into_iter()
+            .map(|(service_id, left_at)| {
+                (
+                    crate::integrations::gatus::service_file_path(
+                        &self.options.gatus_config_dir,
+                        &service_id,
+                    ),
+                    (service_id, left_at),
+                )
+            })
+            .collect();
+        let now = unix_now();
+        let mut removed_any = false;
         loop {
             match entries.next_entry().await {
                 Ok(Some(entry)) => {
@@ -557,35 +685,39 @@ impl Reconciler {
                     if expected.contains(&path) {
                         continue;
                     }
-                    // Respect the removal grace period.  A container that briefly
-                    // leaves a snapshot (e.g. a restart) has its service row
-                    // cascade-deleted, so it is no longer "expected", yet
-                    // apply_inner deliberately keeps its file during the grace
-                    // window to preserve Gatus alert state.  The file's mtime is
-                    // the last moment its service was present (write_service_file
-                    // rewrites it on every reconcile), so it is a sound proxy for
-                    // last-seen once the service row is gone.  Deleting a
-                    // still-in-grace file here would reset alert state — exactly
-                    // what the grace period exists to prevent.
-                    let within_grace = match entry.metadata().await {
-                        Ok(meta) => meta
-                            .modified()
-                            .ok()
-                            .and_then(|m| m.elapsed().ok())
-                            .is_some_and(|age| age.as_secs() < GATUS_REMOVAL_GRACE_SECS as u64),
-                        Err(_) => false,
+                    let pending = left_at.remove(&path);
+                    let within_grace = match &pending {
+                        Some((_, left_at)) => !past_grace(*left_at, now),
+                        // No record of the departure (a file from before
+                        // pending_gatus_removals existed): fall back to the
+                        // mtime, the last time the file's monitors changed.
+                        None => match entry.metadata().await {
+                            Ok(meta) => meta
+                                .modified()
+                                .ok()
+                                .and_then(|m| m.elapsed().ok())
+                                .is_some_and(|age| age.as_secs() < GATUS_REMOVAL_GRACE_SECS as u64),
+                            Err(_) => false,
+                        },
                     };
                     if within_grace {
                         tracing::debug!(path = %path.display(), "orphan gatus file still within grace period, keeping");
                         continue;
                     }
                     tracing::info!(path = %path.display(), "removing orphan gatus file");
-                    match tokio::fs::remove_file(&path).await {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    let gone = match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {
+                            removed_any = true;
+                            true
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
                         Err(err) => {
                             tracing::warn!(path = %path.display(), error = %err, "failed to remove orphan gatus file");
+                            false
                         }
+                    };
+                    if gone && let Some((service_id, _)) = pending {
+                        self.clear_pending_gatus_removal(&service_id).await;
                     }
                 }
                 Ok(None) => break,
@@ -595,39 +727,61 @@ impl Reconciler {
                 }
             }
         }
+        if removed_any && let Err(err) = self.touch_gatus_reload_trigger().await {
+            tracing::warn!(error = %err, "gatus reload trigger failed");
+        }
+        // Records whose file is already gone, or which belong to a live
+        // service again, have nothing left to wait for once grace has passed.
+        for (_, (service_id, left_at)) in left_at {
+            if past_grace(left_at, now) {
+                self.clear_pending_gatus_removal(&service_id).await;
+            }
+        }
+    }
+
+    async fn clear_pending_gatus_removal(&self, service_id: &str) {
+        if let Err(err) = crate::storage::delete_pending_gatus_removal(&self.db, service_id).await {
+            tracing::warn!(service_id, error = %err, "failed to clear pending gatus removal");
+        }
+    }
+
+    /// Make Gatus reload after this pass deleted one or more service files.
+    async fn touch_gatus_reload_trigger(&self) -> anyhow::Result<()> {
+        crate::integrations::gatus::touch_reload_trigger(&self.options.gatus_config_dir).await?;
+        tracing::info!("gatus service files deleted; reload trigger touched");
+        Ok(())
     }
 
     /// Prune NPM proxy hosts recorded in `pending_npm_removals` once they are
     /// past the grace period.  This is the backstop for removals deferred by
     /// `apply_inner` (within-grace, breaker open, or a failed delete) and for
     /// machines that went offline entirely without a final empty snapshot.
+    /// Returns whether an NPM delete failed.
     async fn sweep_pending_npm_removals(
         &self,
         npm_ctx: Option<&(String, Vec<crate::integrations::npm::Certificate>)>,
         report: &mut ResyncReport,
-    ) {
+    ) -> bool {
         let pending = match crate::storage::list_pending_npm_removals(&self.db).await {
             Ok(p) => p,
             Err(err) => {
                 tracing::warn!(error = %err, "could not list pending npm removals");
-                return;
+                return false;
             }
         };
         if pending.is_empty() {
-            return;
+            return false;
         }
         let Some((token, _)) = npm_ctx else {
             // No NPM access this pass; leave the entries for the next sweep.
-            return;
+            return false;
         };
         let client = self.npm.as_ref().expect("npm_ctx implies npm client");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(i64::MAX);
+        let now = unix_now();
+        let mut npm_failed = false;
 
         for (service_id, npm_index, npm_id, last_seen) in pending {
-            if now.saturating_sub(last_seen) < GATUS_REMOVAL_GRACE_SECS {
+            if !past_grace(last_seen, now) {
                 // Still within grace (a removal that landed just before this
                 // sweep); a later sweep will pick it up.
                 continue;
@@ -649,9 +803,11 @@ impl Reconciler {
                     // Leave the pending row in place so the next sweep retries.
                     tracing::warn!(service_id, npm_id, error = %err, "pending npm host prune failed");
                     report.failed += 1;
+                    npm_failed = true;
                 }
             }
         }
+        npm_failed
     }
 
     /// Delete Cloudflare DNS records recorded in `pending_cf_removals` once they
@@ -673,13 +829,10 @@ impl Reconciler {
             // No Cloudflare access this pass; leave the entries for the next sweep.
             return;
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(i64::MAX);
+        let now = unix_now();
 
         for (service_id, record_id, last_seen) in pending {
-            if now.saturating_sub(last_seen) < GATUS_REMOVAL_GRACE_SECS {
+            if !past_grace(last_seen, now) {
                 // Still within grace (a removal that landed just before this
                 // sweep); a later sweep will pick it up.
                 continue;
@@ -881,6 +1034,8 @@ impl Reconciler {
         // cascade wipes them.
         let npm_hosts = crate::storage::get_npm_hosts_for_services(&self.db, &removed).await?;
         let cf_records = crate::storage::get_cf_records_for_services(&self.db, &removed).await?;
+        self.record_gatus_departures(snap, &current_ids, &removed_last_seen)
+            .await?;
         crate::storage::upsert_snapshot(&self.db, snap).await?;
 
         let mut hosts_by_service: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
@@ -903,6 +1058,42 @@ impl Reconciler {
                 last_seen,
             })
             .collect())
+    }
+
+    /// Keep `pending_gatus_removals` in step with the snapshot: record when each
+    /// service that just left within the grace period did so, and forget the
+    /// departure of any service that is back.  This runs at persist time, before
+    /// `upsert_snapshot` deletes the service rows, so no sweep can ever see a
+    /// kept Gatus file without its departure; the apply runs later, off the lock.
+    async fn record_gatus_departures(
+        &self,
+        snap: &Snapshot,
+        current_ids: &[String],
+        removed_last_seen: &[(String, i64)],
+    ) -> Result<(), ReconcileError> {
+        let now = unix_now();
+        for (service_id, last_seen) in removed_last_seen {
+            let absent_secs = (snap.taken_at as i64).saturating_sub(*last_seen).max(0);
+            if absent_secs < GATUS_REMOVAL_GRACE_SECS {
+                // In server time, backdated by how long the agent saw it gone.
+                crate::storage::add_pending_gatus_removal(
+                    &self.db,
+                    service_id,
+                    now.saturating_sub(absent_secs),
+                )
+                .await?;
+            }
+        }
+        let returned: Vec<String> = crate::storage::list_pending_gatus_removals(&self.db)
+            .await?
+            .into_iter()
+            .map(|(service_id, _)| service_id)
+            .filter(|service_id| current_ids.contains(service_id))
+            .collect();
+        for service_id in returned {
+            crate::storage::delete_pending_gatus_removal(&self.db, &service_id).await?;
+        }
+        Ok(())
     }
 
     /// Apply the external side effects of a snapshot: Gatus config files, NPM
@@ -932,16 +1123,27 @@ impl Reconciler {
             tracing::debug!(machine = %machine, "snapshot unchanged since last successful reconcile; skipping external reconcile");
             return Ok(());
         }
+        // The cached hash describes the machine before these removals.  Drop it
+        // now, so that if this apply fails, a later snapshot bringing the
+        // services back is not skipped as unchanged with their pending
+        // removals still queued for the sweep.
+        if !removed.is_empty() {
+            self.last_reconciled.lock().await.remove(&machine);
+        }
 
         let mut failures = 0usize;
+        let mut gatus_removed = false;
 
         // Write gatus files for all current services before removing any stale
         // ones.  This ensures Gatus never reloads with an active service missing
         // from the config directory.
         for service in &intended {
-            if let Err(err) = self.apply_gatus(service).await {
-                tracing::warn!(service_id = %service.service_id, error = %err, "gatus write failed");
-                failures += 1;
+            match self.apply_gatus(service).await {
+                Ok(removed) => gatus_removed |= removed,
+                Err(err) => {
+                    tracing::warn!(service_id = %service.service_id, error = %err, "gatus write failed");
+                    failures += 1;
+                }
             }
         }
 
@@ -949,22 +1151,25 @@ impl Reconciler {
         // snapshot, but only after a grace period.  Containers that are
         // restarting briefly disappear from the snapshot; deleting their
         // config file causes Gatus to reset alert state so recovery
-        // notifications are never sent.  Files for truly-removed services
-        // that are still within the grace period are cleaned up by
-        // full_resync's orphan sweep.
+        // notifications are never sent.  A file kept through the grace period
+        // is a pending removal: sweep_pending_removals deletes it once the
+        // grace period that persist_inner recorded ends.
         let snap_time = snap.taken_at as i64;
         for rs in &removed {
             let absent_secs = snap_time.saturating_sub(rs.last_seen);
             if absent_secs >= GATUS_REMOVAL_GRACE_SECS {
                 tracing::info!(service_id = %rs.service_id, absent_secs, "service removed");
-                if let Err(err) = crate::integrations::gatus::remove_service_file(
+                match crate::integrations::gatus::remove_service_file(
                     &self.options.gatus_config_dir,
                     &rs.service_id,
                 )
                 .await
                 {
-                    tracing::warn!(service_id = %rs.service_id, error = %err, "gatus removal failed");
-                    failures += 1;
+                    Ok(removed) => gatus_removed |= removed,
+                    Err(err) => {
+                        tracing::warn!(service_id = %rs.service_id, error = %err, "gatus removal failed");
+                        failures += 1;
+                    }
                 }
             } else {
                 tracing::debug!(
@@ -974,6 +1179,10 @@ impl Reconciler {
                     "service absent but within grace period, keeping gatus file"
                 );
             }
+        }
+        if gatus_removed && let Err(err) = self.touch_gatus_reload_trigger().await {
+            tracing::warn!(error = %err, "gatus reload trigger failed");
+            failures += 1;
         }
 
         // Fetch the NPM token + certificate list once for the whole snapshot,
@@ -1010,7 +1219,7 @@ impl Reconciler {
         // container restart should not tear down and recreate the host, which
         // reloads nginx).  Anything we can't delete right now — within grace,
         // breaker open, token unavailable, or a failed API call — is recorded
-        // in pending_npm_removals so the periodic resync sweep retries it.  The
+        // in pending_npm_removals so the pending-removal sweep retries it.  The
         // npm_hosts mapping has already been cascade-deleted, so that table is
         // the only durable record of what to prune.
         for rs in &removed {
@@ -1056,10 +1265,10 @@ impl Reconciler {
         // Past the grace period we delete immediately; within it we defer (a
         // brief container restart should not tear down a live public record).
         // Anything we can't delete right now — within grace, no client, or a
-        // failed API call — is recorded in pending_cf_removals so the periodic
-        // resync sweep retries it.  The cf_dns_records mapping has already been
-        // cascade-deleted, so that table is the only durable record of what to
-        // delete.
+        // failed API call — is recorded in pending_cf_removals so the
+        // pending-removal sweep retries it.  The cf_dns_records mapping has
+        // already been cascade-deleted, so that table is the only durable
+        // record of what to delete.
         for rs in &removed {
             let Some(record_id) = &rs.cf_record else {
                 continue;
@@ -1195,10 +1404,11 @@ impl Reconciler {
     }
 
     /// Write (or remove) the Gatus config file for a single current service.
+    /// Returns whether it deleted the file.
     async fn apply_gatus(
         &self,
         service: &crate::integrations::intended::IntendedService,
-    ) -> Result<(), ReconcileError> {
+    ) -> Result<bool, ReconcileError> {
         if service.labels.gatus.is_empty() {
             // Service still exists but gatus labels were intentionally removed.
             return crate::integrations::gatus::remove_service_file(
@@ -1228,7 +1438,7 @@ impl Reconciler {
             )
             .await?;
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Reconcile (or delete) the Cloudflare DNS record for a single service.
@@ -1719,16 +1929,8 @@ mod tests {
             .unwrap();
         assert!(service_file.exists(), "file should survive grace period");
 
-        // Age the file past the grace period so the orphan sweep is allowed to
-        // remove it (the file's mtime is the sweep's proxy for last-seen).
-        let old = std::time::SystemTime::now()
-            - std::time::Duration::from_secs((GATUS_REMOVAL_GRACE_SECS + 60) as u64);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&service_file)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
+        // Let the grace period recorded for its departure run out.
+        end_grace(&reconciler, "m1/app").await;
 
         // full_resync should sweep the orphan file (service is no longer in DB).
         let report = reconciler.full_resync().await.unwrap();
@@ -1798,6 +2000,609 @@ mod tests {
         assert!(
             service_file.exists(),
             "full_resync must not delete a gatus file that is still within the grace period"
+        );
+    }
+
+    /// Push a snapshot of machine `m1` holding `containers` at `taken_at`.
+    async fn push(reconciler: &Reconciler, taken_at: u64, containers: Vec<ContainerEntry>) {
+        reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at,
+                containers,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn gatus_labels() -> BTreeMap<String, String> {
+        let mut labels = BTreeMap::new();
+        labels.insert("docktornet.gatus.0.url".into(), "https://x".into());
+        labels.insert("docktornet.gatus.0.interval".into(), "30s".into());
+        labels
+    }
+
+    fn set_mtime(path: &std::path::Path, mtime: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    /// Backdate a departure that apply_inner recorded so its grace period is over.
+    async fn end_grace(reconciler: &Reconciler, service_id: &str) {
+        storage::add_pending_gatus_removal(
+            reconciler.pool(),
+            service_id,
+            unix_now() - GATUS_REMOVAL_GRACE_SECS - 60,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn aged_past_grace() -> std::time::SystemTime {
+        std::time::SystemTime::now()
+            - std::time::Duration::from_secs((GATUS_REMOVAL_GRACE_SECS + 60) as u64)
+    }
+
+    #[tokio::test]
+    async fn pending_removal_sweep_removes_gatus_file_without_full_resync() {
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = Reconciler::new(
+            pool,
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: gatus_dir.clone(),
+            },
+        );
+        let app = || ContainerEntry {
+            name: "app".into(),
+            labels: gatus_labels(),
+        };
+
+        // Present at t=1, gone at t=31 (within grace), and still gone after it.
+        push(&reconciler, 1, vec![app()]).await;
+        let service_file = gatus::service_file_path(&gatus_dir, "m1/app");
+        assert!(service_file.exists());
+        push(&reconciler, 31, vec![]).await;
+        assert!(service_file.exists(), "file should survive grace period");
+        push(
+            &reconciler,
+            (31 + GATUS_REMOVAL_GRACE_SECS + 30) as u64,
+            vec![],
+        )
+        .await;
+        assert!(
+            service_file.exists(),
+            "a later snapshot no longer names the service, so it cannot remove the file"
+        );
+
+        // Grace has passed since the service left.
+        end_grace(&reconciler, "m1/app").await;
+        reconciler.sweep_pending_removals().await.unwrap();
+
+        assert!(
+            !service_file.exists(),
+            "the short sweep must remove the gatus file once grace has passed"
+        );
+    }
+
+    /// Create the reload trigger with an old mtime and return that mtime.
+    fn age_reload_trigger(gatus_dir: &std::path::Path) -> std::time::SystemTime {
+        let trigger = gatus::reload_trigger_path(gatus_dir);
+        std::fs::create_dir_all(gatus_dir).unwrap();
+        std::fs::write(&trigger, "{}\n").unwrap();
+        let old = aged_past_grace();
+        set_mtime(&trigger, old);
+        old
+    }
+
+    fn reload_trigger_mtime(gatus_dir: &std::path::Path) -> std::time::SystemTime {
+        std::fs::metadata(gatus::reload_trigger_path(gatus_dir))
+            .unwrap()
+            .modified()
+            .unwrap()
+    }
+
+    fn gatus_reconciler(pool: Db, gatus_dir: &std::path::Path) -> Reconciler {
+        Reconciler::new(
+            pool,
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: gatus_dir.to_path_buf(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn pending_removal_sweep_keeps_long_unchanged_gatus_file_within_grace() {
+        // A stable service's file is only rewritten when its monitors change,
+        // so its mtime can be far older than the grace period.  A restart that
+        // drops it from one snapshot must not cost it its monitor.
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = gatus_reconciler(pool, &gatus_dir);
+        let app = || ContainerEntry {
+            name: "app".into(),
+            labels: gatus_labels(),
+        };
+
+        push(&reconciler, 1, vec![app()]).await;
+        let service_file = gatus::service_file_path(&gatus_dir, "m1/app");
+        set_mtime(&service_file, aged_past_grace());
+        push(&reconciler, 31, vec![]).await;
+
+        reconciler.sweep_pending_removals().await.unwrap();
+        reconciler.full_resync().await.unwrap();
+
+        assert!(
+            service_file.exists(),
+            "a service absent for less than the grace period keeps its gatus file"
+        );
+        assert!(!gatus::reload_trigger_path(&gatus_dir).exists());
+    }
+
+    #[tokio::test]
+    async fn sweep_between_ingest_and_apply_keeps_gatus_file_within_grace() {
+        // The ingest handler persists a snapshot, then applies it later in a
+        // background task.  A sweep that runs in between must already know the
+        // service only just left.
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = gatus_reconciler(pool, &gatus_dir);
+        push(
+            &reconciler,
+            1,
+            vec![ContainerEntry {
+                name: "app".into(),
+                labels: gatus_labels(),
+            }],
+        )
+        .await;
+        let service_file = gatus::service_file_path(&gatus_dir, "m1/app");
+        set_mtime(&service_file, aged_past_grace());
+
+        let gone = Snapshot {
+            machine_id: MachineId::new("m1"),
+            forward_host: "10.0.0.1".into(),
+            taken_at: 31,
+            containers: vec![],
+        };
+        let ticket = reconciler.ingest_snapshot(&gone).await.unwrap();
+        reconciler.sweep_pending_removals().await.unwrap();
+        reconciler.apply_reconcile(&gone, ticket).await.unwrap();
+
+        assert!(
+            service_file.exists(),
+            "a sweep between ingest and apply must respect the grace period"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_returning_after_a_failed_removal_apply_is_reconciled() {
+        // The apply that records a removal fails (NPM is down).  When the
+        // service comes back with the same labels it had, that snapshot must
+        // not be skipped as unchanged, or its pending NPM removal survives and
+        // the sweep deletes a live proxy host.
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let token_ok = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let _get = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body(
+                r#"{"id":50,"domain_names":["a.example.com"],"forward_scheme":"http","forward_host":"10.0.0.1","forward_port":3000,"certificate_id":0,"ssl_forced":false,"http2_support":false,"hsts_enabled":false,"block_exploits":true,"allow_websocket_upgrade":true,"enabled":true}"#,
+            )
+            .create_async()
+            .await;
+        let delete = npm_server
+            .mock("DELETE", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body("{}")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+        let app = || ContainerEntry {
+            name: "app".into(),
+            labels: npm_host_labels("a.example.com"),
+        };
+
+        // Present and reconciled, so its intent hash is cached.
+        storage::upsert_snapshot(
+            &pool,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 1,
+                containers: vec![app()],
+            },
+        )
+        .await
+        .unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+        push(&reconciler, 2, vec![app()]).await;
+
+        // Gone within grace while NPM fails: the apply errors.
+        token_ok.remove_async().await;
+        let token_down = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(500)
+            .create_async()
+            .await;
+        let result = reconciler
+            .reconcile_snapshot(&Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 32,
+                containers: vec![],
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            storage::list_pending_npm_removals(&pool)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Back with the same labels, NPM healthy again.
+        token_down.remove_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .create_async()
+            .await;
+        push(&reconciler, 62, vec![app()]).await;
+
+        assert!(
+            storage::list_pending_npm_removals(&pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the returning service's pending removal must be cleared"
+        );
+        assert_eq!(
+            storage::get_npm_host(&pool, "m1/app", 0).await.unwrap(),
+            Some(50)
+        );
+        reconciler.sweep_pending_removals().await.unwrap();
+        delete.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn removal_past_grace_touches_gatus_reload_trigger() {
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = gatus_reconciler(pool, &gatus_dir);
+        let app = ContainerEntry {
+            name: "app".into(),
+            labels: gatus_labels(),
+        };
+
+        push(&reconciler, 1, vec![app]).await;
+        let before = age_reload_trigger(&gatus_dir);
+        push(
+            &reconciler,
+            (1 + GATUS_REMOVAL_GRACE_SECS + 1) as u64,
+            vec![],
+        )
+        .await;
+
+        assert!(!gatus::service_file_path(&gatus_dir, "m1/app").exists());
+        assert!(reload_trigger_mtime(&gatus_dir) > before);
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_touches_gatus_reload_trigger() {
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = gatus_reconciler(pool, &gatus_dir);
+        let app = ContainerEntry {
+            name: "app".into(),
+            labels: gatus_labels(),
+        };
+
+        push(&reconciler, 1, vec![app]).await;
+        push(&reconciler, 31, vec![]).await;
+        let service_file = gatus::service_file_path(&gatus_dir, "m1/app");
+        end_grace(&reconciler, "m1/app").await;
+        let before = age_reload_trigger(&gatus_dir);
+
+        reconciler.sweep_pending_removals().await.unwrap();
+
+        assert!(!service_file.exists());
+        assert!(reload_trigger_mtime(&gatus_dir) > before);
+        assert!(
+            gatus::reload_trigger_path(&gatus_dir).exists(),
+            "the orphan sweep must never delete the trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_gatus_labels_touches_gatus_reload_trigger() {
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = gatus_reconciler(pool, &gatus_dir);
+
+        let mut labels = gatus_labels();
+        labels.extend(cf_dns_labels("app", "home.example.com"));
+        push(
+            &reconciler,
+            1,
+            vec![ContainerEntry {
+                name: "app".into(),
+                labels,
+            }],
+        )
+        .await;
+        let before = age_reload_trigger(&gatus_dir);
+
+        // Still running, but its Gatus labels are gone.
+        push(
+            &reconciler,
+            31,
+            vec![ContainerEntry {
+                name: "app".into(),
+                labels: cf_dns_labels("app", "home.example.com"),
+            }],
+        )
+        .await;
+
+        assert!(!gatus::service_file_path(&gatus_dir, "m1/app").exists());
+        assert!(reload_trigger_mtime(&gatus_dir) > before);
+    }
+
+    #[tokio::test]
+    async fn pass_without_gatus_deletion_leaves_reload_trigger_alone() {
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = gatus_reconciler(pool, &gatus_dir);
+        let app = || ContainerEntry {
+            name: "app".into(),
+            labels: gatus_labels(),
+        };
+
+        push(&reconciler, 1, vec![app()]).await;
+        // A restart within grace keeps the file, so Gatus has nothing to reload.
+        push(&reconciler, 31, vec![]).await;
+        assert_eq!(
+            storage::list_pending_gatus_removals(reconciler.pool())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        push(&reconciler, 61, vec![app()]).await;
+        reconciler.sweep_pending_removals().await.unwrap();
+
+        assert!(!gatus::reload_trigger_path(&gatus_dir).exists());
+        assert!(
+            storage::list_pending_gatus_removals(reconciler.pool())
+                .await
+                .unwrap()
+                .is_empty(),
+            "a returning service's departure is forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_pending_removal_sweep_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let gatus_dir = dir.path().join("gatus");
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        let reconciler = gatus_reconciler(pool.clone(), &gatus_dir);
+        push(
+            &reconciler,
+            1,
+            vec![ContainerEntry {
+                name: "app".into(),
+                labels: gatus_labels(),
+            }],
+        )
+        .await;
+        push(&reconciler, 31, vec![]).await;
+        let service_file = gatus::service_file_path(&gatus_dir, "m1/app");
+        end_grace(&reconciler, "m1/app").await;
+
+        let dryrun = Reconciler::new(
+            pool,
+            ReconcileOptions {
+                dry_run: true,
+                adopt_existing: false,
+                gatus_config_dir: gatus_dir.clone(),
+            },
+        );
+        dryrun.sweep_pending_removals().await.unwrap();
+
+        assert!(service_file.exists());
+        assert!(!gatus::reload_trigger_path(&gatus_dir).exists());
+    }
+
+    #[tokio::test]
+    async fn pending_removal_sweep_deletes_cf_record_without_full_resync() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut cf_server = mockito::Server::new_async().await;
+        let delete = cf_server
+            .mock("DELETE", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(r#"{"success":true}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients_with_cf(&cf_server.url(), &cf_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+        let app = || ContainerEntry {
+            name: "app".into(),
+            labels: cf_dns_labels("app", "home.example.com"),
+        };
+
+        // Present at t=1, owning a Cloudflare record.
+        storage::upsert_snapshot(
+            &pool,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 1,
+                containers: vec![app()],
+            },
+        )
+        .await
+        .unwrap();
+        storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
+            .await
+            .unwrap();
+        push(&reconciler, 31, vec![]).await;
+        push(
+            &reconciler,
+            (31 + GATUS_REMOVAL_GRACE_SECS + 30) as u64,
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            storage::list_pending_cf_removals(&pool).await.unwrap(),
+            vec![("m1/app".to_string(), "rec-1".to_string(), 1)],
+            "no later snapshot names the service, so the record waits in pending"
+        );
+
+        reconciler.sweep_pending_removals().await.unwrap();
+
+        delete.assert_async().await;
+        assert!(
+            storage::list_pending_cf_removals(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_removal_sweep_prunes_npm_host_without_full_resync() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let delete = npm_server
+            .mock("DELETE", "/api/nginx/proxy-hosts/50")
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+        let app = || ContainerEntry {
+            name: "app".into(),
+            labels: npm_host_labels("a.example.com"),
+        };
+
+        // Present at t=1, owning an NPM proxy host.
+        storage::upsert_snapshot(
+            &pool,
+            &Snapshot {
+                machine_id: MachineId::new("m1"),
+                forward_host: "10.0.0.1".into(),
+                taken_at: 1,
+                containers: vec![app()],
+            },
+        )
+        .await
+        .unwrap();
+        storage::set_npm_host(&pool, "m1/app", 0, 50).await.unwrap();
+        push(&reconciler, 31, vec![]).await;
+        push(
+            &reconciler,
+            (31 + GATUS_REMOVAL_GRACE_SECS + 30) as u64,
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            storage::list_pending_npm_removals(&pool).await.unwrap(),
+            vec![("m1/app".to_string(), 0, 50, 1)],
+            "no later snapshot names the service, so the host waits in pending"
+        );
+
+        reconciler.sweep_pending_removals().await.unwrap();
+
+        delete.assert_async().await;
+        assert!(
+            storage::list_pending_npm_removals(&pool)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
