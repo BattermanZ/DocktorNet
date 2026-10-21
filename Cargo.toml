@@ -28,7 +28,7 @@ tracing          = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # config
 dotenvy          = "0.15"
-humantime-serde  = "1"
+humantime        = "2.4.0"
 url              = "2"
 # crypto
 subtle           = "2"

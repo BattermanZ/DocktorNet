@@ -24,8 +24,7 @@ anyhow      = { workspace = true }
 tracing     = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy     = { workspace = true }
-humantime-serde = { workspace = true }
-humantime   = "2"
+humantime   = { workspace = true }
 axum        = { workspace = true }
 reqwest     = { workspace = true }
 url         = { workspace = true }

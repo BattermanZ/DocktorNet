@@ -9,7 +9,6 @@ use url::Url;
 pub const CLOUDFLARE_API_URL: &str = "https://api.cloudflare.com/client/v4";
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ServerConfig {
     pub listen: String,
     pub secret: Secret,

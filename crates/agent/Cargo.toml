@@ -21,7 +21,7 @@ anyhow      = { workspace = true }
 tracing     = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy     = { workspace = true }
-humantime-serde = { workspace = true }
+humantime   = { workspace = true }
 reqwest     = { workspace = true }
 bollard     = { workspace = true }
 

@@ -2,10 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use docktornet_core::{MachineId, Secret, WeakSecret, validate_shared_secret};
-use serde::Deserialize;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct AgentConfig {
     pub server_url: String,
     pub secret: Secret,
@@ -37,9 +35,6 @@ pub enum ConfigError {
     WeakSecret(#[from] WeakSecret),
 }
 
-#[derive(Debug, Deserialize)]
-struct DurationStr(#[serde(with = "humantime_serde")] Duration);
-
 impl AgentConfig {
     /// Load from the current process environment. Reads (in order):
     ///   DOCKTORNET_SERVER_URL, DOCKTORNET_SECRET, DOCKTORNET_POLL_INTERVAL,
@@ -56,14 +51,13 @@ impl AgentConfig {
         let secret = get("DOCKTORNET_SECRET")?;
         validate_shared_secret(&secret)?;
 
-        let interval_str = get("DOCKTORNET_POLL_INTERVAL")?;
-        let DurationStr(poll_interval) = serde_json::from_value(serde_json::Value::String(
-            interval_str.clone(),
-        ))
-        .map_err(|e| ConfigError::Invalid {
-            var: "DOCKTORNET_POLL_INTERVAL",
-            msg: e.to_string(),
-        })?;
+        let poll_interval =
+            humantime::parse_duration(&get("DOCKTORNET_POLL_INTERVAL")?).map_err(|e| {
+                ConfigError::Invalid {
+                    var: "DOCKTORNET_POLL_INTERVAL",
+                    msg: e.to_string(),
+                }
+            })?;
 
         const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
         if poll_interval < MIN_POLL_INTERVAL {
@@ -252,6 +246,32 @@ mod tests {
     #[test]
     fn zero_poll_interval_errors_with_poll_interval_var() {
         for value in ["0s", "0", "1ms", "999ms"] {
+            let err = AgentConfig::from_iter(env(&[
+                ("DOCKTORNET_SERVER_URL", "u"),
+                ("DOCKTORNET_SECRET", SECRET),
+                ("DOCKTORNET_POLL_INTERVAL", value),
+                ("DOCKTORNET_MACHINE_ID", "m"),
+                ("DOCKTORNET_FORWARD_HOST", "10.0.0.10"),
+                ("DOCKTORNET_SOCKETS", "docker:/x"),
+            ]))
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "DOCKTORNET_POLL_INTERVAL",
+                        ..
+                    }
+                ),
+                "expected Invalid poll-interval error for {value:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unparseable_poll_interval_errors_with_poll_interval_var() {
+        for value in ["", "abc", "30", "5 parsecs", "-1s"] {
             let err = AgentConfig::from_iter(env(&[
                 ("DOCKTORNET_SERVER_URL", "u"),
                 ("DOCKTORNET_SECRET", SECRET),
