@@ -9,6 +9,7 @@ pub mod db;
 pub mod db_location;
 pub mod flapping;
 pub mod handlers;
+pub mod healthcheck;
 pub mod integrations;
 pub mod reconcile;
 pub mod routes;

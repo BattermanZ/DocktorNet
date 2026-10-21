@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use docktornet_core::Snapshot;
 use tokio::sync::Mutex;
@@ -31,6 +31,8 @@ pub struct Reconciler {
     /// pending snapshot, so applies never queue up behind a slow NPM or
     /// Cloudflare, and a stale snapshot is never applied after a newer one.
     applies: Arc<std::sync::Mutex<HashMap<String, MachineApplies>>>,
+    /// How the last full resync ended, for the health endpoint.
+    last_resync: Arc<std::sync::Mutex<Option<LastResync>>>,
     clock: Clock,
 }
 
@@ -190,6 +192,16 @@ impl ResyncReport {
     }
 }
 
+/// How a full resync ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastResync {
+    pub finished_at: SystemTime,
+    /// The counts the pass reached, kept when it returned an error.
+    pub report: ResyncReport,
+    /// The error the pass returned; `None` when it finished.
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReconcileOptions {
     pub dry_run: bool,
@@ -296,6 +308,31 @@ impl Reconciler {
         &self.db
     }
 
+    /// How the last full resync ended, or `None` before the first one does.
+    pub fn last_resync(&self) -> Option<LastResync> {
+        self.last_resync
+            .lock()
+            .expect("last resync mutex poisoned")
+            .clone()
+    }
+
+    /// The wall-clock time the NPM breaker's cooldown ends while it is open,
+    /// or `None` when it is closed.
+    pub fn npm_breaker_open_until(&self) -> Option<SystemTime> {
+        let now = std::time::Instant::now();
+        let until = self.npm_breaker.open_until(now)?;
+        Some(SystemTime::now() + (until - now))
+    }
+
+    /// Open the NPM breaker as a run of failed NPM calls would.
+    #[cfg(test)]
+    pub(crate) fn trip_npm_breaker(&self) {
+        let now = std::time::Instant::now();
+        for _ in 0..NPM_BREAKER_THRESHOLD {
+            self.npm_breaker.record_failure(now);
+        }
+    }
+
     pub fn new(db: Db, options: ReconcileOptions) -> Self {
         Self {
             db,
@@ -309,6 +346,7 @@ impl Reconciler {
             )),
             last_reconciled: Arc::new(Mutex::new(HashMap::new())),
             applies: Arc::default(),
+            last_resync: Arc::default(),
             clock: Clock::default(),
         }
     }
@@ -331,6 +369,7 @@ impl Reconciler {
             )),
             last_reconciled: Arc::new(Mutex::new(HashMap::new())),
             applies: Arc::default(),
+            last_resync: Arc::default(),
             clock: Clock::default(),
         }
     }
@@ -690,9 +729,21 @@ impl Reconciler {
         }
     }
 
+    /// Verify and repair every live service, then sweep removals.  Records how
+    /// the pass ended, error or not, for `last_resync`.
     pub async fn full_resync(&self) -> Result<ResyncReport, ReconcileError> {
-        let _guard = self.lock.lock().await;
         let mut report = ResyncReport::default();
+        let result = self.full_resync_pass(&mut report).await;
+        *self.last_resync.lock().expect("last resync mutex poisoned") = Some(LastResync {
+            finished_at: SystemTime::now(),
+            report: report.clone(),
+            error: result.as_ref().err().map(ToString::to_string),
+        });
+        result.map(|()| report)
+    }
+
+    async fn full_resync_pass(&self, report: &mut ResyncReport) -> Result<(), ReconcileError> {
+        let _guard = self.lock.lock().await;
 
         let services = crate::storage::list_all_services(&self.db).await?;
         // Read before NPM is touched, so a database error can never cut a pass
@@ -784,7 +835,7 @@ impl Reconciler {
 
         if let Some(expected) = &expected_gatus_files {
             npm_failed |= self
-                .sweep_removals(expected, npm_ctx.as_ref(), &mut report)
+                .sweep_removals(expected, npm_ctx.as_ref(), report)
                 .await;
             if let Err(err) = self.refresh_classification_map().await {
                 tracing::warn!(error = %err, "gatus classification map refresh failed");
@@ -806,7 +857,7 @@ impl Reconciler {
             failed = report.failed,
             "full resync complete"
         );
-        Ok(report)
+        Ok(())
     }
 
     /// Delete what services that left their snapshot still own once their grace

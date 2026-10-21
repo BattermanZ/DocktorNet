@@ -184,8 +184,9 @@ transaction. A service that is created or removed while the audit runs can
 still show up in a list, so run it again before acting on a finding.
 
 Running the binary with no argument starts the server as before.
-`docktornet-server backup` is described under [Backups](#backups). Any other
-argument exits 2 with a usage line.
+`docktornet-server backup` is described under [Backups](#backups), and
+`docktornet-server healthcheck` under [Health](#health). Any other argument
+exits 2 with a usage line.
 
 ## Backups
 
@@ -294,6 +295,42 @@ docker compose -f agent.compose.yaml up -d
 ```
 
 For rootless Podman hosts, set `DOCKER_GID` to the gid of the directory containing `podman.sock` (typically the operator's own gid) and adjust the volume path in the compose file.
+
+## Health
+
+The server service in `main-host.compose.yaml` has a compose healthcheck, and
+the agent starts only once the server reports `healthy`. The image is
+distroless, with no shell or curl, so the check runs
+`docktornet-server healthcheck` from the image. It sends `GET /healthz` to the port in
+`DOCKTORNET_LISTEN` on loopback (`0.0.0.0` becomes `127.0.0.1`, `::` becomes
+`::1`, and a specific address is used as is). It exits 0 on HTTP 200 and 1 on
+anything else, giving up after 3 seconds. It reads no other setting and sends
+no token, so a broken NPM or Cloudflare never marks the container unhealthy.
+
+```bash
+docker inspect --format '{{.State.Health.Status}}' docktornet-server
+```
+
+For what the server is doing rather than whether it answers, call `/healthz`
+with the bearer token:
+
+```bash
+curl -s -H "Authorization: Bearer $DOCKTORNET_SECRET" http://127.0.0.1:5363/healthz | jq
+```
+
+Besides `version` and `agents`, the authenticated response carries:
+
+- `last_resync`: `null` until the first full resync finishes, then
+  `finished_at`, `outcome` (`"ok"` or `"error"`) and the `verified`, `repaired`
+  and `failed` counts. A resync that returned an error also has an `error`
+  field with its message.
+- `npm_breaker`: `open`, and `open_until`, the time NPM calls resume, or
+  `null` while the breaker is closed. The breaker opens after three NPM
+  failures in a row and stays open for a minute, during which the server
+  leaves NPM alone.
+
+`status` is `"degraded"` while the NPM breaker is open or when the server
+cannot read its agent list, and `"ok"` otherwise.
 
 ## Filesystem permissions
 

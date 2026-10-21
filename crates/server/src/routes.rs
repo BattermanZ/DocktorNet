@@ -49,10 +49,24 @@ mod tests {
     }
 
     async fn make_app_with_window(window: Duration) -> (Router, crate::db::Db, tempfile::TempDir) {
+        let (state, dir) = make_state(window).await;
+        let pool = state.reconciler.pool().clone();
+        (build(state), pool, dir)
+    }
+
+    /// The app, with a handle on the reconciler behind it.
+    async fn make_app_with_reconciler() -> (Router, Reconciler, tempfile::TempDir) {
+        let (state, dir) = make_state(Duration::from_secs(300)).await;
+        let reconciler = state.reconciler.clone();
+        (build(state), reconciler, dir)
+    }
+
+    /// The app state over a fresh database, before it becomes a router.
+    async fn make_state(window: Duration) -> (AppState, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
         let reconciler = Reconciler::new(
-            pool.clone(),
+            pool,
             ReconcileOptions {
                 dry_run: true,
                 adopt_existing: false,
@@ -65,7 +79,7 @@ mod tests {
             flapping: Arc::new(FlappingTracker::new(window)),
             agent_versions: Arc::new(AgentVersionTracker::new(SERVER_VERSION)),
         };
-        (build(state), pool, dir)
+        (state, dir)
     }
 
     fn body(snap: &Snapshot) -> Body {
@@ -508,11 +522,14 @@ mod tests {
     async fn healthz_hides_agent_inventory_without_auth() {
         // Unauthenticated /healthz must stay a bare liveness probe: 200, but it
         // must NOT leak any agent's machine id or internal forward address.
-        let (app, _pool, _dir) = make_app().await;
+        let (app, reconciler, _dir) = make_app_with_reconciler().await;
 
         // Push a snapshot for machine "m1" (forward_host 10.0.0.10).
         let push = req("POST", Some("s3cret"), &snap());
         app.clone().oneshot(push).await.unwrap();
+        // Neither a finished resync nor an open breaker shows here.
+        reconciler.full_resync().await.unwrap();
+        reconciler.trip_npm_breaker();
 
         // Fetch /healthz WITHOUT any Authorization header.
         let get_req = Request::builder()
@@ -539,5 +556,107 @@ mod tests {
             serde_json::from_slice(&body_bytes).unwrap();
         let keys: Vec<&str> = body.keys().map(String::as_str).collect();
         assert_eq!(keys, ["server_time", "status"], "{body_str}");
+        // Nor does the open breaker turn it degraded.
+        assert_eq!(body["status"], "ok", "{body_str}");
+    }
+
+    /// The body of `/healthz` fetched with the bearer token.
+    async fn authenticated_health(app: Router) -> serde_json::Value {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .header("authorization", "Bearer s3cret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_the_last_full_resync_with_valid_bearer() {
+        let (app, reconciler, _dir) = make_app_with_reconciler().await;
+
+        let body = authenticated_health(app.clone()).await;
+        assert_eq!(
+            body.get("last_resync"),
+            Some(&serde_json::Value::Null),
+            "null before the first resync: {body}"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(req("POST", Some("s3cret"), &snap()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        reconciler.full_resync().await.unwrap();
+
+        let body = authenticated_health(app).await;
+        let last = &body["last_resync"];
+        assert_eq!(last["outcome"], "ok", "{body}");
+        assert_eq!(last["verified"], 1, "{body}");
+        assert_eq!(last["repaired"], 0, "{body}");
+        assert_eq!(last["failed"], 0, "{body}");
+        assert_eq!(last.get("error"), None, "{body}");
+        let finished_at = last["finished_at"].as_str().unwrap();
+        humantime::parse_rfc3339(finished_at).unwrap();
+        assert_eq!(body["status"], "ok", "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_a_failed_full_resync_with_its_error() {
+        let (app, reconciler, _dir) = make_app_with_reconciler().await;
+        // The resync cannot read its services from a closed database.
+        reconciler.pool().close().await;
+        reconciler.full_resync().await.unwrap_err();
+
+        let body = authenticated_health(app).await;
+        let last = &body["last_resync"];
+        assert_eq!(last["outcome"], "error", "{body}");
+        assert_eq!(last["verified"], 0, "{body}");
+        assert_eq!(last["repaired"], 0, "{body}");
+        assert_eq!(last["failed"], 0, "{body}");
+        assert!(
+            last["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{body}"
+        );
+        humantime::parse_rfc3339(last["finished_at"].as_str().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_a_closed_npm_breaker_with_valid_bearer() {
+        let (app, _pool, _dir) = make_app().await;
+
+        let body = authenticated_health(app).await;
+
+        assert_eq!(
+            body["npm_breaker"],
+            serde_json::json!({ "open": false, "open_until": null }),
+            "{body}"
+        );
+        assert_eq!(body["status"], "ok", "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_is_degraded_while_the_npm_breaker_is_open() {
+        let (app, reconciler, _dir) = make_app_with_reconciler().await;
+        reconciler.trip_npm_breaker();
+
+        let body = authenticated_health(app).await;
+
+        assert_eq!(body["npm_breaker"]["open"], true, "{body}");
+        let open_until =
+            humantime::parse_rfc3339(body["npm_breaker"]["open_until"].as_str().unwrap()).unwrap();
+        // The cooldown is a minute; the endpoint rounds to whole seconds.
+        let ahead = open_until
+            .duration_since(std::time::SystemTime::now() - Duration::from_secs(1))
+            .unwrap();
+        assert!(ahead <= Duration::from_secs(62), "{body}");
+        assert!(ahead >= Duration::from_secs(55), "{body}");
+        assert_eq!(body["status"], "degraded", "{body}");
     }
 }

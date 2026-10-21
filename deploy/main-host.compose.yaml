@@ -11,6 +11,13 @@ services:
       - /etc/gatus/config.d:/etc/gatus/config.d
     ports:
       - "5363:5363"
+    healthcheck:
+      # The image is distroless; the binary probes its own /healthz.
+      test: ["CMD", "/usr/local/bin/docktornet-server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   docktornet-agent:
     container_name: docktornet-agent
@@ -26,4 +33,5 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /run/user/1001/podman/podman.sock:/run/user/1001/podman/podman.sock:ro
     depends_on:
-      - docktornet-server
+      docktornet-server:
+        condition: service_healthy

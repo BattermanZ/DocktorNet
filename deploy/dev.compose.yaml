@@ -99,6 +99,13 @@ services:
       RUST_LOG: info,docktornet_server=debug
     ports:
       - "127.0.0.1:15363:5363"
+    healthcheck:
+      # The image is distroless; the binary probes its own /healthz.
+      test: ["CMD", "/usr/local/bin/docktornet-server", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     volumes:
       - ../dev-data/server-data:/data
       - ../dev-data/gatus-config:/etc/gatus/config.d
@@ -135,7 +142,7 @@ services:
       dind:
         condition: service_healthy
       docktornet-server:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   dind-socket:

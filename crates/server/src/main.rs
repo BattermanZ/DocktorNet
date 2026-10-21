@@ -9,7 +9,7 @@ use anyhow::Result;
 use docktornet_server::agent_versions::AgentVersionTracker;
 use docktornet_server::db_location::{self, Placement};
 use docktornet_server::flapping::FlappingTracker;
-use docktornet_server::{audit, backup};
+use docktornet_server::{audit, backup, healthcheck};
 use docktornet_server::{config, db, routes};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -34,7 +34,7 @@ fn bind_exposes_plaintext(listen: &str) -> bool {
     }
 }
 
-const USAGE: &str = "usage: docktornet-server [audit | backup]";
+const USAGE: &str = "usage: docktornet-server [audit | backup | healthcheck]";
 
 /// What the server binary was asked to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,7 @@ enum Command {
     Serve,
     Audit,
     Backup,
+    Healthcheck,
 }
 
 /// The command named by the arguments after the program name, or the usage
@@ -52,6 +53,7 @@ fn parse_command<I: IntoIterator<Item = OsString>>(args: I) -> Result<Command, &
         (None, _) => Ok(Command::Serve),
         (Some(arg), None) if arg == "audit" => Ok(Command::Audit),
         (Some(arg), None) if arg == "backup" => Ok(Command::Backup),
+        (Some(arg), None) if arg == "healthcheck" => Ok(Command::Healthcheck),
         _ => Err(USAGE),
     }
 }
@@ -85,6 +87,10 @@ async fn main() -> Result<()> {
         Ok(Command::Backup) => {
             init_stderr_logging();
             std::process::exit(backup::cli().await)
+        }
+        Ok(Command::Healthcheck) => {
+            init_stderr_logging();
+            std::process::exit(healthcheck::cli().await)
         }
         Err(usage) => {
             eprintln!("{usage}");
@@ -185,6 +191,10 @@ mod tests {
         assert_eq!(parse_command(args(&[])), Ok(Command::Serve));
         assert_eq!(parse_command(args(&["audit"])), Ok(Command::Audit));
         assert_eq!(parse_command(args(&["backup"])), Ok(Command::Backup));
+        assert_eq!(
+            parse_command(args(&["healthcheck"])),
+            Ok(Command::Healthcheck)
+        );
     }
 
     #[test]

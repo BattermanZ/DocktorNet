@@ -55,8 +55,12 @@ flowchart LR
 The public `GET /healthz` response contains liveness status and server time.
 Send the configured bearer token to include agent inventory and versions: the
 server's `version`, and each agent's `agent_version` (`null` for an agent that
-predates version reporting). Unauthenticated callers do not receive machine
-IDs, forwarding addresses, last-seen times or versions. The server logs a
+predates version reporting). The same response has the last full resync's
+result and the NPM circuit breaker's state, described in the
+[deployment guide](docs/deployment.md#health) along with the
+`docktornet-server healthcheck` command the compose files use. Unauthenticated
+callers do not receive machine IDs, forwarding addresses, last-seen times,
+versions, resync results or breaker state. The server logs a
 warning once per change when an agent's version differs from its own.
 
 The server refuses a relative `DOCKTORNET_DB_PATH`, and inside a container it

@@ -31,8 +31,14 @@ impl CircuitBreaker {
 
     /// True while the breaker is tripped and the cooldown has not yet elapsed.
     pub fn is_open(&self, now: Instant) -> bool {
+        self.open_until(now).is_some()
+    }
+
+    /// When the cooldown ends while the breaker is open, or `None` when it is
+    /// closed.  Reads the state without changing it.
+    pub fn open_until(&self, now: Instant) -> Option<Instant> {
         let inner = self.inner.lock().expect("breaker mutex poisoned");
-        matches!(inner.open_until, Some(until) if now < until)
+        inner.open_until.filter(|until| now < *until)
     }
 
     /// Record a successful call: clears any failures and closes the breaker.
@@ -89,6 +95,20 @@ mod tests {
         b.record_failure(t0);
         assert!(b.is_open(t0 + Duration::from_secs(59)));
         assert!(!b.is_open(t0 + Duration::from_secs(61)), "cooldown elapsed");
+    }
+
+    #[test]
+    fn reports_when_the_cooldown_ends_while_open() {
+        let b = CircuitBreaker::new(2, Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert_eq!(b.open_until(t0), None, "a fresh breaker is closed");
+        b.record_failure(t0);
+        b.record_failure(t0);
+        assert_eq!(
+            b.open_until(t0 + Duration::from_secs(10)),
+            Some(t0 + Duration::from_secs(60))
+        );
+        assert_eq!(b.open_until(t0 + Duration::from_secs(61)), None);
     }
 
     #[test]
