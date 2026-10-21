@@ -3691,6 +3691,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_removal_sweep_clears_an_npm_host_already_gone_without_feeding_the_breaker() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        // Someone already deleted the host in NPM.
+        let delete = npm_server
+            .mock("DELETE", "/api/nginx/proxy-hosts/50")
+            .with_status(404)
+            .with_body(r#"{"error":{"code":404,"message":"Not Found"}}"#)
+            .expect(NPM_BREAKER_THRESHOLD as usize)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+        reconciler.set_now(1 + GATUS_REMOVAL_GRACE_SECS + 60);
+
+        // As many sweeps as it takes failures to open the breaker, each with a
+        // removal past its grace period whose delete finds nothing.
+        for sweep in 0..NPM_BREAKER_THRESHOLD {
+            storage::add_pending_npm_removal(&pool, "m1/app", 0, 50, 1)
+                .await
+                .unwrap();
+
+            let report = reconciler.sweep_pending_removals().await.unwrap();
+
+            assert_eq!(report.failed, 0, "sweep {sweep}: {report:?}");
+            assert!(
+                storage::list_pending_npm_removals(&pool)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "sweep {sweep}: a host already gone clears its pending row"
+            );
+            assert_eq!(
+                reconciler.npm_breaker.consecutive_failures(),
+                0,
+                "sweep {sweep}"
+            );
+            assert_eq!(reconciler.npm_breaker_open_until(), None, "sweep {sweep}");
+        }
+        delete.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn npm_forwards_to_each_machines_own_address() {
         use mockito::Matcher;
 
@@ -3801,6 +3868,124 @@ mod tests {
             .await
             .unwrap();
 
+        create_a.assert_async().await;
+        create_b.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_ingests_for_two_machines_both_persist() {
+        use mockito::Matcher;
+
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut npm_server = mockito::Server::new_async().await;
+        let _token = npm_server
+            .mock("POST", "/api/tokens")
+            .with_status(200)
+            .with_body(r#"{"token":"t"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _certs = npm_server
+            .mock("GET", "/api/nginx/certificates")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _list = npm_server
+            .mock("GET", "/api/nginx/proxy-hosts")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let create_a = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "forward_host": "10.0.0.1" }),
+            ))
+            .with_status(200)
+            .with_body(r#"{"id":1,"domain_names":["a.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let create_b = npm_server
+            .mock("POST", "/api/nginx/proxy-hosts")
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "forward_host": "10.0.0.2" }),
+            ))
+            .with_status(200)
+            .with_body(r#"{"id":2,"domain_names":["b.example.com"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (npm, cf) = test_clients(&npm_server.url());
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+
+        // Both ingests wait at the barrier and run at once; the applies start
+        // only once both snapshots are queued, so neither push's pending apply
+        // can be taken before the other machine's push lands.
+        let start = Arc::new(tokio::sync::Barrier::new(2));
+        let ingest = |machine: &str, forward_host: &str, host: &str| {
+            let reconciler = reconciler.clone();
+            let start = start.clone();
+            let snap = Snapshot {
+                machine_id: MachineId::new(machine).unwrap(),
+                forward_host: forward_host.into(),
+                taken_at: 1,
+                agent_version: None,
+                containers: vec![ContainerEntry {
+                    name: "app".into(),
+                    labels: npm_host_labels(host),
+                }],
+            };
+            tokio::spawn(async move {
+                start.wait().await;
+                reconciler.ingest_snapshot(&snap).await.unwrap()
+            })
+        };
+        let m1 = ingest("m1", "10.0.0.1", "a.example.com");
+        let m2 = ingest("m2", "10.0.0.2", "b.example.com");
+        let workers = [m1.await.unwrap(), m2.await.unwrap()];
+        assert!(
+            workers.iter().all(Option::is_some),
+            "each machine's first push starts its own worker"
+        );
+        for worker in workers.into_iter().flatten() {
+            tokio::spawn(worker.run());
+        }
+        reconciler.wait_for_applies().await;
+
+        for (machine, npm_id) in [("m1", 1), ("m2", 2)] {
+            let service_id = format!("{machine}/app");
+            let services = storage::list_services_for_machine(&pool, machine)
+                .await
+                .unwrap();
+            assert_eq!(
+                services
+                    .iter()
+                    .map(|(id, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![service_id.as_str()],
+                "{machine}'s service persists"
+            );
+            assert_eq!(
+                storage::get_npm_host(&pool, &service_id, 0).await.unwrap(),
+                Some(npm_id),
+                "{machine}'s NPM mapping persists"
+            );
+        }
         create_a.assert_async().await;
         create_b.assert_async().await;
     }
@@ -4885,6 +5070,65 @@ mod tests {
 
         get.assert_async().await;
         update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cf_record_deleted_when_a_running_container_drops_its_cf_labels() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+
+        let mut cf_server = mockito::Server::new_async().await;
+        let delete = cf_server
+            .mock("DELETE", "/zones/z/dns_records/rec-1")
+            .with_status(200)
+            .with_body(r#"{"success":true}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reconciler = reconciler_on(pool.clone(), &dir.path().join("gatus"), &cf_server);
+
+        // The service owns a Cloudflare record and a Gatus monitor.
+        let mut labels = gatus_labels();
+        labels.extend(cf_dns_labels("app", "home.example.com"));
+        storage::upsert_snapshot(
+            &pool,
+            &m1_snapshot(vec![ContainerEntry {
+                name: "app".into(),
+                labels,
+            }]),
+            1,
+        )
+        .await
+        .unwrap();
+        storage::set_cf_dns_record(&pool, "m1/app", "rec-1")
+            .await
+            .unwrap();
+
+        // The container keeps running with only its Gatus labels.
+        push(&reconciler, 31, vec![gatus_entry("app")]).await;
+
+        delete.assert_async().await;
+        assert_eq!(
+            storage::get_cf_dns_record(&pool, "m1/app").await.unwrap(),
+            None,
+            "the cf record mapping goes with the record"
+        );
+        assert!(
+            storage::list_pending_cf_removals(&pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a service still running owes no pending removal"
+        );
+        assert_eq!(
+            storage::list_services_for_machine(&pool, "m1")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the service itself stays"
+        );
     }
 
     #[tokio::test]

@@ -41,6 +41,15 @@ impl CircuitBreaker {
         inner.open_until.filter(|until| now < *until)
     }
 
+    /// The failures recorded since the last success or trip.
+    #[cfg(test)]
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.inner
+            .lock()
+            .expect("breaker mutex poisoned")
+            .consecutive_failures
+    }
+
     /// Record a successful call: clears any failures and closes the breaker.
     pub fn record_success(&self) {
         let mut inner = self.inner.lock().expect("breaker mutex poisoned");
