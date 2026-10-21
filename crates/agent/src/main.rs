@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::AgentConfig::from_env()?;
-    let client = push::PushClient::new(&cfg.server_url, &cfg.secret)?;
+    let client = push::PushClient::new(&cfg.server_url, cfg.secret.expose())?;
 
     let mut sources: Vec<Box<dyn ContainerSource>> = Vec::new();
     for spec in &cfg.sockets {

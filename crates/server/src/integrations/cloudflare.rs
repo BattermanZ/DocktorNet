@@ -162,7 +162,7 @@ impl CloudflareClient {
             .expect("failed to build Cloudflare HTTP client");
 
         Self {
-            api_token: config.api_token,
+            api_token: config.api_token.expose().to_owned(),
             zone_id: config.zone_id,
             base_url,
             http,
@@ -509,7 +509,7 @@ mod tests {
             .await;
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "t".to_string(),
+                api_token: "t".into(),
                 zone_id: "z".to_string(),
             },
             server.url(),
@@ -563,7 +563,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "token-abc".to_string(),
+                api_token: "token-abc".into(),
                 zone_id: "zone-123".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -623,7 +623,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "token-abc".to_string(),
+                api_token: "token-abc".into(),
                 zone_id: "zone-123".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -653,7 +653,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "token-abc".to_string(),
+                api_token: "token-abc".into(),
                 zone_id: "zone-123".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -684,7 +684,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "token-abc".to_string(),
+                api_token: "token-abc".into(),
                 zone_id: "zone-123".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -715,7 +715,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url_and_timeout(
             CloudflareConfig {
-                api_token: "t".to_string(),
+                api_token: "t".into(),
                 zone_id: "zone-id".to_string(),
             },
             format!("http://{addr}/client/v4"),
@@ -762,7 +762,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "t".to_string(),
+                api_token: "t".into(),
                 zone_id: "zone-id".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -793,7 +793,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "t".to_string(),
+                api_token: "t".into(),
                 zone_id: "zone-id".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -826,7 +826,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "t".to_string(),
+                api_token: "t".into(),
                 zone_id: "zone-id".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -865,7 +865,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "t".to_string(),
+                api_token: "t".into(),
                 zone_id: "zone-id".to_string(),
             },
             format!("{}/client/v4", server.url()),

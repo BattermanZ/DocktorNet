@@ -222,7 +222,7 @@ impl NpmClient {
         Self {
             base_url: normalize_base_url(config.url),
             user: config.user,
-            password: config.password,
+            password: config.password.expose().to_owned(),
             http,
         }
     }
@@ -705,7 +705,7 @@ mod tests {
         let client = NpmClient::new(crate::config::NpmConfig {
             url: Url::parse(&format!("{}/npm", server.url())).unwrap(),
             user: "admin@example.com".to_string(),
-            password: "pw".to_string(),
+            password: "pw".into(),
         });
 
         assert_eq!(client.token().await.unwrap(), "abc123");
@@ -784,7 +784,7 @@ mod tests {
         let client = NpmClient::new(crate::config::NpmConfig {
             url: Url::parse(&server.url()).unwrap(),
             user: "admin@example.com".to_string(),
-            password: "pw".to_string(),
+            password: "pw".into(),
         });
 
         assert_eq!(client.token().await.unwrap(), "abc123");
@@ -817,7 +817,7 @@ mod tests {
         let client = NpmClient::new(crate::config::NpmConfig {
             url: Url::parse(&server.url()).unwrap(),
             user: "admin@example.com".to_string(),
-            password: "pw".to_string(),
+            password: "pw".into(),
         });
         let payload = proxy_payload(&host(), "web.internal", Some(42), "m1/app");
 

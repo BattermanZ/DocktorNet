@@ -17,10 +17,10 @@ check:
 test:
     cargo test --workspace
 
-# run agent locally (requires .env in CWD)
+# run agent locally with ./agent.env loaded (sourced by the shell: quote values with spaces or $&;)
 run-agent:
-    cargo run -p docktornet-agent
+    set -a && . ./agent.env && set +a && cargo run -p docktornet-agent
 
-# run server locally (requires .env in CWD)
+# run server locally with ./server.env loaded (sourced by the shell: quote values with spaces or $&;)
 run-server:
-    cargo run -p docktornet-server
+    set -a && . ./server.env && set +a && cargo run -p docktornet-server

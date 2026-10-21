@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use docktornet_core::{Secret, WeakSecret, validate_shared_secret};
 use url::Url;
 
 /// The public Cloudflare v4 API, used unless `DOCKTORNET_CF_API_URL` overrides it.
@@ -11,7 +12,7 @@ pub const CLOUDFLARE_API_URL: &str = "https://api.cloudflare.com/client/v4";
 #[allow(dead_code)]
 pub struct ServerConfig {
     pub listen: String,
-    pub secret: String,
+    pub secret: Secret,
     pub db_path: PathBuf,
     /// Start even when the database sits on a container's own filesystem.
     pub allow_ephemeral_db: bool,
@@ -28,12 +29,12 @@ pub struct ServerConfig {
 pub struct NpmConfig {
     pub url: Url,
     pub user: String,
-    pub password: String,
+    pub password: Secret,
 }
 
 #[derive(Debug, Clone)]
 pub struct CloudflareConfig {
-    pub api_token: String,
+    pub api_token: Secret,
     pub zone_id: String,
 }
 
@@ -41,8 +42,8 @@ pub struct CloudflareConfig {
 pub enum ConfigError {
     #[error("missing environment variable '{0}'")]
     Missing(&'static str),
-    #[error("environment variable '{0}' must not be empty")]
-    Empty(&'static str),
+    #[error(transparent)]
+    WeakSecret(#[from] WeakSecret),
     #[error("invalid boolean value for '{name}': '{value}'")]
     InvalidBool { name: &'static str, value: String },
     #[error("invalid url for '{name}': '{value}'")]
@@ -62,17 +63,10 @@ impl ServerConfig {
 
     pub fn from_map(env: HashMap<String, String>) -> Result<Self, ConfigError> {
         let required = |k: &'static str| env.get(k).cloned().ok_or(ConfigError::Missing(k));
-        let required_non_empty = |k: &'static str| {
-            let value = required(k)?;
-            if value.is_empty() {
-                Err(ConfigError::Empty(k))
-            } else {
-                Ok(value)
-            }
-        };
 
         let listen = required("DOCKTORNET_LISTEN")?;
-        let secret = required_non_empty("DOCKTORNET_SECRET")?;
+        let secret = required("DOCKTORNET_SECRET")?;
+        validate_shared_secret(&secret)?;
         let dry_run = parse_bool_opt(env.get("DOCKTORNET_DRY_RUN"), "DOCKTORNET_DRY_RUN", true)?;
         let adopt_existing = parse_bool_opt(
             env.get("DOCKTORNET_ADOPT_EXISTING"),
@@ -109,7 +103,7 @@ impl ServerConfig {
 
         Ok(Self {
             listen,
-            secret,
+            secret: secret.into(),
             db_path,
             allow_ephemeral_db,
             dry_run,
@@ -119,10 +113,10 @@ impl ServerConfig {
             npm: NpmConfig {
                 url: parse_url(required("DOCKTORNET_NPM_URL")?, "DOCKTORNET_NPM_URL")?,
                 user: required("DOCKTORNET_NPM_USER")?,
-                password: required("DOCKTORNET_NPM_PASSWORD")?,
+                password: required("DOCKTORNET_NPM_PASSWORD")?.into(),
             },
             cloudflare: CloudflareConfig {
-                api_token: required("DOCKTORNET_CF_API_TOKEN")?,
+                api_token: required("DOCKTORNET_CF_API_TOKEN")?.into(),
                 zone_id: required("DOCKTORNET_CF_ZONE_ID")?,
             },
             cloudflare_api_url: parse_cloudflare_api_url(
@@ -185,6 +179,8 @@ fn parse_cloudflare_api_url(value: String) -> Result<Url, ConfigError> {
 mod tests {
     use super::*;
 
+    const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()
@@ -196,7 +192,7 @@ mod tests {
     fn happy_path() {
         let c = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -228,7 +224,7 @@ mod tests {
     fn parses_integration_config_with_safe_defaults() {
         let c = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -250,7 +246,7 @@ mod tests {
     fn parses_explicit_write_flags() {
         let c = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_DRY_RUN", "false"),
             ("DOCKTORNET_ADOPT_EXISTING", "true"),
@@ -271,7 +267,7 @@ mod tests {
     fn rejects_invalid_bool() {
         let err = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_DRY_RUN", "maybe"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
@@ -296,7 +292,7 @@ mod tests {
     fn rejects_invalid_url() {
         let err = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "not a url"),
@@ -320,7 +316,7 @@ mod tests {
     fn full_resync_interval_defaults_to_one_hour() {
         let c = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -337,7 +333,7 @@ mod tests {
     fn full_resync_interval_parses_humantime() {
         let c = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -355,7 +351,7 @@ mod tests {
     fn rejects_invalid_full_resync_interval() {
         let err = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -376,31 +372,63 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_secret() {
-        let err = ServerConfig::from_map(env(&[
+    fn rejects_weak_secrets() {
+        let changeme_40 = format!("{}CHANGEME{}", "a".repeat(16), "b".repeat(16));
+        for secret in ["", "s", "changeme", "changeme-please", changeme_40.as_str()] {
+            let err = ServerConfig::from_map(env(&[
+                ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+                ("DOCKTORNET_SECRET", secret),
+                ("DOCKTORNET_DB_PATH", "/data/x.db"),
+                ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+                ("DOCKTORNET_NPM_URL", "http://npm:81"),
+                ("DOCKTORNET_NPM_USER", "admin@example.com"),
+                ("DOCKTORNET_NPM_PASSWORD", "pw"),
+                ("DOCKTORNET_CF_API_TOKEN", "token"),
+                ("DOCKTORNET_CF_ZONE_ID", "zone"),
+            ]))
+            .unwrap_err();
+
+            let message = err.to_string();
+            assert!(
+                message.contains("DOCKTORNET_SECRET") && message.contains("openssl rand -hex 32"),
+                "expected a weak-secret error for {secret:?}, got {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets() {
+        let c = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", ""),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
             ("DOCKTORNET_NPM_USER", "admin@example.com"),
-            ("DOCKTORNET_NPM_PASSWORD", "pw"),
-            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_NPM_PASSWORD", "npm-password-value"),
+            ("DOCKTORNET_CF_API_TOKEN", "cf-token-value"),
             ("DOCKTORNET_CF_ZONE_ID", "zone"),
         ]))
-        .unwrap_err();
+        .unwrap();
 
-        match err {
-            ConfigError::Empty(name) => assert_eq!(name, "DOCKTORNET_SECRET"),
-            other => panic!("unexpected error: {other:?}"),
+        for printed in [
+            format!("{c:?}"),
+            format!("{c:#?}"),
+            format!("{:?}", c.npm),
+            format!("{:?}", c.cloudflare),
+        ] {
+            for value in [SECRET, "npm-password-value", "cf-token-value"] {
+                assert!(!printed.contains(value), "{value:?} leaked into {printed}");
+            }
         }
+        assert!(format!("{c:?}").contains("admin@example.com"));
     }
 
     #[test]
     fn cloudflare_api_url_defaults_to_the_public_api() {
         let c = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -420,7 +448,7 @@ mod tests {
     fn cloudflare_api_url_can_point_at_a_stub() {
         let c = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -441,7 +469,7 @@ mod tests {
     fn rejects_invalid_cloudflare_api_url() {
         let err = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -466,7 +494,7 @@ mod tests {
     fn rejects_cloudflare_api_url_without_the_v4_path() {
         let err = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -491,7 +519,7 @@ mod tests {
     fn rejects_relative_db_path() {
         let err = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "data/docktornet.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -512,7 +540,7 @@ mod tests {
     fn rejects_db_path_naming_a_directory() {
         let err = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "http://npm:81"),
@@ -533,7 +561,7 @@ mod tests {
     fn rejects_non_http_npm_url() {
         let err = ServerConfig::from_map(env(&[
             ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
-            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_SECRET", SECRET),
             ("DOCKTORNET_DB_PATH", "/data/x.db"),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
             ("DOCKTORNET_NPM_URL", "file:///tmp/npm"),

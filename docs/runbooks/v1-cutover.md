@@ -29,7 +29,7 @@ Do **not** proceed if any file is missing.
 
 ## 3. Shadow phase (dry-run)
 
-- [ ] In `.env`: set `DOCKTORNET_DRY_RUN=true`.
+- [ ] In `server.env`: set `DOCKTORNET_DRY_RUN=true`.
 - [ ] Deploy `deploy/main-host.compose.yaml`.
 - [ ] Tail logs for at least one `DOCKTORNET_FULL_RESYNC_INTERVAL` (default 1h):
 
@@ -54,7 +54,7 @@ Pick **one** low-stakes service to flip first. The simplest way is:
    docker compose -f deploy/main-host.compose.yaml stop docktornet-server
    ```
 
-2. In `.env`: `DOCKTORNET_DRY_RUN=false`.
+2. In `server.env`: `DOCKTORNET_DRY_RUN=false`.
 3. Restart:
 
    ```bash
@@ -134,6 +134,6 @@ Use the most recent `docktornet-backups/<date>/` directory.
 
 6. Bring docktornet back up in dry-run for a second look before reattempting:
    ```bash
-   # .env: DOCKTORNET_DRY_RUN=true
+   # server.env: DOCKTORNET_DRY_RUN=true
    docker compose -f deploy/main-host.compose.yaml up -d
    ```

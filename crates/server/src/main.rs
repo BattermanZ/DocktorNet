@@ -130,7 +130,7 @@ async fn serve() -> Result<()> {
     );
     let app_state = docktornet_server::handlers::snapshot::AppState {
         reconciler,
-        secret: std::sync::Arc::new(cfg.secret),
+        secret: std::sync::Arc::new(cfg.secret.expose().to_owned()),
         flapping: std::sync::Arc::new(FlappingTracker::new(FLAPPING_WINDOW)),
         agent_versions: std::sync::Arc::new(AgentVersionTracker::new(VERSION)),
     };

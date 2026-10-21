@@ -95,7 +95,7 @@ fn no_argument_starts_the_server() {
         .current_dir(dir.path())
         .env_clear()
         .env("DOCKTORNET_LISTEN", format!("127.0.0.1:{port}"))
-        .env("DOCKTORNET_SECRET", "s3cret")
+        .env("DOCKTORNET_SECRET", "0123456789abcdef".repeat(4))
         .env("DOCKTORNET_DB_PATH", dir.path().join("server.db"))
         .env("DOCKTORNET_ALLOW_EPHEMERAL_DB", "true")
         .env("DOCKTORNET_DRY_RUN", "true")

@@ -119,11 +119,14 @@ has the details.
 ## Quick start (local dev)
 
 ```bash
-just run-server  # in one terminal, with server.env loaded
-just run-agent   # in another, with agent.env loaded
+cp server.env.example server.env  # then fill it in
+cp agent.env.example agent.env    # then fill it in
+just run-server  # in one terminal, loads ./server.env
+just run-agent   # in another, loads ./agent.env
 ```
 
-`DOCKTORNET_SECRET` must be non-empty on the server. Agent
+`DOCKTORNET_SECRET` must match in both files, be at least 32 characters and
+not contain `changeme`; generate one with `openssl rand -hex 32`. Agent
 `DOCKTORNET_POLL_INTERVAL` values must be at least one second. See the
 [deployment guide](docs/deployment.md) for the complete environment-variable
 reference.

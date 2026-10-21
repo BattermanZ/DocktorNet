@@ -18,12 +18,26 @@ Publishing images to GHCR is out of scope for v1 — tag and push manually for n
 
 ## Configuration
 
-Both binaries read the same `.env` file. Keys irrelevant to a given role are ignored.
+The server and the agent each read their own env file, next to the compose
+file: `server.env` and `agent.env`. Copy them from `server.env.example` and
+`agent.env.example` at the repository root. The agent's file holds no NPM or
+Cloudflare keys. The agent container mounts the Docker socket, so it should
+not also carry credentials it never uses.
+
+`DOCKTORNET_SECRET` is the bearer token agents send with each snapshot. Set the
+same value in `server.env` and in every `agent.env`. Both binaries refuse to
+start when it is shorter than 32 characters or contains `changeme`, upper or
+lower case,
+and the error names the variable. Generate one with:
+
+```bash
+openssl rand -hex 32
+```
 
 | Var | Server | Agent |
 | --- | --- | --- |
 | `DOCKTORNET_LISTEN` | required | — |
-| `DOCKTORNET_SECRET` | required | required |
+| `DOCKTORNET_SECRET` | required; at least 32 characters, no `changeme` | required; the server's value |
 | `DOCKTORNET_DB_PATH` | absolute; the image sets `/data/docktornet.db`, required outside it | — |
 | `DOCKTORNET_ALLOW_EPHEMERAL_DB` | optional (`false`); start even when the database is on the container's own filesystem | — |
 | `DOCKTORNET_GATUS_CONFIG_DIR` | required | — |
@@ -38,6 +52,26 @@ Both binaries read the same `.env` file. Keys irrelevant to a given role are ign
 | `DOCKTORNET_MACHINE_ID` | — | required; non-empty, with no `/`, whitespace or control characters. Give each agent its own: within 5 minutes of the first agent's last push, the server answers `409` to another agent pushing the same id with a different forward host |
 | `DOCKTORNET_FORWARD_HOST` | — | required |
 | `DOCKTORNET_SOCKETS` | — | required |
+
+### Upgrading from a single `.env`
+
+Earlier versions read one `.env` for both roles. To upgrade:
+
+1. Create `server.env` from the server keys in the old `.env`, and `agent.env`
+   from the agent keys plus `DOCKTORNET_SECRET`, using the two example files
+   as the list of keys. Put both next to the compose file you run. On an
+   agent-only host, `agent.env` sits next to `deploy/agent.compose.yaml`, not
+   one directory up as `.env` did.
+2. If the old secret is shorter than 32 characters or contains `changeme`, the
+   new server and agents refuse to start. Generate a new one with
+   `openssl rand -hex 32` and put it in `server.env` and in every host's
+   `agent.env`, then recreate the server and all agents together. An agent
+   still holding the old secret gets a 401 on every push until it has the new
+   one.
+3. Once both stacks are up, remove the `DOCKTORNET_*` keys from the old
+   `.env`. Keep the file if it also sets compose variables such as
+   `SERVER_IMAGE`, `AGENT_IMAGE` or `DOCKER_GID`: compose reads those from the
+   `.env` next to the compose file, not from `env_file`.
 
 ### The database path
 
@@ -185,11 +219,11 @@ The agent only needs **read** access to the docker/podman socket. Setting the co
 
 ## Gatus configuration
 
-Gatus must be configured to load from a directory rather than a single file, so it picks up the per-service files docktornet writes. Set `GATUS_CONFIG_FILE` to the config directory in your Gatus compose service:
+Gatus must be configured to load from a directory rather than a single file, so it picks up the per-service files docktornet writes. Set `GATUS_CONFIG_PATH` to the config directory in your Gatus compose service. `GATUS_CONFIG_FILE` is its deprecated alias.
 
 ```yaml
 environment:
-  - GATUS_CONFIG_FILE=/config
+  - GATUS_CONFIG_PATH=/config
 ```
 
 Docktornet only writes per-service files. The base Gatus config (web/storage/alerting) must be defined by the operator in a non-managed file in the same directory, e.g. `/etc/gatus/config.d/00-base.yaml`:

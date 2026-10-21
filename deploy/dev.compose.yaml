@@ -84,7 +84,7 @@ services:
     user: "${DEV_UID:-1000}:${DEV_GID:-1000}"
     environment:
       DOCKTORNET_LISTEN: 0.0.0.0:5363
-      DOCKTORNET_SECRET: dev-shared-secret
+      DOCKTORNET_SECRET: dev-shared-secret-for-the-live-test-stack
       DOCKTORNET_DB_PATH: /data/docktornet.db
       DOCKTORNET_GATUS_CONFIG_DIR: /etc/gatus/config.d
       DOCKTORNET_DRY_RUN: "false"
@@ -123,7 +123,7 @@ services:
       - "2375"
     environment:
       DOCKTORNET_SERVER_URL: http://docktornet-server:5363
-      DOCKTORNET_SECRET: dev-shared-secret
+      DOCKTORNET_SECRET: dev-shared-secret-for-the-live-test-stack
       DOCKTORNET_POLL_INTERVAL: 5s
       DOCKTORNET_MACHINE_ID: devbox
       DOCKTORNET_FORWARD_HOST: dind

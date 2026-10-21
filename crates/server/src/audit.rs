@@ -616,7 +616,7 @@ mod tests {
     fn config(db_path: &Path, npm: &ServerGuard, cf: &ServerGuard) -> ServerConfig {
         let env: HashMap<String, String> = [
             ("DOCKTORNET_LISTEN", "127.0.0.1:0".to_string()),
-            ("DOCKTORNET_SECRET", "s".to_string()),
+            ("DOCKTORNET_SECRET", "0123456789abcdef".repeat(4)),
             ("DOCKTORNET_DB_PATH", db_path.display().to_string()),
             ("DOCKTORNET_GATUS_CONFIG_DIR", "/nonexistent".to_string()),
             ("DOCKTORNET_DRY_RUN", "false".to_string()),
