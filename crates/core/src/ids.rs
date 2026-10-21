@@ -1,15 +1,44 @@
 use serde::{Deserialize, Serialize};
 
+/// The name an agent reports its machine under.  It is the first half of every
+/// service id (`machine/container`), so it is non-empty and holds no `/`, no
+/// whitespace and no control characters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct MachineId(String);
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidMachineId {
+    #[error("machine id is empty")]
+    Empty,
+    #[error("machine id {0:?} contains '/', whitespace or a control character")]
+    BadChar(String),
+}
+
 impl MachineId {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
+    pub fn new(s: impl Into<String>) -> Result<Self, InvalidMachineId> {
+        let s = s.into();
+        if s.is_empty() {
+            return Err(InvalidMachineId::Empty);
+        }
+        if s.chars()
+            .any(|c| c == '/' || c.is_whitespace() || c.is_control())
+        {
+            return Err(InvalidMachineId::BadChar(s));
+        }
+        Ok(Self(s))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for MachineId {
+    type Error = InvalidMachineId;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::new(s)
     }
 }
 
@@ -40,7 +69,7 @@ mod tests {
 
     #[test]
     fn service_id_joins_machine_and_container() {
-        let m = MachineId::new("batterdock");
+        let m = MachineId::new("batterdock").unwrap();
         assert_eq!(service_id(&m, "myapp"), "batterdock/myapp");
     }
 
@@ -56,8 +85,29 @@ mod tests {
     }
 
     #[test]
+    fn machine_id_rejects_ids_that_break_the_service_id() {
+        for bad in ["", "a/b", "a b", "a\u{7}b", "a\tb", "a\u{a0}b"] {
+            assert!(MachineId::new(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert_eq!(
+            MachineId::new("batter-dock.1").unwrap().as_str(),
+            "batter-dock.1"
+        );
+    }
+
+    #[test]
+    fn deserializing_an_invalid_machine_id_fails() {
+        for bad in [r#""""#, r#""a/b""#, r#""a b""#, r#""a\u0001b""#] {
+            assert!(
+                serde_json::from_str::<MachineId>(bad).is_err(),
+                "{bad} must not deserialize"
+            );
+        }
+    }
+
+    #[test]
     fn machine_id_roundtrips_json() {
-        let m = MachineId::new("batterdock");
+        let m = MachineId::new("batterdock").unwrap();
         let s = serde_json::to_string(&m).unwrap();
         let back: MachineId = serde_json::from_str(&s).unwrap();
         assert_eq!(m, back);

@@ -73,7 +73,11 @@ impl AgentConfig {
             });
         }
 
-        let machine_id = MachineId::new(get("DOCKTORNET_MACHINE_ID")?);
+        let machine_id =
+            MachineId::new(get("DOCKTORNET_MACHINE_ID")?).map_err(|e| ConfigError::Invalid {
+                var: "DOCKTORNET_MACHINE_ID",
+                msg: e.to_string(),
+            })?;
 
         let forward_host = get("DOCKTORNET_FORWARD_HOST")?;
 
@@ -285,5 +289,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn invalid_machine_id_errors_with_machine_id_var() {
+        for value in ["", "a/b", "a b", "a\u{1}b"] {
+            let err = AgentConfig::from_iter(env(&[
+                ("DOCKTORNET_SERVER_URL", "u"),
+                ("DOCKTORNET_SECRET", "s"),
+                ("DOCKTORNET_POLL_INTERVAL", "1s"),
+                ("DOCKTORNET_MACHINE_ID", value),
+                ("DOCKTORNET_FORWARD_HOST", "10.0.0.10"),
+                ("DOCKTORNET_SOCKETS", "docker:/x"),
+            ]))
+            .unwrap_err();
+
+            assert!(
+                err.to_string().contains("DOCKTORNET_MACHINE_ID"),
+                "expected the error for {value:?} to name the variable, got {err}"
+            );
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "DOCKTORNET_MACHINE_ID",
+                        ..
+                    }
+                ),
+                "expected Invalid machine-id error for {value:?}, got {err:?}"
+            );
+        }
     }
 }

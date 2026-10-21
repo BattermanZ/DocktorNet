@@ -38,7 +38,7 @@ async fn env() -> Env {
 
 fn snapshot(machine: &str, taken_at: u64, containers: &[(&str, &[(&str, &str)])]) -> Snapshot {
     Snapshot {
-        machine_id: MachineId::new(machine),
+        machine_id: MachineId::new(machine).unwrap(),
         forward_host: "127.0.0.1".into(),
         taken_at,
         agent_version: None,

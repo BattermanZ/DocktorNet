@@ -40,7 +40,7 @@ mod tests {
         labels.insert("docktornet.gatus.0.url".into(), "https://x".into());
 
         let snap = Snapshot {
-            machine_id: MachineId::new("batterdock"),
+            machine_id: MachineId::new("batterdock").unwrap(),
             forward_host: "10.0.0.10".into(),
             taken_at: 1716300000,
             agent_version: None,
@@ -74,7 +74,7 @@ mod tests {
     #[test]
     fn empty_snapshot_is_valid() {
         let snap = Snapshot {
-            machine_id: MachineId::new("batterdock"),
+            machine_id: MachineId::new("batterdock").unwrap(),
             forward_host: "10.0.0.10".into(),
             taken_at: 1716300000,
             agent_version: None,

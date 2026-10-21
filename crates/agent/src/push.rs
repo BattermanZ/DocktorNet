@@ -135,7 +135,7 @@ mod tests {
 
     fn snap() -> Snapshot {
         Snapshot {
-            machine_id: MachineId::new("m1"),
+            machine_id: MachineId::new("m1").unwrap(),
             forward_host: "10.0.0.10".into(),
             taken_at: 1,
             agent_version: None,

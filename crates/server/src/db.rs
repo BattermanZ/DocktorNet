@@ -211,7 +211,7 @@ mod tests {
         );
         reconciler
             .reconcile_snapshot(&docktornet_core::Snapshot {
-                machine_id: docktornet_core::MachineId::new("m1"),
+                machine_id: docktornet_core::MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.1".into(),
                 taken_at: now as u64,
                 agent_version: None,

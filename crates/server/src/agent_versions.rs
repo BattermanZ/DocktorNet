@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn a_mismatched_agent_is_noted_once_until_its_version_changes() {
         let tracker = AgentVersionTracker::new("1.2.0");
-        let m1 = MachineId::new("m1");
+        let m1 = MachineId::new("m1").unwrap();
         assert_eq!(tracker.observe(&m1, Some("1.1.0")), mismatch("1.1.0"));
         assert_eq!(tracker.observe(&m1, Some("1.1.0")), None);
         assert_eq!(tracker.observe(&m1, Some("1.1.1")), mismatch("1.1.1"));
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn a_matching_agent_is_not_noted() {
         let tracker = AgentVersionTracker::new("1.2.0");
-        let m1 = MachineId::new("m1");
+        let m1 = MachineId::new("m1").unwrap();
         assert_eq!(tracker.observe(&m1, Some("1.2.0")), None);
         assert_eq!(tracker.observe(&m1, Some("1.1.0")), mismatch("1.1.0"));
         assert_eq!(tracker.observe(&m1, Some("1.2.0")), None);
@@ -91,14 +91,14 @@ mod tests {
     #[test]
     fn versions_compare_as_exact_strings() {
         let tracker = AgentVersionTracker::new("1.2.0");
-        let m1 = MachineId::new("m1");
+        let m1 = MachineId::new("m1").unwrap();
         assert_eq!(tracker.observe(&m1, Some("v1.2.0")), mismatch("v1.2.0"));
     }
 
     #[test]
     fn an_agent_without_a_version_is_noted_once() {
         let tracker = AgentVersionTracker::new("1.2.0");
-        let m1 = MachineId::new("m1");
+        let m1 = MachineId::new("m1").unwrap();
         assert_eq!(tracker.observe(&m1, None), Some(VersionNote::Predates));
         assert_eq!(tracker.observe(&m1, None), None);
     }
@@ -107,11 +107,11 @@ mod tests {
     fn machines_are_tracked_separately() {
         let tracker = AgentVersionTracker::new("1.2.0");
         assert_eq!(
-            tracker.observe(&MachineId::new("m1"), Some("1.1.0")),
+            tracker.observe(&MachineId::new("m1").unwrap(), Some("1.1.0")),
             mismatch("1.1.0")
         );
         assert_eq!(
-            tracker.observe(&MachineId::new("m2"), Some("1.1.0")),
+            tracker.observe(&MachineId::new("m2").unwrap(), Some("1.1.0")),
             mismatch("1.1.0")
         );
     }

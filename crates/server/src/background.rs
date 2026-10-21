@@ -69,7 +69,7 @@ mod tests {
         labels.insert("docktornet.gatus.0.interval".into(), "30s".into());
         reconciler
             .reconcile_snapshot(&Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "127.0.0.1".into(),
                 taken_at: 1,
                 agent_version: None,

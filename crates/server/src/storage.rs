@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use docktornet_core::{Snapshot, service_id};
 use sqlx::{Pool, Sqlite, SqliteExecutor};
@@ -144,6 +144,22 @@ pub async fn get_services_last_seen(
     Ok(out)
 }
 
+/// The labels of a stored service as its machine's latest persisted snapshot
+/// holds them, or `None` when that snapshot does not hold it.
+pub async fn get_service_labels(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<Option<BTreeMap<String, String>>> {
+    let labels_json: Option<String> =
+        sqlx::query_scalar("SELECT labels_json FROM services WHERE id = ?")
+            .bind(service_id)
+            .fetch_optional(pool)
+            .await?;
+    labels_json
+        .map(|json| serde_json::from_str(&json).map_err(|e| sqlx::Error::Decode(Box::new(e))))
+        .transpose()
+}
+
 pub async fn removed_service_ids(
     pool: &Pool<Sqlite>,
     machine: &str,
@@ -275,6 +291,27 @@ pub async fn add_pending_npm_removal(
     .bind(last_seen)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Move the last sighting of a service's pending NPM and Cloudflare removals
+/// up to `last_seen`, never back.  A service that came back and left again
+/// before an apply restored its removals starts its grace period from its
+/// latest sighting.
+pub async fn refresh_pending_removals(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    last_seen: i64,
+) -> sqlx::Result<()> {
+    for table in ["pending_npm_removals", "pending_cf_removals"] {
+        sqlx::query(&format!(
+            "UPDATE {table} SET last_seen = MAX(last_seen, ?) WHERE service_id = ?"
+        ))
+        .bind(last_seen)
+        .bind(service_id)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -576,7 +613,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 agent_version: None,
@@ -597,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn updates_existing_when_labels_change() {
         let p = pool().await;
-        let m = MachineId::new("m1");
+        let m = MachineId::new("m1").unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
@@ -632,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn removes_containers_not_in_latest_snapshot() {
         let p = pool().await;
-        let m = MachineId::new("m1");
+        let m = MachineId::new("m1").unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
@@ -673,7 +710,7 @@ mod tests {
     #[tokio::test]
     async fn empty_snapshot_clears_machine() {
         let p = pool().await;
-        let m = MachineId::new("m1");
+        let m = MachineId::new("m1").unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
@@ -711,7 +748,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 agent_version: None,
@@ -724,7 +761,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m2"),
+                machine_id: MachineId::new("m2").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 agent_version: None,
@@ -742,7 +779,7 @@ mod tests {
     #[tokio::test]
     async fn returns_removed_services_for_machine() {
         let p = pool().await;
-        let m = MachineId::new("m1");
+        let m = MachineId::new("m1").unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
@@ -775,7 +812,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 agent_version: None,
@@ -797,7 +834,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 agent_version: None,
@@ -891,7 +928,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 100,
                 agent_version: None,
@@ -904,7 +941,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m2"),
+                machine_id: MachineId::new("m2").unwrap(),
                 forward_host: "10.0.0.2".into(),
                 taken_at: 200,
                 agent_version: None,
@@ -939,7 +976,7 @@ mod tests {
     async fn a_machine_keeps_its_latest_agent_version() {
         let p = pool().await;
         let snap = |taken_at, agent_version: Option<&str>| Snapshot {
-            machine_id: MachineId::new("m1"),
+            machine_id: MachineId::new("m1").unwrap(),
             forward_host: "10.0.0.1".into(),
             taken_at,
             containers: vec![],
@@ -967,7 +1004,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 1,
                 agent_version: None,
@@ -980,7 +1017,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m2"),
+                machine_id: MachineId::new("m2").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 1,
                 agent_version: None,
@@ -1003,7 +1040,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 42,
                 agent_version: None,
@@ -1041,7 +1078,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 42,
                 agent_version: None,
@@ -1065,7 +1102,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 agent_version: None,
@@ -1091,7 +1128,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 agent_version: None,
@@ -1116,7 +1153,7 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
                 agent_version: None,

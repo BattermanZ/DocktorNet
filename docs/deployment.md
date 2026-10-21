@@ -35,7 +35,7 @@ Both binaries read the same `.env` file. Keys irrelevant to a given role are ign
 | `DOCKTORNET_CF_API_URL` | optional (`https://api.cloudflare.com/client/v4`); the dev stack points it at its stub | — |
 | `DOCKTORNET_SERVER_URL` | — | required |
 | `DOCKTORNET_POLL_INTERVAL` | — | required |
-| `DOCKTORNET_MACHINE_ID` | — | required |
+| `DOCKTORNET_MACHINE_ID` | — | required; non-empty, with no `/`, whitespace or control characters. Give each agent its own: within 5 minutes of the first agent's last push, the server answers `409` to another agent pushing the same id with a different forward host |
 | `DOCKTORNET_FORWARD_HOST` | — | required |
 | `DOCKTORNET_SOCKETS` | — | required |
 

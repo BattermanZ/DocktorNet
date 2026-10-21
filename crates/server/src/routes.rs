@@ -45,6 +45,10 @@ mod tests {
     const SERVER_VERSION: &str = "1.2.3-test";
 
     async fn make_app() -> (Router, crate::db::Db, tempfile::TempDir) {
+        make_app_with_window(Duration::from_secs(300)).await
+    }
+
+    async fn make_app_with_window(window: Duration) -> (Router, crate::db::Db, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
         let reconciler = Reconciler::new(
@@ -58,7 +62,7 @@ mod tests {
         let state = AppState {
             reconciler,
             secret: Arc::new("s3cret".into()),
-            flapping: Arc::new(FlappingTracker::new(Duration::from_secs(300))),
+            flapping: Arc::new(FlappingTracker::new(window)),
             agent_versions: Arc::new(AgentVersionTracker::new(SERVER_VERSION)),
         };
         (build(state), pool, dir)
@@ -73,7 +77,7 @@ mod tests {
         labels.insert("docktornet.gatus.0.url".into(), "u".into());
         labels.insert("docktornet.gatus.0.interval".into(), "30s".into());
         Snapshot {
-            machine_id: MachineId::new("m1"),
+            machine_id: MachineId::new("m1").unwrap(),
             forward_host: "10.0.0.10".into(),
             taken_at: 1,
             agent_version: None,
@@ -85,6 +89,11 @@ mod tests {
     }
 
     fn req(method: &str, token: Option<&str>, snap: &Snapshot) -> Request<Body> {
+        req_from(method, "127.0.0.1:9999", token, body(snap))
+    }
+
+    /// A request to the snapshot endpoint carrying `body`, arriving from `from`.
+    fn req_from(method: &str, from: &str, token: Option<&str>, body: Body) -> Request<Body> {
         let mut b = Request::builder()
             .method(method)
             .uri("/api/v1/snapshot")
@@ -92,11 +101,11 @@ mod tests {
         if let Some(t) = token {
             b = b.header("authorization", format!("Bearer {t}"));
         }
-        let mut request = b.body(body(snap)).unwrap();
+        let mut request = b.body(body).unwrap();
         request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo::<SocketAddr>(
-                "127.0.0.1:9999".parse().unwrap(),
+                from.parse().unwrap(),
             ));
         request
     }
@@ -199,7 +208,7 @@ mod tests {
         labels.insert("docktornet.npm.0.scheme".into(), "http".into());
         labels.insert("docktornet.npm.0.ssl".into(), "false".into());
         let snap = Snapshot {
-            machine_id: MachineId::new("m1"),
+            machine_id: MachineId::new("m1").unwrap(),
             forward_host: "10.0.0.10".into(),
             taken_at: 1,
             agent_version: None,
@@ -219,6 +228,221 @@ mod tests {
         // background NPM reconcile will fail.
         let rows = list_services_for_machine(&pool, "m1").await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    fn snapshot_json(machine_id: &str) -> Body {
+        Body::from(
+            serde_json::json!({
+                "machine_id": machine_id,
+                "forward_host": "10.0.0.10",
+                "taken_at": 1,
+                "containers": [],
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_an_invalid_machine_id_with_400() {
+        let (app, pool, _dir) = make_app().await;
+        for bad in ["", "a/b", "a b", "a\u{1}b"] {
+            let resp = app
+                .clone()
+                .oneshot(req_from(
+                    "POST",
+                    "127.0.0.1:9999",
+                    Some("s3cret"),
+                    snapshot_json(bad),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "machine id {bad:?}");
+        }
+        assert!(
+            crate::storage::list_machines(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A snapshot of `m1` from an agent forwarding to `forward_host`, with one
+    /// service carrying NPM and Cloudflare labels.
+    fn published(forward_host: &str) -> Snapshot {
+        let mut labels = BTreeMap::new();
+        labels.insert("docktornet.npm.0.host".into(), "a.example.com".into());
+        labels.insert("docktornet.npm.0.port".into(), "3000".into());
+        labels.insert("docktornet.npm.0.scheme".into(), "http".into());
+        labels.insert("docktornet.npm.0.ssl".into(), "false".into());
+        labels.insert("docktornet.cf.dns.name".into(), "a".into());
+        labels.insert("docktornet.cf.dns.target".into(), "home.example.com".into());
+        Snapshot {
+            forward_host: forward_host.into(),
+            containers: vec![ContainerEntry {
+                name: "intruder".into(),
+                labels,
+            }],
+            ..snap()
+        }
+    }
+
+    #[tokio::test]
+    async fn second_agent_with_another_forward_host_gets_409_and_leaves_no_trace() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        // NPM and Cloudflare both point at a server that must never be called.
+        let mut external = mockito::Server::new_async().await;
+        let mut untouched = Vec::new();
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            untouched.push(
+                external
+                    .mock(method, mockito::Matcher::Any)
+                    .expect(0)
+                    .create_async()
+                    .await,
+            );
+        }
+        let npm = crate::integrations::npm::NpmClient::new(crate::config::NpmConfig {
+            url: url::Url::parse(&external.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let cf = crate::integrations::cloudflare::CloudflareClient::with_base_url(
+            crate::config::CloudflareConfig {
+                api_token: "t".into(),
+                zone_id: "z".into(),
+            },
+            external.url(),
+        );
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+        let app = build(AppState {
+            reconciler: reconciler.clone(),
+            secret: Arc::new("s3cret".into()),
+            flapping: Arc::new(FlappingTracker::new(Duration::from_secs(300))),
+            agent_versions: Arc::new(AgentVersionTracker::new(SERVER_VERSION)),
+        });
+
+        // The owner publishes nothing, so its own apply calls neither API.
+        let owner = Snapshot {
+            containers: vec![],
+            ..snap()
+        };
+        let resp = app
+            .clone()
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.1:1000",
+                Some("s3cret"),
+                body(&owner),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        reconciler.wait_for_applies().await;
+        let before = crate::storage::list_machines(&pool).await.unwrap();
+
+        let resp = app
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.2:1000",
+                Some("s3cret"),
+                body(&published("10.0.0.99")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        reconciler.wait_for_applies().await;
+
+        assert_eq!(crate::storage::list_machines(&pool).await.unwrap(), before);
+        assert!(
+            list_services_for_machine(&pool, "m1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for mock in untouched {
+            mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn second_agent_takes_over_once_the_owner_is_silent_for_the_window() {
+        let (app, pool, _dir) = make_app_with_window(Duration::from_millis(200)).await;
+        let resp = app
+            .clone()
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.1:1000",
+                Some("s3cret"),
+                body(&snap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app
+            .clone()
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.2:1000",
+                Some("s3cret"),
+                body(&published("10.0.0.99")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let resp = app
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.2:1000",
+                Some("s3cret"),
+                body(&published("10.0.0.99")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let machines = crate::storage::list_machines(&pool).await.unwrap();
+        assert_eq!(machines[0].forward_host, "10.0.0.99");
+    }
+
+    #[tokio::test]
+    async fn new_source_ip_with_the_same_forward_host_is_accepted() {
+        let (app, pool, _dir) = make_app().await;
+        let resp = app
+            .clone()
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.1:1000",
+                Some("s3cret"),
+                body(&snap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let moved = published("10.0.0.10");
+        let resp = app
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.2:1000",
+                Some("s3cret"),
+                body(&moved),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let rows = list_services_for_machine(&pool, "m1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "m1/intruder");
     }
 
     #[tokio::test]
@@ -245,7 +469,7 @@ mod tests {
             ..snap()
         };
         let silent = Snapshot {
-            machine_id: MachineId::new("m2"),
+            machine_id: MachineId::new("m2").unwrap(),
             ..snap()
         };
         for push in [&reporting, &silent] {
