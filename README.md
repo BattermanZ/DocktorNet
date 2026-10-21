@@ -187,6 +187,73 @@ A single DNS record per container (not indexed).
 | `docktornet.gatus.<index>.group` | no | string | host/machine id | `media` | Gatus dashboard group. Defaults to the machine this container runs on. |
 | `docktornet.gatus.<index>.name` | no | string | container name | `Homepage` | Display name shown in alerts/dashboard. Defaults to the container name; colliding defaults get a ` <index>` suffix. |
 | `docktornet.gatus.<index>.telegram` | no | bool | `true` | `false` | Emit a Gatus `custom` alert (used for Telegram). |
+| `docktornet.gatus.<index>.severity` | no | `critical`, `warning` or `info` | `warning` | `critical` | How urgent this endpoint's alerts are. Written to the classification map only; the Gatus config does not change. |
+| `docktornet.gatus.<index>.area` | no | `core`, `backups`, `storage`, `network`, `apps`, `deploys` or `agents` | `apps` | `backups` | Which part of the estate this endpoint watches. Written to the classification map only. |
+
+Values are lowercase and matched exactly. An unknown `severity` or `area`
+drops that monitor and logs a warning naming it, the same as any other
+malformed `gatus` label. It never falls back to the default, so a typo cannot
+quietly demote a critical endpoint. Every other monitor on the container is
+still published.
+
+### Gatus classification map
+
+Next to the per-service Gatus files, the server writes
+`docktornet-classification.json` in `DOCKTORNET_GATUS_CONFIG_DIR`. An alert
+service reads it to label Gatus alerts and to apply thresholds the way Gatus
+does. Gatus loads only `.yaml` and `.yml` files, so it ignores this file, and
+rewriting it never makes Gatus reload.
+
+```json
+{
+  "version": 1,
+  "endpoints": [
+    {
+      "key": "media_jellyfin",
+      "name": "jellyfin",
+      "group": "media",
+      "service_id": "batterdock/jellyfin",
+      "host": "batterdock",
+      "severity": "critical",
+      "severity_defaulted": false,
+      "area": "apps",
+      "area_defaulted": true,
+      "alert": { "failure_threshold": 3, "success_threshold": 2 }
+    }
+  ]
+}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `version` | integer | Format version, currently `1`. A change that breaks a reader bumps it; new fields can appear without a bump. |
+| `endpoints` | array | One entry per Gatus endpoint Docktornet manages, sorted by `key`. |
+| `key` | string | Gatus's endpoint key: group and name, each lowercased and trimmed with `/ _ . , #` and spaces turned into `-`, joined by `_`. It is the key Gatus uses in its API. |
+| `name`, `group` | string | The endpoint's name and group exactly as written to the Gatus config. |
+| `service_id` | string | The `<machine>/<container>` that owns the endpoint. |
+| `host` | string | The lowercase machine ID of the agent that reported the container. It comes from the agent, never from the `group` label. |
+| `severity` | string | `critical`, `warning` or `info`. |
+| `severity_defaulted` | bool | `true` when no `severity` label was set and `warning` applies. |
+| `area` | string | `core`, `backups`, `storage`, `network`, `apps`, `deploys` or `agents`. |
+| `area_defaulted` | bool | `true` when no `area` label was set and `apps` applies. |
+| `alert` | object or `null` | The thresholds Gatus applies to the endpoint's alert, or `null` when it has none (`telegram=false`). `failure_threshold` is how many failed checks in a row trigger the alert; `success_threshold` is how many passing checks in a row resolve it. |
+
+Docktornet's alert sets no thresholds, so Gatus takes them from
+`alerting.custom.default-alert` in the base config and uses its own defaults, 3
+and 2, for any value that is unset or not above zero. The server reads the
+base config from the other YAML files in the same directory to report the same
+numbers. Write the thresholds as plain numbers there: Gatus fills in `${VAR}`
+placeholders from its own environment, which the server cannot see, so the
+server logs a warning and reports Gatus's default for that value instead. If you change `default-alert`, the map catches up within a minute.
+
+The map is rewritten whenever its content changes: after a snapshot changes a
+Gatus file, on every full resync, and on the removal sweep every minute. It lists
+exactly the endpoints in the Gatus files on disk, so a service that has left
+stays in the map through its five-minute grace period, while Gatus still
+monitors it, and leaves the map when its file is deleted. One exception: a
+service that was already inside its grace period when the server was upgraded
+to 1.2.0 has no entry, because its labels were gone before the server recorded
+them. Its file is deleted within about five minutes anyway.
 
 ### Example
 
@@ -212,6 +279,7 @@ services:
       # Gatus monitors
       docktornet.gatus.0.url: https://flowsync.example.com
       docktornet.gatus.0.interval: 30s
+      docktornet.gatus.0.severity: critical
       docktornet.gatus.1.url: https://flowsync.home.local
       docktornet.gatus.1.interval: 30s
       docktornet.gatus.2.url: http://192.168.1.42:8080

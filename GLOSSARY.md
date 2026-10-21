@@ -46,3 +46,17 @@ Adoption of a resource whose ownership marker names the service. Always allowed.
 **Hostname adoption**:
 Adoption of an unmarked resource because its hostname matches a service's labels. Allowed only when `DOCKTORNET_ADOPT_EXISTING` is on, and never for a resource whose marker names another service.
 _Avoid_: legacy adoption
+
+### Monitoring
+
+**Classification map**:
+The `docktornet-classification.json` file the server writes next to the Gatus service files. For each Gatus endpoint it gives the severity, area, host and alert thresholds an alert service needs. Its `host` is the machine ID of the reporting agent, not an NPM host.
+_Avoid_: alert map, label map
+
+**Severity**:
+How urgent a Gatus endpoint's alerts are: `critical`, `warning` or `info`.
+_Avoid_: priority, level
+
+**Area**:
+The part of the estate a Gatus endpoint watches, such as `backups` or `network`.
+_Avoid_: category, component

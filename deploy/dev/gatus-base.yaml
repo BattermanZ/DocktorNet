@@ -9,6 +9,8 @@ alerting:
     body: "[ALERT_TRIGGERED_OR_RESOLVED] [ENDPOINT_NAME]"
     default-alert:
       send-on-resolved: true
+      # Not Gatus's default of 3, so the classification map shows it was read.
+      failure-threshold: 4
 # Gatus refuses to start with no endpoints, so watch the dev server itself.
 endpoints:
   - name: docktornet-server

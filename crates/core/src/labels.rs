@@ -54,6 +54,68 @@ pub struct GatusMonitor {
     pub group: Option<String>,
     pub name: Option<String>,
     pub telegram: bool,
+    /// `None` when the label is absent; [`Severity::DEFAULT`] applies then.
+    pub severity: Option<Severity>,
+    /// `None` when the label is absent; [`Area::DEFAULT`] applies then.
+    pub area: Option<Area>,
+}
+
+/// How urgent an alert from a Gatus endpoint is, for the alert service that
+/// reads the classification map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Critical,
+    Warning,
+    Info,
+}
+
+impl Severity {
+    pub const DEFAULT: Severity = Severity::Warning;
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "critical" => Ok(Self::Critical),
+            "warning" => Ok(Self::Warning),
+            "info" => Ok(Self::Info),
+            other => Err(format!(
+                "severity must be critical|warning|info, got '{other}'"
+            )),
+        }
+    }
+}
+
+/// Which part of the estate a Gatus endpoint watches, for the alert service
+/// that reads the classification map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Area {
+    Core,
+    Backups,
+    Storage,
+    Network,
+    Apps,
+    Deploys,
+    Agents,
+}
+
+impl Area {
+    pub const DEFAULT: Area = Area::Apps;
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "core" => Ok(Self::Core),
+            "backups" => Ok(Self::Backups),
+            "storage" => Ok(Self::Storage),
+            "network" => Ok(Self::Network),
+            "apps" => Ok(Self::Apps),
+            "deploys" => Ok(Self::Deploys),
+            "agents" => Ok(Self::Agents),
+            other => Err(format!(
+                "area must be core|backups|storage|network|apps|deploys|agents, got '{other}'"
+            )),
+        }
+    }
 }
 
 pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
@@ -288,6 +350,16 @@ fn build_gatus(index: u8, fields: &BTreeMap<String, String>) -> Result<GatusMoni
         Some(value) => parse_bool(value)?,
         None => true,
     };
+    // An unknown value drops the monitor rather than defaulting: a typo must
+    // not quietly demote a critical endpoint.
+    let severity = fields
+        .get("severity")
+        .map(|value| Severity::parse(value))
+        .transpose()?;
+    let area = fields
+        .get("area")
+        .map(|value| Area::parse(value))
+        .transpose()?;
 
     Ok(GatusMonitor {
         index,
@@ -297,13 +369,15 @@ fn build_gatus(index: u8, fields: &BTreeMap<String, String>) -> Result<GatusMoni
         group,
         name,
         telegram,
+        severity,
+        area,
     })
 }
 
 fn is_gatus_field(field: &str) -> bool {
     matches!(
         field,
-        "url" | "interval" | "conditions" | "group" | "name" | "telegram"
+        "url" | "interval" | "conditions" | "group" | "name" | "telegram" | "severity" | "area"
     )
 }
 
@@ -737,5 +811,49 @@ mod tests {
             ("docktornet.gatus.0.name", ""),
         ]));
         assert_eq!(p.gatus[0].name, None);
+    }
+
+    #[test]
+    fn gatus_severity_and_area_parse_when_set() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+            ("docktornet.gatus.0.severity", "critical"),
+            ("docktornet.gatus.0.area", "network"),
+        ]));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(p.gatus[0].severity, Some(Severity::Critical));
+        assert_eq!(p.gatus[0].area, Some(Area::Network));
+    }
+
+    #[test]
+    fn gatus_severity_and_area_are_none_when_absent() {
+        let p = parse(&lbl(&[
+            ("docktornet.gatus.0.url", "https://x"),
+            ("docktornet.gatus.0.interval", "30s"),
+        ]));
+        assert_eq!(p.gatus[0].severity, None);
+        assert_eq!(p.gatus[0].area, None);
+    }
+
+    #[test]
+    fn gatus_unknown_severity_or_area_drops_the_monitor_with_a_warning() {
+        for (field, value) in [
+            ("severity", "urgent"),
+            ("severity", "Critical"),
+            ("severity", ""),
+            ("area", "databases"),
+        ] {
+            let key = format!("docktornet.gatus.0.{field}");
+            let p = parse(&lbl(&[
+                ("docktornet.gatus.0.url", "https://x"),
+                ("docktornet.gatus.0.interval", "30s"),
+                (key.as_str(), value),
+            ]));
+            assert!(p.gatus.is_empty(), "{field}={value:?} must not default");
+            assert_eq!(p.warnings.len(), 1);
+            assert!(p.warnings[0].contains("gatus.0"), "{:?}", p.warnings);
+            assert!(p.warnings[0].contains(field), "{:?}", p.warnings);
+        }
     }
 }

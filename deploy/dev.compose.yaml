@@ -102,6 +102,8 @@ services:
     volumes:
       - ../dev-data/server-data:/data
       - ../dev-data/gatus-config:/etc/gatus/config.d
+      # The server reads the base config's default alert for the classification map.
+      - ./dev/gatus-base.yaml:/etc/gatus/config.d/00-base.yaml:ro
     depends_on:
       dev-data-init:
         condition: service_completed_successfully

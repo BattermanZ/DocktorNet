@@ -451,6 +451,45 @@ pub async fn delete_pending_gatus_removal(
     Ok(())
 }
 
+/// Store a service's classification map entries, replacing any earlier ones.
+pub async fn set_gatus_classification(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    endpoints_json: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO gatus_classifications (service_id, endpoints_json)
+           VALUES (?, ?)
+           ON CONFLICT(service_id) DO UPDATE SET endpoints_json = excluded.endpoints_json"#,
+    )
+    .bind(service_id)
+    .bind(endpoints_json)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_gatus_classifications(
+    pool: &Pool<Sqlite>,
+) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as(
+        "SELECT service_id, endpoints_json FROM gatus_classifications ORDER BY service_id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn delete_gatus_classification(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM gatus_classifications WHERE service_id = ?")
+        .bind(service_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn get_cf_dns_record(
     pool: &Pool<Sqlite>,
     service_id: &str,

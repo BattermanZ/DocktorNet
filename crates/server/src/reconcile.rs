@@ -651,6 +651,10 @@ impl Reconciler {
             let expected = self.expected_gatus_files().await?;
             self.sweep_removals(&expected, npm_ctx.as_ref(), &mut report)
                 .await;
+            if let Err(err) = self.refresh_classification_map().await {
+                tracing::warn!(error = %err, "gatus classification map refresh failed");
+                report.failed += 1;
+            }
         }
 
         tracing::info!(
@@ -704,6 +708,10 @@ impl Reconciler {
         let npm_failed = self
             .sweep_removals(&expected, npm_ctx.as_ref(), &mut report)
             .await;
+        if let Err(err) = self.refresh_classification_map().await {
+            tracing::warn!(error = %err, "gatus classification map refresh failed");
+            report.failed += 1;
+        }
         if npm_ctx.is_some() {
             if npm_failed {
                 self.npm_breaker.record_failure(std::time::Instant::now());
@@ -873,6 +881,64 @@ impl Reconciler {
     async fn touch_gatus_reload_trigger(&self) -> anyhow::Result<()> {
         crate::integrations::gatus::touch_reload_trigger(&self.options.gatus_config_dir).await?;
         tracing::info!("gatus service files deleted; reload trigger touched");
+        Ok(())
+    }
+
+    /// Store a service's classification map entries once its Gatus file holds
+    /// these monitors.
+    async fn record_gatus_classification(
+        &self,
+        service_id: &str,
+        monitors: &[docktornet_core::labels::GatusMonitor],
+    ) -> Result<(), ReconcileError> {
+        let endpoints = crate::integrations::gatus::classify_endpoints(service_id, monitors);
+        let json =
+            serde_json::to_string(&endpoints).map_err(|e| ReconcileError::External(e.into()))?;
+        crate::storage::set_gatus_classification(&self.db, service_id, &json).await?;
+        Ok(())
+    }
+
+    /// Rewrite the classification map from the stored entries of every service
+    /// whose Gatus file is on disk, so the map lists exactly the endpoints Gatus
+    /// loads, a departed service's included until its grace period ends.  Rows
+    /// whose file is gone are dropped.
+    async fn refresh_classification_map(&self) -> anyhow::Result<()> {
+        let dir = &self.options.gatus_config_dir;
+        let mut endpoints = Vec::new();
+        for (service_id, endpoints_json) in
+            crate::storage::list_gatus_classifications(&self.db).await?
+        {
+            let path = crate::integrations::gatus::service_file_path(dir, &service_id);
+            match tokio::fs::try_exists(&path).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    crate::storage::delete_gatus_classification(&self.db, &service_id).await?;
+                    continue;
+                }
+                // Keep an entry whose file cannot be checked: dropping it would
+                // unlabel a monitor Gatus may still run.
+                Err(err) => {
+                    tracing::warn!(service_id, path = %path.display(), error = %err, "could not check gatus file; keeping its classification");
+                }
+            }
+            match serde_json::from_str::<Vec<crate::integrations::gatus::ClassifiedEndpoint>>(
+                &endpoints_json,
+            ) {
+                Ok(stored) => endpoints.extend(stored),
+                Err(err) => {
+                    tracing::warn!(service_id, error = %err, "dropping unreadable gatus classification");
+                    crate::storage::delete_gatus_classification(&self.db, &service_id).await?;
+                }
+            }
+        }
+        let thresholds = crate::integrations::gatus::alert_thresholds(dir).await;
+        if crate::integrations::gatus::write_classification_map(dir, &endpoints, thresholds).await?
+        {
+            tracing::info!(
+                endpoints = endpoints.len(),
+                "gatus classification map written"
+            );
+        }
         Ok(())
     }
 
@@ -1125,22 +1191,26 @@ impl Reconciler {
         let intended = crate::integrations::gatus::render_gatus_yaml(service_id, monitors)
             .map_err(|e| ReconcileError::External(e.into()))?;
         let current = tokio::fs::read_to_string(&target).await.ok();
-        if current.as_deref() == Some(intended.as_str()) {
-            return Ok(false);
-        }
         if self.options.dry_run {
-            tracing::debug!(service_id, path = %target.display(), "dry-run: would rewrite gatus file");
+            if current.as_deref() != Some(intended.as_str()) {
+                tracing::debug!(service_id, path = %target.display(), "dry-run: would rewrite gatus file");
+            }
             return Ok(false);
         }
-        tracing::info!(service_id, path = %target.display(), "gatus file drifted, rewriting");
-        crate::integrations::gatus::write_service_file(
-            &self.options.gatus_config_dir,
-            service_id,
-            monitors,
-        )
-        .await
-        .map_err(ReconcileError::External)?;
-        Ok(true)
+        let rewrote = current.as_deref() != Some(intended.as_str());
+        if rewrote {
+            tracing::info!(service_id, path = %target.display(), "gatus file drifted, rewriting");
+            crate::integrations::gatus::write_service_file(
+                &self.options.gatus_config_dir,
+                service_id,
+                monitors,
+            )
+            .await
+            .map_err(ReconcileError::External)?;
+        }
+        self.record_gatus_classification(service_id, monitors)
+            .await?;
+        Ok(rewrote)
     }
 
     /// Persist the snapshot to SQLite and return the `(service_id, last_seen)`
@@ -1311,6 +1381,10 @@ impl Reconciler {
         }
         if gatus_removed && let Err(err) = self.touch_gatus_reload_trigger().await {
             tracing::warn!(error = %err, "gatus reload trigger failed");
+            failures += 1;
+        }
+        if let Err(err) = self.refresh_classification_map().await {
+            tracing::warn!(error = %err, "gatus classification map refresh failed");
             failures += 1;
         }
 
@@ -1571,6 +1645,8 @@ impl Reconciler {
             )
             .await?;
         }
+        self.record_gatus_classification(&service.service_id, &service.labels.gatus)
+            .await?;
         Ok(false)
     }
 
