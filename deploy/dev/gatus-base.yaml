@@ -1,0 +1,19 @@
+# Base Gatus config for the dev stack. Docktornet writes the per-service files
+# next to it. Alerts go to a closed local port, so they fail quietly.
+web:
+  port: 8080
+alerting:
+  custom:
+    url: "http://127.0.0.1:9/dev-alert"
+    method: "POST"
+    body: "[ALERT_TRIGGERED_OR_RESOLVED] [ENDPOINT_NAME]"
+    default-alert:
+      send-on-resolved: true
+# Gatus refuses to start with no endpoints, so watch the dev server itself.
+endpoints:
+  - name: docktornet-server
+    group: dev
+    url: "http://docktornet-server:5363/healthz"
+    interval: 30s
+    conditions:
+      - "[STATUS] == 200"

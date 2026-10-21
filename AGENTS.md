@@ -1,8 +1,8 @@
 
 # AGENTS.md — Minimal AI Agent Protocol
 
-Version: 2.6
-Last updated: 2026-05-12
+Version: 2.7
+Last updated: 2026-10-21
 Scope: Entire repository (unless a subdirectory explicitly overrides this file)
 
 This protocol exists to:
@@ -190,3 +190,30 @@ When the Implementer creates a commit for new code, use this format:
 5) Reset `development` hard to `origin/main`.
 6) Force-push `development` with `--force-with-lease` to every configured remote.
 7) Verify all relevant remote refs for `development` and `main`.
+
+---
+
+## 9) Live test environment (MUST)
+
+`deploy/dev.compose.yaml` is the live test environment: a throwaway NPM, a Cloudflare API stub, Gatus, and a server and agent built from the working tree. Production NPM and Cloudflare are never a test environment.
+
+Run labelled test containers inside the stack's `dind` daemon only. A production agent on the host reads `docktornet.*` labels from both the host's Docker and Podman sockets and reconciles them into production NPM and Cloudflare.
+
+1) Start (rebuilds both images from the working tree; the server runs as your uid so `dev-data/` stays yours):
+   `DEV_UID=$(id -u) DEV_GID=$(id -g) docker compose -f deploy/dev.compose.yaml up -d --build --wait`
+2) Run a labelled container inside `dind`:
+   ```bash
+   docker compose -f deploy/dev.compose.yaml exec dind docker run -d --name whoami -p 18080:80 \
+     -l docktornet.npm.0.host=whoami.dev.test -l docktornet.npm.0.port=18080 \
+     -l docktornet.npm.0.scheme=http -l docktornet.npm.0.ssl=false \
+     -l docktornet.cf.dns.name=whoami -l docktornet.cf.dns.target=dev.test -l docktornet.cf.dns.proxied=false \
+     -l docktornet.gatus.0.url=http://dind:18080 -l docktornet.gatus.0.interval=10s \
+     traefik/whoami:v1.10.3
+   ```
+3) Read the result. The agent polls every 5s.
+   - NPM: `T=$(curl -s -X POST 127.0.0.1:18081/api/tokens -H 'Content-Type: application/json' -d '{"identity":"dev@example.com","secret":"dev-npm-password"}' | jq -r .token); curl -s 127.0.0.1:18081/api/nginx/proxy-hosts -H "Authorization: Bearer $T"`, and the proxy itself: `curl -H 'Host: whoami.dev.test' 127.0.0.1:18080`
+   - Cloudflare stub: `curl -s 127.0.0.1:18086/_stub/records`
+   - Gatus: `ls dev-data/gatus-config` and `curl -s 127.0.0.1:18085/api/v1/endpoints/statuses`
+   - Server log: `docker compose -f deploy/dev.compose.yaml logs docktornet-server`
+4) Remove: `docker compose -f deploy/dev.compose.yaml exec dind docker rm -f whoami`. Deletions wait out the 300s grace period. Pending removals then drain on the next full resync, every 30s in this stack. Rerun the step 3 reads: the proxy host, the stub record and the `devbox__whoami--*.yaml` file are gone.
+5) Tear down: `docker compose -f deploy/dev.compose.yaml down -v && rm -rf dev-data`

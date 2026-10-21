@@ -4,6 +4,9 @@ use std::time::Duration;
 
 use url::Url;
 
+/// The public Cloudflare v4 API, used unless `DOCKTORNET_CF_API_URL` overrides it.
+pub const CLOUDFLARE_API_URL: &str = "https://api.cloudflare.com/client/v4";
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ServerConfig {
@@ -16,6 +19,7 @@ pub struct ServerConfig {
     pub full_resync_interval: Duration,
     pub npm: NpmConfig,
     pub cloudflare: CloudflareConfig,
+    pub cloudflare_api_url: Url,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +98,11 @@ impl ServerConfig {
                 api_token: required("DOCKTORNET_CF_API_TOKEN")?,
                 zone_id: required("DOCKTORNET_CF_ZONE_ID")?,
             },
+            cloudflare_api_url: parse_cloudflare_api_url(
+                env.get("DOCKTORNET_CF_API_URL")
+                    .cloned()
+                    .unwrap_or_else(|| CLOUDFLARE_API_URL.to_string()),
+            )?,
         })
     }
 }
@@ -129,6 +138,19 @@ fn parse_url(value: String, name: &'static str) -> Result<Url, ConfigError> {
     match url.scheme() {
         "http" | "https" => Ok(url),
         _ => Err(ConfigError::InvalidUrl { name, value }),
+    }
+}
+
+/// Like [`parse_url`], but the path must be the v4 API root.  Cloudflare
+/// answers 404 off that path, and the client reads a 404 on delete as "already
+/// gone", so a bare host would make every DNS deletion a silent no-op.
+fn parse_cloudflare_api_url(value: String) -> Result<Url, ConfigError> {
+    const NAME: &str = "DOCKTORNET_CF_API_URL";
+    let url = parse_url(value.clone(), NAME)?;
+    if url.path().trim_end_matches('/').ends_with("/client/v4") {
+        Ok(url)
+    } else {
+        Err(ConfigError::InvalidUrl { name: NAME, value })
     }
 }
 
@@ -343,6 +365,97 @@ mod tests {
 
         match err {
             ConfigError::Empty(name) => assert_eq!(name, "DOCKTORNET_SECRET"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cloudflare_api_url_defaults_to_the_public_api() {
+        let c = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.cloudflare_api_url.as_str(),
+            "https://api.cloudflare.com/client/v4"
+        );
+    }
+
+    #[test]
+    fn cloudflare_api_url_can_point_at_a_stub() {
+        let c = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+            ("DOCKTORNET_CF_API_URL", "http://cf-stub:8080/client/v4"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.cloudflare_api_url.as_str(),
+            "http://cf-stub:8080/client/v4"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_cloudflare_api_url() {
+        let err = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+            ("DOCKTORNET_CF_API_URL", "cf-stub:8080"),
+        ]))
+        .unwrap_err();
+
+        match err {
+            ConfigError::InvalidUrl { name, value } => {
+                assert_eq!(name, "DOCKTORNET_CF_API_URL");
+                assert_eq!(value, "cf-stub:8080");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_cloudflare_api_url_without_the_v4_path() {
+        let err = ServerConfig::from_map(env(&[
+            ("DOCKTORNET_LISTEN", "0.0.0.0:5363"),
+            ("DOCKTORNET_SECRET", "s"),
+            ("DOCKTORNET_DB_PATH", "/data/x.db"),
+            ("DOCKTORNET_GATUS_CONFIG_DIR", "/etc/gatus/config"),
+            ("DOCKTORNET_NPM_URL", "http://npm:81"),
+            ("DOCKTORNET_NPM_USER", "admin@example.com"),
+            ("DOCKTORNET_NPM_PASSWORD", "pw"),
+            ("DOCKTORNET_CF_API_TOKEN", "token"),
+            ("DOCKTORNET_CF_ZONE_ID", "zone"),
+            ("DOCKTORNET_CF_API_URL", "https://api.cloudflare.com"),
+        ]))
+        .unwrap_err();
+
+        match err {
+            ConfigError::InvalidUrl { name, value } => {
+                assert_eq!(name, "DOCKTORNET_CF_API_URL");
+                assert_eq!(value, "https://api.cloudflare.com");
+            }
             other => panic!("unexpected error: {other:?}"),
         }
     }

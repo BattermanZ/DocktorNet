@@ -32,7 +32,8 @@ Give `DOCKTORNET_DB_PATH` as an absolute path on the `./data:/data` volume. A re
 | `DOCKTORNET_DRY_RUN` | optional (`true`) | — |
 | `DOCKTORNET_ADOPT_EXISTING` | optional (`false`) | — |
 | `DOCKTORNET_NPM_*` | required | — |
-| `DOCKTORNET_CF_*` | required | — |
+| `DOCKTORNET_CF_API_TOKEN`, `DOCKTORNET_CF_ZONE_ID` | required | — |
+| `DOCKTORNET_CF_API_URL` | optional (`https://api.cloudflare.com/client/v4`); the dev stack points it at its stub | — |
 | `DOCKTORNET_SERVER_URL` | — | required |
 | `DOCKTORNET_POLL_INTERVAL` | — | required |
 | `DOCKTORNET_MACHINE_ID` | — | required |

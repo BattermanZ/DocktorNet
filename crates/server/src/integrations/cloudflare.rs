@@ -87,7 +87,7 @@ struct DeleteResponse {
 
 impl CloudflareClient {
     pub fn new(config: CloudflareConfig) -> Self {
-        Self::with_base_url(config, "https://api.cloudflare.com/client/v4")
+        Self::with_base_url(config, crate::config::CLOUDFLARE_API_URL)
     }
 
     pub fn with_base_url(config: CloudflareConfig, base_url: impl Into<String>) -> Self {
