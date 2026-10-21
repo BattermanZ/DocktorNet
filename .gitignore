@@ -49,3 +49,6 @@ deploy/smoke.compose.yaml
 
 # Dev stack data (deploy/dev.compose.yaml)
 /dev-data/
+
+# Machine-local agent instructions
+/AGENTS.local.md
