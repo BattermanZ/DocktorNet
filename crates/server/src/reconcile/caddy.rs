@@ -1,5 +1,7 @@
 //! The Caddy side of a machine's apply: departed services, dropped indices,
-//! host claims and route writes inside the anchor route.
+//! host claims and route writes inside the anchor route.  Also the Caddy work
+//! of the pending-removal sweep: deleting pending removals and the drift
+//! check.
 
 use std::collections::HashSet;
 
@@ -8,8 +10,10 @@ use docktornet_core::labels::ParsedLabels;
 use serde_json::Value;
 
 use super::{
-    GATUS_REMOVAL_GRACE_SECS, ReconcileError, Reconciler, RemovedService, ResyncReport, past_grace,
+    CaddyAnchor, GATUS_REMOVAL_GRACE_SECS, ReconcileError, Reconciler, RemovedService,
+    ResyncReport, past_grace,
 };
+use crate::breaker::CircuitBreaker;
 use crate::integrations::caddy::{CaddyClient, CaddyError, position_of, render_route};
 use crate::integrations::intended::IntendedService;
 use crate::storage::{CaddyClaim, CaddyRouteRow};
@@ -21,6 +25,26 @@ pub(super) struct CaddyApply {
     pub failures: usize,
     /// The breaker was open, so the Caddy work waits for a later apply.
     pub skipped: bool,
+}
+
+/// What a pass sent Caddy, for the breaker.
+#[derive(Debug, Default)]
+struct Contact {
+    /// The pass sent Caddy a request.
+    made: bool,
+    /// A request failed in a way that feeds the breaker.
+    failed: bool,
+}
+
+impl Contact {
+    /// Tell `breaker` how the pass went, once, and only if it reached Caddy.
+    fn record(&self, breaker: &CircuitBreaker) {
+        if self.failed {
+            breaker.record_failure(std::time::Instant::now());
+        } else if self.made {
+            breaker.record_success();
+        }
+    }
 }
 
 /// Why one route couldn't be written.
@@ -89,10 +113,7 @@ impl Reconciler {
             return Ok(out);
         }
 
-        let mut breaker_failed = false;
-        // Whether this apply sent Caddy a request, so the breaker hears only
-        // about calls that were made.
-        let mut contacted = false;
+        let mut contact = Contact::default();
 
         // The routes of services that left are pending removals already,
         // parked when the snapshot was persisted.  Past the grace period they
@@ -103,7 +124,7 @@ impl Reconciler {
         for rs in departed.iter().filter(|rs| due(rs)) {
             for (caddy_index, _) in &rs.caddy_routes {
                 let marker = caddy_route_marker(&rs.service_id, index_u8(*caddy_index));
-                contacted = true;
+                contact.made = true;
                 match client.delete_route(&marker).await {
                     Ok(()) => {
                         tracing::info!(service_id = %rs.service_id, marker, "caddy route deleted: its service is gone");
@@ -117,7 +138,7 @@ impl Reconciler {
                     Err(err) => {
                         tracing::warn!(service_id = %rs.service_id, marker, error = %err, "caddy route delete failed; deferring");
                         out.failures += 1;
-                        breaker_failed |= err.feeds_breaker();
+                        contact.failed |= err.feeds_breaker();
                     }
                 }
             }
@@ -129,7 +150,7 @@ impl Reconciler {
         for (service, rows) in &work {
             for row in dropped(service, rows) {
                 let marker = caddy_route_marker(&service.service_id, index_u8(row.caddy_index));
-                contacted = true;
+                contact.made = true;
                 match client.delete_route(&marker).await {
                     Ok(()) => {
                         tracing::info!(service_id = %service.service_id, marker, "caddy route deleted: its labels are gone");
@@ -143,7 +164,7 @@ impl Reconciler {
                     Err(err) => {
                         tracing::warn!(service_id = %service.service_id, marker, error = %err, "caddy route delete failed; deferring");
                         out.failures += 1;
-                        breaker_failed |= err.feeds_breaker();
+                        contact.failed |= err.feeds_breaker();
                         self.park_caddy_route(&service.service_id, row, now).await?;
                     }
                 }
@@ -155,8 +176,8 @@ impl Reconciler {
             .any(|(service, _)| !service.labels.caddy.is_empty())
         {
             let pending = crate::storage::list_pending_caddy_removals(&self.db).await?;
-            contacted = true;
-            match client.anchor_routes().await {
+            contact.made = true;
+            match self.read_anchor(client).await {
                 Ok(Some(mut anchor)) => {
                     for (service, rows) in &work {
                         // A pending row the claim moves back is a restore, not
@@ -178,31 +199,24 @@ impl Reconciler {
                                 service,
                                 &mapped,
                                 forward_host,
-                                &mut breaker_failed,
+                                &mut contact,
                             )
                             .await?;
                     }
                 }
                 Ok(None) => {
-                    tracing::error!(
-                        anchor = client.anchor_id(),
-                        "caddy anchor route not found; add it to Caddy's config, docktornet never creates it"
-                    );
+                    log_missing_anchor(client);
                     out.failures += 1;
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "caddy reconcile skipped: reading the anchor's routes failed");
                     out.failures += 1;
-                    breaker_failed |= err.feeds_breaker();
+                    contact.failed |= err.feeds_breaker();
                 }
             }
         }
 
-        if breaker_failed {
-            self.caddy_breaker.record_failure(std::time::Instant::now());
-        } else if contacted {
-            self.caddy_breaker.record_success();
-        }
+        contact.record(&self.caddy_breaker);
         Ok(out)
     }
 
@@ -219,7 +233,7 @@ impl Reconciler {
         service: &IntendedService,
         mapped: &HashSet<i64>,
         forward_host: &str,
-        breaker_failed: &mut bool,
+        contact: &mut Contact,
     ) -> Result<usize, ReconcileError> {
         let service_id = service.service_id.as_str();
         let mut failures = 0;
@@ -257,24 +271,33 @@ impl Reconciler {
                 tracing::info!(service_id, marker, "caddy route adopted by marker");
             }
             match write_route(client, anchor, &marker, rendered).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(WriteError::Caddy(err)) => {
                     tracing::warn!(service_id, marker, error = %err, "caddy route write failed");
-                    *breaker_failed |= err.feeds_breaker();
+                    contact.failed |= err.feeds_breaker();
                     failures += 1;
                 }
                 Err(WriteError::OutsideAnchor) => {
-                    tracing::error!(
-                        service_id,
-                        marker,
-                        anchor = client.anchor_id(),
-                        "a caddy route with this service's marker sits outside the anchor route; leaving it alone"
-                    );
+                    log_outside_anchor(client, service_id, &marker);
                     failures += 1;
                 }
             }
         }
         Ok(failures)
+    }
+
+    /// The Caddy work of the pending-removal sweep and the full resync: delete
+    /// pending removals past grace, then put drifted routes back.  The breaker
+    /// hears once about the whole pass, and only when it sent Caddy a request.
+    pub(super) async fn sweep_and_check_caddy(&self, report: &mut ResyncReport) {
+        let Some(client) = &self.caddy else {
+            return;
+        };
+        let mut contact = Contact::default();
+        self.sweep_pending_caddy_removals(client, report, &mut contact)
+            .await;
+        self.check_caddy_drift(client, report, &mut contact).await;
+        contact.record(&self.caddy_breaker);
     }
 
     /// Delete the Caddy routes recorded in `pending_caddy_removals` once they
@@ -284,16 +307,18 @@ impl Reconciler {
     /// that service's apply, and a row whose delete fails stays for the next
     /// sweep.  Caddy is reached only when a row is due and the breaker is
     /// closed.
-    pub(super) async fn sweep_pending_caddy_removals(&self, report: &mut ResyncReport) {
+    async fn sweep_pending_caddy_removals(
+        &self,
+        client: &CaddyClient,
+        report: &mut ResyncReport,
+        contact: &mut Contact,
+    ) {
         let pending = match crate::storage::list_pending_caddy_removals(&self.db).await {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(error = %err, "could not list pending caddy removals");
                 return;
             }
-        };
-        let Some(client) = &self.caddy else {
-            return;
         };
         let now = self.clock.now();
         let mut due = Vec::new();
@@ -316,9 +341,9 @@ impl Reconciler {
             return;
         }
 
-        let mut breaker_failed = false;
         for row in due {
             let marker = caddy_route_marker(&row.service_id, index_u8(row.caddy_index));
+            contact.made = true;
             match client.delete_route(&marker).await {
                 Ok(()) => {
                     tracing::info!(service_id = %row.service_id, marker, "pending caddy route deleted");
@@ -339,15 +364,85 @@ impl Reconciler {
                 Err(err) => {
                     tracing::warn!(service_id = %row.service_id, marker, error = %err, "pending caddy route delete failed");
                     report.failed += 1;
-                    breaker_failed |= err.feeds_breaker();
+                    contact.failed |= err.feeds_breaker();
                 }
             }
         }
-        if breaker_failed {
-            self.caddy_breaker.record_failure(std::time::Instant::now());
-        } else {
-            self.caddy_breaker.record_success();
+    }
+
+    /// Put back every mapped route that drifted from its mapping row: deleted
+    /// or edited by hand, or emptied out of the anchor by a `caddy reload`.
+    /// The row holds the route its last successful claim rendered, so a
+    /// refused label edit can't reach Caddy this way.  A missing route follows
+    /// the apply's write rule.  Routes in the anchor with no mapping, and the
+    /// routes of pending removals, are left alone.  Records what the anchor
+    /// read found, and never creates the anchor.
+    async fn check_caddy_drift(
+        &self,
+        client: &CaddyClient,
+        report: &mut ResyncReport,
+        contact: &mut Contact,
+    ) {
+        if self.caddy_breaker.is_open(std::time::Instant::now()) {
+            tracing::warn!("caddy circuit breaker open; skipping the caddy drift check");
+            return;
         }
+        let rows = match crate::storage::list_caddy_routes(&self.db).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(error = %err, "caddy drift check skipped: could not list caddy routes");
+                report.failed += 1;
+                return;
+            }
+        };
+        contact.made = true;
+        let mut anchor = match self.read_anchor(client).await {
+            Ok(Some(anchor)) => anchor,
+            Ok(None) => {
+                log_missing_anchor(client);
+                report.failed += 1;
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "caddy drift check skipped: reading the anchor's routes failed");
+                report.failed += 1;
+                contact.failed |= err.feeds_breaker();
+                return;
+            }
+        };
+        for (service_id, row) in rows {
+            let marker = caddy_route_marker(&service_id, index_u8(row.caddy_index));
+            match write_route(client, &mut anchor, &marker, row.route).await {
+                Ok(wrote) => report.count(wrote),
+                Err(WriteError::Caddy(err)) => {
+                    tracing::warn!(service_id, marker, error = %err, "caddy drift repair failed");
+                    report.failed += 1;
+                    contact.failed |= err.feeds_breaker();
+                }
+                Err(WriteError::OutsideAnchor) => {
+                    log_outside_anchor(client, &service_id, &marker);
+                    report.failed += 1;
+                }
+            }
+        }
+    }
+
+    /// Read the anchor's routes, and record what the read found.
+    async fn read_anchor(&self, client: &CaddyClient) -> Result<Option<Vec<Value>>, CaddyError> {
+        let read = client.anchor_routes().await;
+        self.set_caddy_anchor(match &read {
+            Ok(Some(_)) => CaddyAnchor::Ok,
+            Ok(None) => CaddyAnchor::Missing,
+            Err(_) => CaddyAnchor::Unknown,
+        });
+        read
+    }
+
+    fn set_caddy_anchor(&self, state: CaddyAnchor) {
+        *self
+            .caddy_anchor
+            .lock()
+            .expect("caddy anchor mutex poisoned") = state;
     }
 
     /// Park every mapping row of `service` whose index its labels dropped.
@@ -401,6 +496,22 @@ fn dropped<'a>(
         .filter(|row| !lists_caddy_index(&service.labels, row.caddy_index))
 }
 
+fn log_missing_anchor(client: &CaddyClient) {
+    tracing::error!(
+        anchor = client.anchor_id(),
+        "caddy anchor route not found; add it to Caddy's config, docktornet never creates it"
+    );
+}
+
+fn log_outside_anchor(client: &CaddyClient, service_id: &str, marker: &str) {
+    tracing::error!(
+        service_id,
+        marker,
+        anchor = client.anchor_id(),
+        "a caddy route with this service's marker sits outside the anchor route; leaving it alone"
+    );
+}
+
 fn index_u8(caddy_index: i64) -> u8 {
     u8::try_from(caddy_index).expect("caddy indices are stored from a u8")
 }
@@ -408,16 +519,18 @@ fn index_u8(caddy_index: i64) -> u8 {
 /// Make the anchor hold `rendered` under `marker`.  A matching route is left
 /// alone, a differing one is patched in place, and a missing one is appended
 /// unless the marker sits elsewhere in Caddy's config.  Routes are compared
-/// as parsed JSON, because Caddy stores them with sorted keys.
+/// as parsed JSON, because Caddy stores them with sorted keys.  Returns
+/// whether it wrote to Caddy.
 async fn write_route(
     client: &CaddyClient,
     anchor: &mut Vec<Value>,
     marker: &str,
     rendered: Value,
-) -> Result<(), WriteError> {
+) -> Result<bool, WriteError> {
     match position_of(anchor, marker) {
         Some(i) if anchor[i] == rendered => {
             tracing::debug!(marker, "caddy route already in sync");
+            return Ok(false);
         }
         Some(i) => {
             client
@@ -444,5 +557,5 @@ async fn write_route(
             anchor.push(rendered);
         }
     }
-    Ok(())
+    Ok(true)
 }

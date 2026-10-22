@@ -661,12 +661,31 @@ pub async fn list_caddy_routes_for_service(
     .fetch_all(pool)
     .await?;
     rows.into_iter()
-        .map(|(caddy_index, hosts, route)| {
-            Ok(CaddyRouteRow {
-                caddy_index,
-                hosts: decode_json(&hosts)?,
-                route: decode_json(&route)?,
-            })
+        .map(|(caddy_index, hosts, route)| caddy_route_row(caddy_index, &hosts, &route))
+        .collect()
+}
+
+fn caddy_route_row(caddy_index: i64, hosts: &str, route: &str) -> sqlx::Result<CaddyRouteRow> {
+    Ok(CaddyRouteRow {
+        caddy_index,
+        hosts: decode_json(hosts)?,
+        route: decode_json(route)?,
+    })
+}
+
+/// Every Caddy route mapping, with its service ID, ordered by service and
+/// index.  A row exists only while its service is stored, because the
+/// `services` cascade deletes it.
+pub async fn list_caddy_routes(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, CaddyRouteRow)>> {
+    let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT service_id, caddy_index, hosts_json, route_json FROM caddy_routes \
+         ORDER BY service_id, caddy_index",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(service_id, caddy_index, hosts, route)| {
+            Ok((service_id, caddy_route_row(caddy_index, &hosts, &route)?))
         })
         .collect()
 }

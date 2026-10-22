@@ -28,6 +28,9 @@ pub struct Reconciler {
     lock: Arc<Mutex<()>>,
     npm_breaker: Arc<CircuitBreaker>,
     caddy_breaker: Arc<CircuitBreaker>,
+    /// What the last read of Caddy's anchor route found, for the health
+    /// endpoint.
+    caddy_anchor: Arc<std::sync::Mutex<CaddyAnchor>>,
     /// Hash of the last successfully-reconciled intent per machine.  Lets an
     /// unchanged snapshot skip the external reconcile entirely (drift is still
     /// caught by the periodic `full_resync`).
@@ -207,6 +210,18 @@ impl ResyncReport {
     }
 }
 
+/// What the last read of Caddy's anchor route found.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CaddyAnchor {
+    /// Not read yet, the read failed, or the Caddy breaker is open.
+    #[default]
+    Unknown,
+    /// Caddy has the anchor route.
+    Ok,
+    /// Caddy answered that it has no route with the anchor's `@id`.
+    Missing,
+}
+
 /// How a full resync ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastResync {
@@ -349,6 +364,19 @@ impl Reconciler {
         Some(SystemTime::now() + (until - now))
     }
 
+    /// What the last read of Caddy's anchor route found, or `Unknown` while
+    /// the Caddy breaker is open: no read happens then, and a failure since
+    /// the last read may have opened it.
+    pub fn caddy_anchor(&self) -> CaddyAnchor {
+        if self.caddy_breaker.is_open(std::time::Instant::now()) {
+            return CaddyAnchor::Unknown;
+        }
+        *self
+            .caddy_anchor
+            .lock()
+            .expect("caddy anchor mutex poisoned")
+    }
+
     /// Open the NPM breaker as a run of failed NPM calls would.
     #[cfg(test)]
     pub(crate) fn trip_npm_breaker(&self) {
@@ -374,6 +402,7 @@ impl Reconciler {
                 CADDY_BREAKER_THRESHOLD,
                 CADDY_BREAKER_COOLDOWN,
             )),
+            caddy_anchor: Arc::default(),
             last_reconciled: Arc::new(Mutex::new(HashMap::new())),
             applies: Arc::default(),
             last_resync: Arc::default(),
@@ -402,6 +431,7 @@ impl Reconciler {
                 CADDY_BREAKER_THRESHOLD,
                 CADDY_BREAKER_COOLDOWN,
             )),
+            caddy_anchor: Arc::default(),
             last_reconciled: Arc::new(Mutex::new(HashMap::new())),
             applies: Arc::default(),
             last_resync: Arc::default(),
@@ -897,10 +927,11 @@ impl Reconciler {
 
     /// Delete what services that left their snapshot still own once their grace
     /// period is over: Gatus files kept through it, then pending NPM,
-    /// Cloudflare and Caddy removals.  The server runs this on a short timer
-    /// so a removal lands soon after its grace period ends, rather than on
-    /// the next `full_resync`.  Unlike `full_resync`, it never re-verifies
-    /// live services.
+    /// Cloudflare and Caddy removals.  Then run the Caddy drift check.  The
+    /// server runs this on a short timer so a removal lands soon after its
+    /// grace period ends, rather than on the next `full_resync`.  Unlike
+    /// `full_resync`, it re-verifies no live service's NPM host, DNS record
+    /// or Gatus file.
     pub async fn sweep_pending_removals(&self) -> Result<ResyncReport, ReconcileError> {
         let _guard = self.lock.lock().await;
         let mut report = ResyncReport::default();
@@ -961,9 +992,11 @@ impl Reconciler {
             }
         }
 
-        if report != ResyncReport::default() {
+        // Routes the drift check found in sync count as verified, which
+        // every tick with a Caddy route does, so they alone aren't logged.
+        if report.repaired > 0 || report.failed > 0 {
             tracing::info!(
-                removed = report.repaired,
+                repaired = report.repaired,
                 failed = report.failed,
                 "pending removal sweep complete"
             );
@@ -971,8 +1004,9 @@ impl Reconciler {
         Ok(report)
     }
 
-    /// The removal sweeps shared by `full_resync` and `sweep_pending_removals`.
-    /// Returns whether an NPM delete failed, for the caller's breaker.
+    /// The removal sweeps and Caddy drift check shared by `full_resync` and
+    /// `sweep_pending_removals`.  Returns whether an NPM delete failed, for
+    /// the caller's breaker.
     async fn sweep_removals(
         &self,
         expected_gatus_files: &std::collections::HashSet<PathBuf>,
@@ -984,7 +1018,7 @@ impl Reconciler {
         self.sweep_orphan_gatus_files(expected_gatus_files).await;
         let npm_failed = self.sweep_pending_npm_removals(npm_ctx, report).await;
         self.sweep_pending_cf_removals(report).await;
-        self.sweep_pending_caddy_removals(report).await;
+        self.sweep_and_check_caddy(report).await;
         npm_failed
     }
 

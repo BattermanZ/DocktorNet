@@ -1390,6 +1390,7 @@ async fn a_failed_pending_delete_stays_for_the_next_sweep() {
     leave(&reconciler, 1_010).await.unwrap();
 
     let failed = expect_delete(&mut f, "m1/app", 0, 502, 1).await;
+    let _anchor = f.anchor(json!([])).await;
     reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS);
     let report = reconciler.sweep_pending_removals().await.unwrap();
     failed.assert_async().await;
@@ -1402,6 +1403,7 @@ async fn a_failed_pending_delete_stays_for_the_next_sweep() {
     f.caddy.reset();
 
     let retried = expect_delete(&mut f, "m1/app", 0, 200, 1).await;
+    let _anchor = f.anchor(json!([])).await;
     reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS + 60);
     reconciler.sweep_pending_removals().await.unwrap();
     retried.assert_async().await;
@@ -1422,6 +1424,7 @@ async fn a_pending_route_already_gone_is_cleared_without_feeding_the_breaker() {
     }
 
     let gone = expect_delete(&mut f, "m1/app", 0, 404, 1).await;
+    let _anchor = f.anchor(json!([])).await;
     reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS);
     let report = reconciler.sweep_pending_removals().await.unwrap();
 
@@ -1574,4 +1577,320 @@ async fn a_route_captured_by_a_replaced_snapshot_is_deleted_in_the_apply_past_gr
 
     delete.assert_async().await;
     assert!(pending(&f).await.is_empty());
+}
+
+/// m1/app's published route, as its mapping row holds it.
+fn app_route(hosts: &[&str], port: u16) -> Value {
+    route("m1/app", 0, hosts, &format!("10.0.0.1:{port}"))
+}
+
+#[tokio::test]
+async fn the_drift_check_recreates_a_deleted_route_without_a_snapshot() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let _anchor = f.anchor(json!([])).await;
+    let _elsewhere = f.no_marked_route_elsewhere().await;
+    let create = f.append(&app_route(&["app.example.com"], 3000)).await;
+
+    let report = reconciler.sweep_pending_removals().await.unwrap();
+
+    create.assert_async().await;
+    assert_eq!(report.repaired, 1);
+    assert_eq!(reconciler.caddy_anchor(), CaddyAnchor::Ok);
+}
+
+#[tokio::test]
+async fn the_full_resync_runs_the_drift_check_too() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let _anchor = f.anchor(json!([])).await;
+    let _elsewhere = f.no_marked_route_elsewhere().await;
+    let create = f.append(&app_route(&["app.example.com"], 3000)).await;
+
+    reconciler.full_resync().await.unwrap();
+
+    create.assert_async().await;
+}
+
+#[tokio::test]
+async fn the_drift_check_reverts_a_hand_edited_route() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let _anchor = f
+        .anchor(json!([app_route(
+            &["app.example.com", "extra.example.com"],
+            9999
+        )]))
+        .await;
+    let post = f.never("POST").await;
+    let revert = f
+        .caddy
+        .mock("PATCH", path("m1/app", 0).as_str())
+        .match_body(Matcher::Json(app_route(&["app.example.com"], 3000)))
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let report = reconciler.sweep_pending_removals().await.unwrap();
+
+    revert.assert_async().await;
+    post.assert_async().await;
+    assert_eq!(report.repaired, 1);
+}
+
+#[tokio::test]
+async fn the_drift_check_restores_the_last_claimed_route_not_a_refused_label_edit() {
+    let mut f = fixture().await;
+    let _anchor = f.anchor(json!([])).await;
+    let _elsewhere = f.no_marked_route_elsewhere().await;
+    let _append = f
+        .caddy
+        .mock("POST", ANCHOR_ROUTES)
+        .with_status(200)
+        .create_async()
+        .await;
+    let reconciler = f.reconciler();
+    let apps = |b_host| {
+        snap(
+            "m1",
+            "10.0.0.1",
+            vec![
+                ("a", caddy_labels(&[(0, "x.example.com", 3000)])),
+                ("b", caddy_labels(&[(0, b_host, 4000)])),
+            ],
+        )
+    };
+    reconciler
+        .reconcile_snapshot(&apps("y.example.com"))
+        .await
+        .unwrap();
+    f.caddy.reset();
+    // b's edit asks for the host a holds, and is refused.
+    let a_route = route("m1/a", 0, &["x.example.com"], "10.0.0.1:3000");
+    let b_route = route("m1/b", 0, &["y.example.com"], "10.0.0.1:4000");
+    let _anchor = f.anchor(json!([a_route, b_route])).await;
+    assert!(
+        reconciler
+            .reconcile_snapshot(&apps("x.example.com"))
+            .await
+            .is_err()
+    );
+    f.caddy.reset();
+
+    // Someone deletes b's route by hand.  The drift check puts back the
+    // route b last claimed.
+    let _anchor = f.anchor(json!([a_route])).await;
+    let _elsewhere = f.no_marked_route_elsewhere().await;
+    let restore = f.append(&b_route).await;
+    let patch = f.never("PATCH").await;
+
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    restore.assert_async().await;
+    patch.assert_async().await;
+}
+
+#[tokio::test]
+async fn the_drift_check_leaves_a_marked_route_outside_the_anchor_alone() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let _anchor = f.anchor(json!([])).await;
+    let _elsewhere = f
+        .caddy
+        .mock("GET", path("m1/app", 0).as_str())
+        .with_status(200)
+        .with_body(app_route(&["app.example.com"], 3000).to_string())
+        .create_async()
+        .await;
+    let post = f.never("POST").await;
+    let patch = f.never("PATCH").await;
+    let buf = LogBuf(Default::default());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::ERROR)
+            .finish(),
+    );
+
+    let report = reconciler.sweep_pending_removals().await.unwrap();
+
+    post.assert_async().await;
+    patch.assert_async().await;
+    assert_eq!(report.failed, 1);
+    let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("outside the anchor") && logs.contains(&caddy_route_marker("m1/app", 0)),
+        "{logs}"
+    );
+    assert_eq!(reconciler.caddy_breaker.consecutive_failures(), 0);
+}
+
+#[tokio::test]
+async fn the_drift_check_writes_nothing_when_caddy_matches() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let read = f
+        .caddy
+        .mock("GET", ANCHOR_ROUTES)
+        .with_status(200)
+        .with_body(json!([app_route(&["app.example.com"], 3000)]).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let mut never = Vec::new();
+    for method in ["POST", "PATCH", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+
+    let report = reconciler.sweep_pending_removals().await.unwrap();
+
+    read.assert_async().await;
+    for mock in never {
+        mock.assert_async().await;
+    }
+    assert_eq!(report.verified, 1);
+    assert_eq!(report.repaired, 0);
+    assert_eq!(reconciler.caddy_anchor(), CaddyAnchor::Ok);
+}
+
+#[tokio::test]
+async fn the_drift_check_leaves_unmapped_and_pending_routes_alone() {
+    let mut f = fixture().await;
+    // m1/app leaves, so its route is a pending removal within grace.
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    leave(&reconciler, 1_010).await.unwrap();
+    // m2/x is mapped and in sync.
+    let x_route = route("m2/x", 0, &["x.example.com"], "10.0.0.2:4000");
+    let _anchor = f.anchor(json!([])).await;
+    let _elsewhere = f.no_marked_route_elsewhere().await;
+    f.append(&x_route).await;
+    reconciler
+        .reconcile_snapshot(&snap(
+            "m2",
+            "10.0.0.2",
+            vec![("x", caddy_labels(&[(0, "x.example.com", 4000)]))],
+        ))
+        .await
+        .unwrap();
+    f.caddy.reset();
+
+    // The anchor lacks the pending route and holds a marked route nothing
+    // maps.
+    let ghost = route("m9/ghost", 0, &["ghost.example.com"], "10.0.0.9:80");
+    let _anchor = f.anchor(json!([x_route, ghost])).await;
+    let mut never = Vec::new();
+    for method in ["POST", "PATCH", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+
+    reconciler.set_now(1_020);
+    let report = reconciler.sweep_pending_removals().await.unwrap();
+
+    for mock in never {
+        mock.assert_async().await;
+    }
+    // Only m2/x was checked: trying to restore the pending route would have
+    // looked it up outside the anchor first, which no mock answers.
+    assert_eq!(report.verified, 1);
+    assert_eq!(report.failed, 0);
+}
+
+#[tokio::test]
+async fn the_drift_check_reports_a_missing_anchor_and_never_creates_it() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let missing = f
+        .caddy
+        .mock("GET", ANCHOR_ROUTES)
+        .with_status(404)
+        .with_body(r#"{"error":"unknown object ID 'docktornet'"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let mut never = Vec::new();
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+    let buf = LogBuf(Default::default());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::ERROR)
+            .finish(),
+    );
+
+    let report = reconciler.sweep_pending_removals().await.unwrap();
+
+    missing.assert_async().await;
+    for mock in never {
+        mock.assert_async().await;
+    }
+    assert_eq!(report.failed, 1);
+    assert_eq!(reconciler.caddy_anchor(), CaddyAnchor::Missing);
+    let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("anchor route not found"), "{logs}");
+}
+
+#[tokio::test]
+async fn the_drift_check_is_skipped_while_the_breaker_is_open() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let _anchor = f
+        .anchor(json!([app_route(&["app.example.com"], 3000)]))
+        .await;
+    reconciler.sweep_pending_removals().await.unwrap();
+    assert_eq!(reconciler.caddy_anchor(), CaddyAnchor::Ok);
+    f.caddy.reset();
+    for _ in 0..CADDY_BREAKER_THRESHOLD {
+        reconciler
+            .caddy_breaker
+            .record_failure(std::time::Instant::now());
+    }
+    let never = f.never("GET").await;
+
+    reconciler.sweep_pending_removals().await.unwrap();
+    reconciler.full_resync().await.unwrap();
+
+    never.assert_async().await;
+    assert_eq!(reconciler.caddy_anchor(), CaddyAnchor::Unknown);
+}
+
+#[tokio::test]
+async fn the_drift_check_feeds_the_breaker_when_caddy_is_unreachable() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let _down = f
+        .caddy
+        .mock("GET", ANCHOR_ROUTES)
+        .with_status(502)
+        .create_async()
+        .await;
+
+    for _ in 0..CADDY_BREAKER_THRESHOLD {
+        assert_eq!(reconciler.sweep_pending_removals().await.unwrap().failed, 1);
+    }
+
+    assert!(reconciler.caddy_breaker.is_open(std::time::Instant::now()));
+    assert_eq!(reconciler.caddy_anchor(), CaddyAnchor::Unknown);
+}
+
+#[tokio::test]
+async fn a_dry_run_drift_check_sends_no_writes() {
+    let mut f = fixture().await;
+    publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let _anchor = f.anchor(json!([])).await;
+    let _elsewhere = f.no_marked_route_elsewhere().await;
+    let mut never = Vec::new();
+    for method in ["POST", "PATCH", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+    let dry = Reconciler::new(f.pool.clone(), f.options(true)).with_caddy(f.caddy_client());
+
+    dry.sweep_pending_removals().await.unwrap();
+    dry.full_resync().await.unwrap();
+
+    for mock in never {
+        mock.assert_async().await;
+    }
 }

@@ -1,5 +1,5 @@
 //! The server's timed reconcile work: the full resync and the short
-//! pending-removal sweep.
+//! pending-removal sweep, which also runs the Caddy drift check.
 
 use std::time::Duration;
 
@@ -7,7 +7,8 @@ use tokio::time::MissedTickBehavior;
 
 use crate::reconcile::Reconciler;
 
-/// How often removals whose grace period has ended are swept.
+/// How often removals whose grace period has ended are swept, and Caddy is
+/// checked for drift.
 const PENDING_REMOVAL_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Start both loops.  The first full resync runs at once, then one every
