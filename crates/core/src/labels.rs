@@ -13,6 +13,13 @@ pub struct ParsedLabels {
     /// deleted as a dropped group's would be.
     #[serde(default)]
     pub npm_malformed: Vec<u8>,
+    /// The indices of `caddy.<index>` groups the labels hold but that did not
+    /// parse.  The group is still there, so its route is kept, not deleted as
+    /// a dropped group's would be.  A group whose host a lower index already
+    /// holds is not listed: it counts as dropped, so the host stays with the
+    /// lower index alone.
+    #[serde(default)]
+    pub caddy_malformed: Vec<u8>,
     /// Diagnostic messages for labels that could not be parsed. The
     /// parsing function never fails; it logs problems here so callers can
     /// surface them without breaking unrelated integrations.
@@ -151,6 +158,7 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
         gatus: Vec::new(),
         caddy: Vec::new(),
         npm_malformed: Vec::new(),
+        caddy_malformed: Vec::new(),
         warnings: Vec::new(),
     };
 
@@ -269,7 +277,10 @@ pub fn parse(labels: &BTreeMap<String, String>) -> ParsedLabels {
                     ));
                 }
             }
-            Err(err) => out.warnings.push(format!("caddy.{index}: {err}")),
+            Err(err) => {
+                out.caddy_malformed.push(index);
+                out.warnings.push(format!("caddy.{index}: {err}"));
+            }
         }
     }
 
@@ -867,6 +878,21 @@ mod tests {
         assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
         assert!(p.warnings[0].contains("caddy.1"), "{:?}", p.warnings);
         assert!(p.warnings[0].contains("a.example.com"), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn a_malformed_caddy_group_is_listed_by_index_but_a_repeated_host_is_not() {
+        let p = parse(&lbl(&[
+            ("docktornet.caddy.0.host", "a.example.com"),
+            ("docktornet.caddy.0.port", "3000"),
+            ("docktornet.caddy.1.host", "b.example.com"),
+            ("docktornet.caddy.1.port", "80a"),
+            ("docktornet.caddy.2.host", "a.example.com"),
+            ("docktornet.caddy.2.port", "4000"),
+            ("docktornet.caddy.3.port", "5000"),
+        ]));
+        assert_eq!(p.caddy.iter().map(|r| r.index).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(p.caddy_malformed, vec![1, 3]);
     }
 
     #[test]

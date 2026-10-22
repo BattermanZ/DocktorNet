@@ -18,8 +18,16 @@ _Avoid_: container ID, service name
 How long a service may be missing from its machine's snapshots before docktornet removes its managed resources. It stops a container restart from looking like a removal.
 _Avoid_: timeout, debounce
 
+**Dropped group**:
+An `npm.<index>` or `caddy.<index>` label group a live service no longer has. Its proxy host or Caddy route is deleted in the next apply, with no grace period. A `caddy.<index>` group whose host a lower index already holds also counts as dropped, so the host stays with the lower index alone.
+_Avoid_: removed group, deleted labels
+
+**Malformed group**:
+An `npm.<index>` or `caddy.<index>` label group still on a live service that fails to parse, such as a port of `80a`. Its proxy host or Caddy route is kept as it was, with its hostnames still claimed, until the labels are fixed or dropped. A malformed `caddy.<index>` group whose hostname another group of the service now lists counts as dropped, so one hostname never has two of a service's Caddy routes. A container whose only docktornet labels are malformed is a service that has left.
+_Avoid_: invalid group, broken labels
+
 **Pending removal**:
-A managed resource docktornet has decided to delete, kept until the deletion succeeds. One whose service has left also waits out the grace period first; an NPM proxy host or Caddy route whose labels were dropped from a live service waits for none.
+A managed resource docktornet has decided to delete, kept until the deletion succeeds. One whose service has left also waits out the grace period first; an NPM proxy host or Caddy route of a dropped group waits for none.
 _Avoid_: orphan (that is a resource no mapping points to)
 
 ### Ownership

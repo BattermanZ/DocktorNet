@@ -518,6 +518,52 @@ async fn a_dropped_index_is_deleted_in_the_same_apply() {
 }
 
 #[tokio::test]
+async fn a_malformed_group_keeps_its_route() {
+    let mut f = fixture().await;
+    let _anchor = f.anchor(json!([])).await;
+    let _elsewhere = f.no_marked_route_elsewhere().await;
+    f.append(&route("m1/app", 0, &["a.example.com"], "10.0.0.1:3000"))
+        .await;
+    f.append(&route("m1/app", 1, &["b.example.com"], "10.0.0.1:3001"))
+        .await;
+    let reconciler = f.reconciler();
+    let labels = caddy_labels(&[(0, "a.example.com", 3000), (1, "b.example.com", 3001)]);
+    reconciler
+        .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![("app", labels.clone())]))
+        .await
+        .unwrap();
+    f.caddy.reset();
+
+    let _anchor = f
+        .anchor(json!([
+            route("m1/app", 0, &["a.example.com"], "10.0.0.1:3000"),
+            route("m1/app", 1, &["b.example.com"], "10.0.0.1:3001"),
+        ]))
+        .await;
+    let delete = f
+        .caddy
+        .mock("DELETE", path("m1/app", 1).as_str())
+        .expect(0)
+        .create_async()
+        .await;
+    // A typo in caddy.1's port: the group is still there, just unparsable.
+    let mut typo = labels;
+    typo.insert("docktornet.caddy.1.port".to_string(), "80a".to_string());
+    reconciler
+        .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![("app", typo)]))
+        .await
+        .unwrap();
+
+    delete.assert_async().await;
+    assert_eq!(
+        caddy_indices(&f.rows("m1/app").await),
+        vec![0, 1],
+        "a malformed group is not a dropped one"
+    );
+    assert!(pending(&f).await.is_empty());
+}
+
+#[tokio::test]
 async fn a_dropped_index_whose_delete_fails_is_parked_past_grace_and_keeps_its_hosts() {
     let mut f = fixture().await;
     let _anchor = f.anchor(json!([])).await;
@@ -1383,6 +1429,202 @@ async fn a_returning_service_gets_back_only_the_routes_it_still_labels() {
     assert_eq!(f.rows("m1/app").await.len(), 1);
 }
 
+/// `app`'s labels for `caddy.0` at a.example.com and `caddy.1` at
+/// b.example.com, with a typo in `caddy.1`'s port.
+fn app_labels_with_a_malformed_group_1() -> BTreeMap<String, String> {
+    let mut labels = caddy_labels(&[(0, "a.example.com", 3000), (1, "b.example.com", 3001)]);
+    labels.insert("docktornet.caddy.1.port".to_string(), "80a".to_string());
+    labels
+}
+
+/// Publish `app` with `caddy.0` and `caddy.1` at `at`.
+async fn publish_app_with_two_routes(f: &mut Fixture, at: i64) -> Reconciler {
+    publish_app(
+        f,
+        at,
+        &[(0, "a.example.com", 3000), (1, "b.example.com", 3001)],
+    )
+    .await
+}
+
+fn caddy_indices(rows: &[storage::CaddyRouteRow]) -> Vec<i64> {
+    rows.iter().map(|row| row.caddy_index).collect()
+}
+
+#[tokio::test]
+async fn a_malformed_group_keeps_its_hosts_from_another_service() {
+    let mut f = fixture().await;
+    let reconciler = publish_app_with_two_routes(&mut f, 1_000).await;
+    let _anchor = f
+        .anchor(json!([
+            route("m1/app", 0, &["a.example.com"], "10.0.0.1:3000"),
+            route("m1/app", 1, &["b.example.com"], "10.0.0.1:3001"),
+        ]))
+        .await;
+    let mut never = Vec::new();
+    for method in ["POST", "PATCH", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+
+    reconciler.set_now(1_010);
+    let clash = snap(
+        "m1",
+        "10.0.0.1",
+        vec![
+            ("app", app_labels_with_a_malformed_group_1()),
+            ("web", caddy_labels(&[(0, "b.example.com", 4000)])),
+        ],
+    );
+    assert!(reconciler.reconcile_snapshot(&clash).await.is_err());
+
+    for mock in never {
+        mock.assert_async().await;
+    }
+    assert!(f.rows("m1/web").await.is_empty());
+    assert_eq!(caddy_indices(&f.rows("m1/app").await), vec![0, 1]);
+}
+
+#[tokio::test]
+async fn a_malformed_group_with_caddy_unconfigured_parks_nothing() {
+    let mut f = fixture().await;
+    publish_app_with_two_routes(&mut f, 1_000).await;
+    let unconfigured = Reconciler::new(f.pool.clone(), f.options(false));
+
+    unconfigured.set_now(1_010);
+    unconfigured
+        .reconcile_snapshot(&snap(
+            "m1",
+            "10.0.0.1",
+            vec![("app", app_labels_with_a_malformed_group_1())],
+        ))
+        .await
+        .unwrap();
+
+    assert!(pending(&f).await.is_empty());
+    assert_eq!(caddy_indices(&f.rows("m1/app").await), vec![0, 1]);
+}
+
+#[tokio::test]
+async fn a_malformed_group_while_the_breaker_is_open_parks_nothing() {
+    let mut f = fixture().await;
+    let reconciler = publish_app_with_two_routes(&mut f, 1_000).await;
+    for _ in 0..CADDY_BREAKER_THRESHOLD {
+        reconciler
+            .caddy_breaker
+            .record_failure(std::time::Instant::now());
+    }
+    let mut never = Vec::new();
+    for method in ["GET", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+
+    reconciler.set_now(1_010);
+    reconciler
+        .reconcile_snapshot(&snap(
+            "m1",
+            "10.0.0.1",
+            vec![("app", app_labels_with_a_malformed_group_1())],
+        ))
+        .await
+        .unwrap();
+
+    for mock in never {
+        mock.assert_async().await;
+    }
+    assert!(pending(&f).await.is_empty());
+    assert_eq!(caddy_indices(&f.rows("m1/app").await), vec![0, 1]);
+}
+
+#[tokio::test]
+async fn a_service_whose_only_labels_are_a_malformed_group_waits_out_the_grace_period() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let early = f.never("DELETE").await;
+
+    let mut labels = caddy_labels(&[(0, "app.example.com", 3000)]);
+    labels.insert("docktornet.caddy.0.port".to_string(), "80a".to_string());
+    reconciler.set_now(1_010);
+    reconciler
+        .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![("app", labels)]))
+        .await
+        .unwrap();
+
+    early.assert_async().await;
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(0, "app.example.com", 1_000)]
+    );
+    assert_deleted_once_grace_ends(&mut f, &reconciler, 1_000).await;
+}
+
+#[tokio::test]
+async fn the_sweep_keeps_the_pending_route_of_a_returning_service_with_a_malformed_group() {
+    let mut f = fixture().await;
+    let reconciler = publish_app_with_two_routes(&mut f, 1_000).await;
+    leave(&reconciler, 1_010).await.unwrap();
+
+    let _anchor = f
+        .anchor(json!([
+            route("m1/app", 0, &["a.example.com"], "10.0.0.1:3000"),
+            route("m1/app", 1, &["b.example.com"], "10.0.0.1:3001"),
+        ]))
+        .await;
+    let mut never = Vec::new();
+    for method in ["POST", "PATCH", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+    reconciler.set_now(1_020);
+    reconciler
+        .reconcile_snapshot(&snap(
+            "m1",
+            "10.0.0.1",
+            vec![("app", app_labels_with_a_malformed_group_1())],
+        ))
+        .await
+        .unwrap();
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS + 60);
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    for mock in never {
+        mock.assert_async().await;
+    }
+    // The malformed group renders no route to restore, so its route stays
+    // pending, serving and holding its hosts, until the labels are fixed.
+    assert_eq!(caddy_indices(&f.rows("m1/app").await), vec![0]);
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(1, "b.example.com", 1_000)]
+    );
+}
+
+#[tokio::test]
+async fn an_index_repeating_a_lower_index_host_is_deleted_in_the_same_apply() {
+    let mut f = fixture().await;
+    let reconciler = publish_app_with_two_routes(&mut f, 1_000).await;
+    let _anchor = f
+        .anchor(json!([
+            route("m1/app", 0, &["a.example.com"], "10.0.0.1:3000"),
+            route("m1/app", 1, &["b.example.com"], "10.0.0.1:3001"),
+        ]))
+        .await;
+    let delete = expect_delete(&mut f, "m1/app", 1, 200, 1).await;
+
+    let mut labels = caddy_labels(&[(0, "a.example.com", 3000), (1, "b.example.com", 3001)]);
+    labels.insert(
+        "docktornet.caddy.1.host".to_string(),
+        "a.example.com".to_string(),
+    );
+    reconciler.set_now(1_010);
+    reconciler
+        .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![("app", labels)]))
+        .await
+        .unwrap();
+
+    delete.assert_async().await;
+    assert_eq!(caddy_indices(&f.rows("m1/app").await), vec![0]);
+    assert!(pending(&f).await.is_empty());
+}
+
 #[tokio::test]
 async fn a_failed_pending_delete_stays_for_the_next_sweep() {
     let mut f = fixture().await;
@@ -1893,4 +2135,120 @@ async fn a_dry_run_drift_check_sends_no_writes() {
     for mock in never {
         mock.assert_async().await;
     }
+}
+
+/// Answer every PATCH of `service_id`'s route at `index`, expecting exactly
+/// one.
+async fn expect_patch(f: &mut Fixture, service_id: &str, index: u8) -> Mock {
+    f.caddy
+        .mock("PATCH", path(service_id, index).as_str())
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await
+}
+
+fn route_hosts(rows: &[storage::CaddyRouteRow]) -> Vec<(i64, Vec<String>)> {
+    rows.iter()
+        .map(|row| (row.caddy_index, row.hosts.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_malformed_group_whose_host_a_lower_index_takes_is_deleted_in_the_same_apply() {
+    let mut f = fixture().await;
+    let reconciler = publish_app_with_two_routes(&mut f, 1_000).await;
+    let _anchor = f
+        .anchor(json!([
+            route("m1/app", 0, &["a.example.com"], "10.0.0.1:3000"),
+            route("m1/app", 1, &["b.example.com"], "10.0.0.1:3001"),
+        ]))
+        .await;
+    let patch = expect_patch(&mut f, "m1/app", 0).await;
+    let delete = expect_delete(&mut f, "m1/app", 1, 200, 1).await;
+
+    // caddy.0 takes b.example.com while caddy.1, which holds it, has a typo.
+    let mut labels = app_labels_with_a_malformed_group_1();
+    labels.insert(
+        "docktornet.caddy.0.host".to_string(),
+        "b.example.com".to_string(),
+    );
+    reconciler.set_now(1_010);
+    reconciler
+        .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![("app", labels)]))
+        .await
+        .unwrap();
+
+    patch.assert_async().await;
+    delete.assert_async().await;
+    assert_eq!(
+        route_hosts(&f.rows("m1/app").await),
+        vec![(0, vec!["b.example.com".to_string()])]
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_group_whose_host_a_higher_index_takes_is_deleted_in_the_same_apply() {
+    let mut f = fixture().await;
+    let reconciler = publish_app_with_two_routes(&mut f, 1_000).await;
+    let _anchor = f
+        .anchor(json!([
+            route("m1/app", 0, &["a.example.com"], "10.0.0.1:3000"),
+            route("m1/app", 1, &["b.example.com"], "10.0.0.1:3001"),
+        ]))
+        .await;
+    let delete = expect_delete(&mut f, "m1/app", 0, 200, 1).await;
+    let patch = expect_patch(&mut f, "m1/app", 1).await;
+
+    // caddy.1 takes a.example.com while caddy.0, which holds it, has a typo.
+    let mut labels = caddy_labels(&[(0, "a.example.com", 3000), (1, "a.example.com", 3001)]);
+    labels.insert("docktornet.caddy.0.port".to_string(), "80a".to_string());
+    reconciler.set_now(1_010);
+    reconciler
+        .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![("app", labels)]))
+        .await
+        .unwrap();
+
+    delete.assert_async().await;
+    patch.assert_async().await;
+    assert_eq!(
+        route_hosts(&f.rows("m1/app").await),
+        vec![(1, vec!["a.example.com".to_string()])]
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_deletes_the_pending_route_of_a_malformed_group_whose_host_was_taken() {
+    let mut f = fixture().await;
+    let reconciler = publish_app_with_two_routes(&mut f, 1_000).await;
+    leave(&reconciler, 1_010).await.unwrap();
+
+    let _anchor = f
+        .anchor(json!([
+            route("m1/app", 0, &["a.example.com"], "10.0.0.1:3000"),
+            route("m1/app", 1, &["b.example.com"], "10.0.0.1:3001"),
+        ]))
+        .await;
+    let _patch = expect_patch(&mut f, "m1/app", 0).await;
+    let delete = expect_delete(&mut f, "m1/app", 1, 200, 1).await;
+    // app comes back with caddy.0 on b.example.com and a typo in caddy.1.
+    let mut labels = app_labels_with_a_malformed_group_1();
+    labels.insert(
+        "docktornet.caddy.0.host".to_string(),
+        "b.example.com".to_string(),
+    );
+    reconciler.set_now(1_020);
+    reconciler
+        .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![("app", labels)]))
+        .await
+        .unwrap();
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS);
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    delete.assert_async().await;
+    assert!(pending(&f).await.is_empty());
+    assert_eq!(
+        route_hosts(&f.rows("m1/app").await),
+        vec![(0, vec!["b.example.com".to_string()])]
+    );
 }

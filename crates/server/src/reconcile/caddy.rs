@@ -15,7 +15,7 @@ use super::{
 };
 use crate::breaker::CircuitBreaker;
 use crate::integrations::caddy::{CaddyClient, CaddyError, position_of, render_route};
-use crate::integrations::intended::IntendedService;
+use crate::integrations::intended::{IntendedService, has_intent};
 use crate::storage::{CaddyClaim, CaddyRouteRow};
 
 /// How the Caddy part of an apply went, for the apply's failure count and
@@ -326,7 +326,7 @@ impl Reconciler {
             if past_grace(row.last_seen, now)
                 && !self
                     .stored_again(&row.service_id, |labels| {
-                        lists_caddy_index(labels, row.caddy_index)
+                        keeps_caddy_route(labels, row.caddy_index, &row.hosts)
                     })
                     .await
             {
@@ -479,21 +479,31 @@ impl Reconciler {
     }
 }
 
-/// Whether `labels` hold a `docktornet.caddy.<caddy_index>` group.
-fn lists_caddy_index(labels: &ParsedLabels, caddy_index: i64) -> bool {
-    labels
-        .caddy
-        .iter()
-        .any(|route| i64::from(route.index) == caddy_index)
+/// Whether `labels` keep the route at `caddy_index`, which holds `hosts`.  A
+/// parsed group keeps its route.  A malformed group keeps it while the labels
+/// still ask for a resource and no parsed group lists one of its hosts, so a
+/// host never has two of the service's routes.  Labels that ask for nothing
+/// are a service that left.
+fn keeps_caddy_route(labels: &ParsedLabels, caddy_index: i64, hosts: &[String]) -> bool {
+    let is_index = |index: u8| i64::from(index) == caddy_index;
+    if labels.caddy.iter().any(|route| is_index(route.index)) {
+        return true;
+    }
+    has_intent(labels)
+        && labels.caddy_malformed.iter().any(|&index| is_index(index))
+        && !labels
+            .caddy
+            .iter()
+            .any(|route| route.hosts.iter().any(|host| hosts.contains(host)))
 }
 
-/// The mapping rows of `service` whose index is no longer in its labels.
+/// The mapping rows of `service` whose routes its labels no longer keep.
 fn dropped<'a>(
     service: &'a IntendedService,
     rows: &'a [CaddyRouteRow],
 ) -> impl Iterator<Item = &'a CaddyRouteRow> {
     rows.iter()
-        .filter(|row| !lists_caddy_index(&service.labels, row.caddy_index))
+        .filter(|row| !keeps_caddy_route(&service.labels, row.caddy_index, &row.hosts))
 }
 
 fn log_missing_anchor(client: &CaddyClient) {

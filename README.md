@@ -88,10 +88,12 @@ check, every 30 seconds.
 A running service that drops a `docktornet.npm.<n>` or `docktornet.caddy.<n>`
 group loses that proxy host or Caddy route in the same update, with no grace
 period, because a label edit is not a restart. Docktornet retries a failed
-delete on the same minute timer. An NPM group that is still there but fails to
-parse keeps its proxy host. A Caddy group that fails to parse counts as
-dropped and loses its route. A service that returns after a removal gets back
-only the proxy hosts and Caddy routes its labels still list.
+delete on the same minute timer. An NPM or Caddy group that is still there
+but fails to parse keeps its proxy host or Caddy route as it was, until the
+labels are fixed. A service that returns after a removal gets back only the
+proxy hosts and Caddy routes its labels still list. A Caddy group that fails to
+parse on the way back keeps its route pending and serving, and gets it back
+once its labels parse again.
 
 Removals that come due while Caddy is unreachable or its circuit breaker is
 open stay pending and run once Caddy answers again. Every minute, and on each
@@ -231,12 +233,16 @@ Caddy serves plain HTTP here, behind whatever terminates TLS in front of it,
 such as a Cloudflare tunnel. There are no `ssl`, HSTS, HTTP/2 or `cert_id`
 labels, because the front owns those. Caddy proxies websockets without a setting.
 
-- Docktornet drops a group with a missing `host` or `port`, a bad port, or an
+- Docktornet skips a group with a missing `host` or `port`, a bad port, or an
   unknown scheme, and logs a warning. If the group already had a Caddy route,
-  Docktornet deletes it in the same update. The container's other labels still
-  apply.
+  the route stays as it was until the labels are fixed. The container's other
+  labels still apply. A container whose only Docktornet labels fail to parse
+  is a service that has left, so its routes wait out the grace period. A
+  group that fails to parse loses its route in the same update if another
+  group of the container now lists one of its hostnames.
 - When two groups of the same container list one hostname, the lower index
-  keeps it. Docktornet drops the later group the same way.
+  keeps it. Docktornet drops the later group and logs a warning. If that group
+  already had a Caddy route, Docktornet deletes it in the same update.
 - Docktornet refuses a hostname that another service's Caddy route already
   holds, in any letter case. The service that claimed it first keeps it, and
   the server logs an error naming both services. Docktornet retries the refused
