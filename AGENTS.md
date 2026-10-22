@@ -102,7 +102,7 @@ adds none.
 ## Releasing
 
 A release is cut by hand, in this order. The version is bare, as in `1.2.0`;
-the tag and the GitHub Release add the `v`. No image is published.
+the tag and the GitHub Release add the `v`.
 
 1. On `development`, set the version in every `crates/*/Cargo.toml` and let
    `cargo check` carry it into `Cargo.lock`. Rename `## Unreleased` to
@@ -131,6 +131,8 @@ the tag and the GitHub Release add the `v`. No image is published.
 6. Merge `development` into `main`, create the annotated tag `v<version>` on
    that merge, push both with `git push origin main v<version>`, and publish
    the draft with `gh release edit v<version> --draft=false --latest`.
+7. Build both images from a clean checkout of the tag and push them to the
+   private registry, as `AGENTS.local.md` says. No public registry gets them.
 
 A tag is never moved and a published version is never replaced. A release found
 broken is fixed by the next patch version.
