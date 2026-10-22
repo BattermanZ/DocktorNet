@@ -1,10 +1,15 @@
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 const FLAPPING_WINDOW: Duration = Duration::from_secs(300);
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use anyhow::Result;
+use docktornet_server::agent_versions::AgentVersionTracker;
+use docktornet_server::db_location::{self, Placement};
 use docktornet_server::flapping::FlappingTracker;
+use docktornet_server::{audit, backup, healthcheck};
 use docktornet_server::{config, db, routes};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -29,6 +34,33 @@ fn bind_exposes_plaintext(listen: &str) -> bool {
     }
 }
 
+const USAGE: &str = "usage: docktornet-server [audit [--only caddy] | backup | healthcheck]";
+
+/// What the server binary was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Serve,
+    Audit(audit::Scope),
+    Backup,
+    Healthcheck,
+}
+
+/// The command named by the arguments after the program name, or the usage
+/// line when they name none the binary knows.
+fn parse_command<I: IntoIterator<Item = OsString>>(args: I) -> Result<Command, &'static str> {
+    let args: Vec<OsString> = args.into_iter().collect();
+    match args.as_slice() {
+        [] => Ok(Command::Serve),
+        [arg] if arg == "audit" => Ok(Command::Audit(audit::Scope::All)),
+        [arg, only, provider] if arg == "audit" && only == "--only" && provider == "caddy" => {
+            Ok(Command::Audit(audit::Scope::Caddy))
+        }
+        [arg] if arg == "backup" => Ok(Command::Backup),
+        [arg] if arg == "healthcheck" => Ok(Command::Healthcheck),
+        _ => Err(USAGE),
+    }
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.ok();
@@ -49,6 +81,38 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
+    match parse_command(std::env::args_os().skip(1)) {
+        Ok(Command::Serve) => serve().await,
+        Ok(Command::Audit(scope)) => {
+            init_stderr_logging();
+            std::process::exit(audit::cli(scope).await)
+        }
+        Ok(Command::Backup) => {
+            init_stderr_logging();
+            std::process::exit(backup::cli().await)
+        }
+        Ok(Command::Healthcheck) => {
+            init_stderr_logging();
+            std::process::exit(healthcheck::cli().await)
+        }
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::exit(2)
+        }
+    }
+}
+
+/// Logging for a subcommand whose stdout carries its output alone.
+fn init_stderr_logging() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+async fn serve() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -56,10 +120,23 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::ServerConfig::from_env()?;
-    let pool = db::connect(&cfg.db_path).await?;
+    let location = db_location::prepare(
+        &cfg.db_path,
+        cfg.allow_ephemeral_db,
+        &db_location::Environment::detect(),
+    )?;
+    let pool = db::connect(&location.path).await?;
+    let (on_mount, mount_point) = match &location.placement {
+        Some(Placement::Mounted(mount_point)) => ("yes", mount_point.display().to_string()),
+        Some(Placement::RootFilesystem) => ("no", "/".to_string()),
+        None => ("unknown", "unknown".to_string()),
+    };
+    info!(path = %location.path.display(), on_mount, mount_point, "database ready");
     let npm = docktornet_server::integrations::npm::NpmClient::new(cfg.npm.clone());
-    let cloudflare =
-        docktornet_server::integrations::cloudflare::CloudflareClient::new(cfg.cloudflare.clone());
+    let cloudflare = docktornet_server::integrations::cloudflare::CloudflareClient::with_base_url(
+        cfg.cloudflare.clone(),
+        cfg.cloudflare_api_url.as_str(),
+    );
     let reconciler = docktornet_server::reconcile::Reconciler::with_clients(
         pool,
         docktornet_server::reconcile::ReconcileOptions {
@@ -70,10 +147,20 @@ async fn main() -> Result<()> {
         npm,
         cloudflare,
     );
+    let reconciler = match cfg.caddy.clone() {
+        Some(caddy) => {
+            info!(admin_url = %caddy.admin_url, anchor = %caddy.anchor_id, "caddy integration enabled");
+            reconciler.with_caddy(docktornet_server::integrations::caddy::CaddyClient::new(
+                caddy,
+            ))
+        }
+        None => reconciler,
+    };
     let app_state = docktornet_server::handlers::snapshot::AppState {
         reconciler,
-        secret: std::sync::Arc::new(cfg.secret),
+        secret: std::sync::Arc::new(cfg.secret.expose().to_owned()),
         flapping: std::sync::Arc::new(FlappingTracker::new(FLAPPING_WINDOW)),
+        agent_versions: std::sync::Arc::new(AgentVersionTracker::new(VERSION)),
     };
     let reconciler_for_resync = app_state.reconciler.clone();
     let app = routes::build(app_state);
@@ -86,19 +173,13 @@ async fn main() -> Result<()> {
     }
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
-    info!(listen = %cfg.listen, "server ready");
+    info!(
+        version = VERSION,
+        listen = %cfg.listen,
+        "server ready"
+    );
 
-    let resync_interval = cfg.full_resync_interval;
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(resync_interval);
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            if let Err(err) = reconciler_for_resync.full_resync().await {
-                tracing::warn!(error = %err, "full resync failed; will retry next cycle");
-            }
-        }
-    });
+    docktornet_server::background::spawn(reconciler_for_resync, cfg.full_resync_interval);
 
     axum::serve(
         listener,
@@ -112,6 +193,41 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn no_argument_serves_and_subcommands_are_recognised() {
+        assert_eq!(parse_command(args(&[])), Ok(Command::Serve));
+        assert_eq!(
+            parse_command(args(&["audit"])),
+            Ok(Command::Audit(audit::Scope::All))
+        );
+        assert_eq!(
+            parse_command(args(&["audit", "--only", "caddy"])),
+            Ok(Command::Audit(audit::Scope::Caddy))
+        );
+        assert_eq!(parse_command(args(&["backup"])), Ok(Command::Backup));
+        assert_eq!(
+            parse_command(args(&["healthcheck"])),
+            Ok(Command::Healthcheck)
+        );
+    }
+
+    #[test]
+    fn unknown_or_extra_arguments_are_usage_errors() {
+        assert_eq!(parse_command(args(&["bogus"])), Err(USAGE));
+        assert_eq!(parse_command(args(&["audit", "--only", "npm"])), Err(USAGE));
+        assert_eq!(parse_command(args(&["audit", "--only"])), Err(USAGE));
+        assert_eq!(
+            parse_command(args(&["audit", "--only", "caddy", "extra"])),
+            Err(USAGE)
+        );
+        assert_eq!(parse_command(args(&["--only", "caddy"])), Err(USAGE));
+        assert_eq!(parse_command(args(&["backup", "out.db"])), Err(USAGE));
+    }
 
     #[test]
     fn wildcard_and_lan_binds_are_flagged_as_plaintext_exposed() {

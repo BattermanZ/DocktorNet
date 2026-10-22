@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use docktornet_core::{Snapshot, service_id};
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, Sqlite, SqliteExecutor};
 
 /// Maximum number of bind parameters to place in a single statement. SQLite's
 /// compile-time `SQLITE_MAX_VARIABLE_NUMBER` defaults to 32766; staying well
@@ -9,8 +9,9 @@ use sqlx::{Pool, Sqlite};
 /// machine reports.
 const MAX_BIND_PARAMS: usize = 20_000;
 
-pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Result<()> {
-    let now = snap.taken_at as i64;
+/// Store a snapshot as seen at `now`, the server's clock in Unix seconds.  The
+/// agent's `taken_at` is never stored: grace periods are timed in server time.
+pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot, now: i64) -> sqlx::Result<()> {
     let machine = snap.machine_id.as_str();
     let seen_ids: Vec<String> = snap
         .containers
@@ -23,15 +24,17 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
     // upsert the machine row so its forward host is available to the DB-only
     // resync path; kept in the same transaction as the services it owns.
     sqlx::query(
-        r#"INSERT INTO machines (machine_id, forward_host, last_seen)
-           VALUES (?, ?, ?)
+        r#"INSERT INTO machines (machine_id, forward_host, last_seen, agent_version)
+           VALUES (?, ?, ?, ?)
            ON CONFLICT(machine_id) DO UPDATE SET
-             forward_host = excluded.forward_host,
-             last_seen    = excluded.last_seen"#,
+             forward_host  = excluded.forward_host,
+             last_seen     = excluded.last_seen,
+             agent_version = excluded.agent_version"#,
     )
     .bind(machine)
     .bind(&snap.forward_host)
     .bind(now)
+    .bind(&snap.agent_version)
     .execute(&mut *tx)
     .await?;
 
@@ -77,10 +80,21 @@ pub async fn upsert_snapshot(pool: &Pool<Sqlite>, snap: &Snapshot) -> sqlx::Resu
     tx.commit().await
 }
 
-pub async fn list_machines(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, String, i64)>> {
-    sqlx::query_as("SELECT machine_id, forward_host, last_seen FROM machines ORDER BY machine_id")
-        .fetch_all(pool)
-        .await
+/// A machine as its latest snapshot left it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct Machine {
+    pub machine_id: String,
+    pub forward_host: String,
+    pub last_seen: i64,
+    pub agent_version: Option<String>,
+}
+
+pub async fn list_machines(db: impl SqliteExecutor<'_>) -> sqlx::Result<Vec<Machine>> {
+    sqlx::query_as(
+        "SELECT machine_id, forward_host, last_seen, agent_version FROM machines ORDER BY machine_id",
+    )
+    .fetch_all(db)
+    .await
 }
 
 pub async fn list_services_for_machine(
@@ -128,6 +142,22 @@ pub async fn get_services_last_seen(
     }
     out.sort();
     Ok(out)
+}
+
+/// The labels of a stored service as its machine's latest persisted snapshot
+/// holds them, or `None` when that snapshot does not hold it.
+pub async fn get_service_labels(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<Option<BTreeMap<String, String>>> {
+    let labels_json: Option<String> =
+        sqlx::query_scalar("SELECT labels_json FROM services WHERE id = ?")
+            .bind(service_id)
+            .fetch_optional(pool)
+            .await?;
+    labels_json
+        .map(|json| serde_json::from_str(&json).map_err(|e| sqlx::Error::Decode(Box::new(e))))
+        .transpose()
 }
 
 pub async fn removed_service_ids(
@@ -229,8 +259,18 @@ pub async fn get_npm_hosts_for_services(
     Ok(out)
 }
 
+/// Every `(service_id, npm_index, npm_id)` ownership mapping, ordered by
+/// `(service_id, npm_index)`.
+pub async fn list_npm_hosts(db: impl SqliteExecutor<'_>) -> sqlx::Result<Vec<(String, i64, i64)>> {
+    sqlx::query_as(
+        "SELECT service_id, npm_index, npm_id FROM npm_hosts ORDER BY service_id, npm_index",
+    )
+    .fetch_all(db)
+    .await
+}
+
 /// Record an NPM proxy host whose service has left a snapshot but whose grace
-/// period has not yet elapsed, so it can be pruned later by the resync sweep.
+/// period has not yet elapsed, so it can be pruned later by the pending-removal sweep.
 pub async fn add_pending_npm_removal(
     pool: &Pool<Sqlite>,
     service_id: &str,
@@ -254,14 +294,39 @@ pub async fn add_pending_npm_removal(
     Ok(())
 }
 
-pub async fn list_pending_npm_removals(
+/// Move the last sighting of a service's pending NPM, Cloudflare and Caddy
+/// removals up to `last_seen`, never back.  A service that came back and left
+/// again before an apply restored its removals starts its grace period from
+/// its latest sighting.
+pub async fn refresh_pending_removals(
     pool: &Pool<Sqlite>,
+    service_id: &str,
+    last_seen: i64,
+) -> sqlx::Result<()> {
+    for table in [
+        "pending_npm_removals",
+        "pending_cf_removals",
+        "pending_caddy_removals",
+    ] {
+        sqlx::query(&format!(
+            "UPDATE {table} SET last_seen = MAX(last_seen, ?) WHERE service_id = ?"
+        ))
+        .bind(last_seen)
+        .bind(service_id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn list_pending_npm_removals(
+    db: impl SqliteExecutor<'_>,
 ) -> sqlx::Result<Vec<(String, i64, i64, i64)>> {
     sqlx::query_as(
         "SELECT service_id, npm_index, npm_id, last_seen FROM pending_npm_removals \
          ORDER BY service_id, npm_index",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await
 }
 
@@ -297,17 +362,35 @@ pub async fn get_pending_npm_removals_for_service(
     .await
 }
 
-/// Drop every pending removal for a service.  Called when a service reappears,
-/// so a host that is live again is never pruned.
-pub async fn clear_pending_npm_removals_for_service(
+/// Move a service's NPM host mapping to `pending_npm_removals`, seen last at
+/// `last_seen`, in one transaction.
+pub async fn park_npm_host(
     pool: &Pool<Sqlite>,
     service_id: &str,
+    npm_index: i64,
+    npm_id: i64,
+    last_seen: i64,
 ) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM pending_npm_removals WHERE service_id = ?")
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"INSERT INTO pending_npm_removals (service_id, npm_index, npm_id, last_seen)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(service_id, npm_index) DO UPDATE SET
+             npm_id    = excluded.npm_id,
+             last_seen = excluded.last_seen"#,
+    )
+    .bind(service_id)
+    .bind(npm_index)
+    .bind(npm_id)
+    .bind(last_seen)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM npm_hosts WHERE service_id = ? AND npm_index = ?")
         .bind(service_id)
-        .execute(pool)
+        .bind(npm_index)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await
 }
 
 /// Return every `(service_id, record_id)` Cloudflare mapping for the given
@@ -344,7 +427,7 @@ pub async fn get_cf_records_for_services(
 
 /// Record a Cloudflare DNS record whose service has left a snapshot but whose
 /// grace period has not yet elapsed (or whose deletion failed), so it can be
-/// deleted later by the resync sweep.
+/// deleted later by the pending-removal sweep.
 pub async fn add_pending_cf_removal(
     pool: &Pool<Sqlite>,
     service_id: &str,
@@ -367,13 +450,13 @@ pub async fn add_pending_cf_removal(
 }
 
 pub async fn list_pending_cf_removals(
-    pool: &Pool<Sqlite>,
+    db: impl SqliteExecutor<'_>,
 ) -> sqlx::Result<Vec<(String, String, i64)>> {
     sqlx::query_as(
         "SELECT service_id, record_id, last_seen FROM pending_cf_removals \
          ORDER BY service_id",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await
 }
 
@@ -401,6 +484,82 @@ pub async fn delete_pending_cf_removal(pool: &Pool<Sqlite>, service_id: &str) ->
     Ok(())
 }
 
+/// Record when a service whose Gatus file is kept through the grace period left
+/// its snapshot, in server time, so the pending-removal sweep knows when the
+/// grace period ends.
+pub async fn add_pending_gatus_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    left_at: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO pending_gatus_removals (service_id, left_at)
+           VALUES (?, ?)
+           ON CONFLICT(service_id) DO UPDATE SET left_at = excluded.left_at"#,
+    )
+    .bind(service_id)
+    .bind(left_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_pending_gatus_removals(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, i64)>> {
+    sqlx::query_as("SELECT service_id, left_at FROM pending_gatus_removals ORDER BY service_id")
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn delete_pending_gatus_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM pending_gatus_removals WHERE service_id = ?")
+        .bind(service_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Store a service's classification map entries, replacing any earlier ones.
+pub async fn set_gatus_classification(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    endpoints_json: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO gatus_classifications (service_id, endpoints_json)
+           VALUES (?, ?)
+           ON CONFLICT(service_id) DO UPDATE SET endpoints_json = excluded.endpoints_json"#,
+    )
+    .bind(service_id)
+    .bind(endpoints_json)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_gatus_classifications(
+    pool: &Pool<Sqlite>,
+) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as(
+        "SELECT service_id, endpoints_json FROM gatus_classifications ORDER BY service_id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn delete_gatus_classification(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM gatus_classifications WHERE service_id = ?")
+        .bind(service_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn get_cf_dns_record(
     pool: &Pool<Sqlite>,
     service_id: &str,
@@ -410,6 +569,15 @@ pub async fn get_cf_dns_record(
         .fetch_optional(pool)
         .await
         .map(|row| row.map(|(record_id,)| record_id))
+}
+
+/// Every `(service_id, record_id)` ownership mapping, ordered by `service_id`.
+pub async fn list_cf_dns_records(
+    db: impl SqliteExecutor<'_>,
+) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as("SELECT service_id, record_id FROM cf_dns_records ORDER BY service_id")
+        .fetch_all(db)
+        .await
 }
 
 pub async fn set_cf_dns_record(
@@ -436,6 +604,285 @@ pub async fn delete_cf_dns_record(pool: &Pool<Sqlite>, service_id: &str) -> sqlx
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// A Caddy route a service owns: its ownership mapping row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaddyRouteRow {
+    pub caddy_index: i64,
+    /// The hosts the route claimed.
+    pub hosts: Vec<String>,
+    /// The route as last rendered after a successful claim.
+    pub route: serde_json::Value,
+}
+
+/// A Caddy route waiting to be deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCaddyRemoval {
+    pub service_id: String,
+    pub caddy_index: i64,
+    /// The hosts the route still holds for the clash check.
+    pub hosts: Vec<String>,
+    pub last_seen: i64,
+}
+
+/// The outcome of claiming a Caddy route's hosts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaddyClaim {
+    /// The mapping row now holds the hosts and route.
+    Claimed,
+    /// Another service holds `host`, through a mapping or a pending removal,
+    /// and keeps it.
+    Clash {
+        host: String,
+        owner: String,
+        owner_index: i64,
+    },
+}
+
+fn decode_json<T: serde::de::DeserializeOwned>(json: &str) -> sqlx::Result<T> {
+    serde_json::from_str(json).map_err(|e| sqlx::Error::Decode(Box::new(e)))
+}
+
+fn encode_json<T: serde::Serialize>(value: &T) -> sqlx::Result<String> {
+    serde_json::to_string(value).map_err(|e| sqlx::Error::Encode(Box::new(e)))
+}
+
+/// Every Caddy route mapping of one service, ordered by index.
+pub async fn list_caddy_routes_for_service(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+) -> sqlx::Result<Vec<CaddyRouteRow>> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT caddy_index, hosts_json, route_json FROM caddy_routes \
+         WHERE service_id = ? ORDER BY caddy_index",
+    )
+    .bind(service_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(caddy_index, hosts, route)| caddy_route_row(caddy_index, &hosts, &route))
+        .collect()
+}
+
+fn caddy_route_row(caddy_index: i64, hosts: &str, route: &str) -> sqlx::Result<CaddyRouteRow> {
+    Ok(CaddyRouteRow {
+        caddy_index,
+        hosts: decode_json(hosts)?,
+        route: decode_json(route)?,
+    })
+}
+
+/// Every Caddy route mapping, with its service ID, ordered by service and
+/// index.  A row exists only while its service is stored, because the
+/// `services` cascade deletes it.
+pub async fn list_caddy_routes(
+    db: impl SqliteExecutor<'_>,
+) -> sqlx::Result<Vec<(String, CaddyRouteRow)>> {
+    let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT service_id, caddy_index, hosts_json, route_json FROM caddy_routes \
+         ORDER BY service_id, caddy_index",
+    )
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|(service_id, caddy_index, hosts, route)| {
+            Ok((service_id, caddy_route_row(caddy_index, &hosts, &route)?))
+        })
+        .collect()
+}
+
+/// Claim `hosts` for a service's Caddy route at `caddy_index` and store the
+/// route.  In one transaction, the hosts are checked, ignoring ASCII case,
+/// against every Caddy mapping and pending removal of other services.  The
+/// service's own rows don't count, so a host can move between its indices.
+/// A successful claim also drops the service's pending removal at this index:
+/// the route is wanted again.
+pub async fn claim_caddy_route(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    caddy_index: i64,
+    hosts: &[String],
+    route: &serde_json::Value,
+) -> sqlx::Result<CaddyClaim> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let held: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT service_id, caddy_index, hosts_json FROM caddy_routes WHERE service_id != ? \
+         UNION ALL \
+         SELECT service_id, caddy_index, hosts_json FROM pending_caddy_removals WHERE service_id != ? \
+         ORDER BY service_id, caddy_index",
+    )
+    .bind(service_id)
+    .bind(service_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (owner, owner_index, held_hosts) in held {
+        let held_hosts: Vec<String> = decode_json(&held_hosts)?;
+        if let Some(host) = hosts
+            .iter()
+            .find(|host| held_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
+        {
+            return Ok(CaddyClaim::Clash {
+                host: host.clone(),
+                owner,
+                owner_index,
+            });
+        }
+    }
+    sqlx::query(
+        r#"INSERT INTO caddy_routes (service_id, caddy_index, hosts_json, route_json)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(service_id, caddy_index) DO UPDATE SET
+             hosts_json = excluded.hosts_json,
+             route_json = excluded.route_json"#,
+    )
+    .bind(service_id)
+    .bind(caddy_index)
+    .bind(encode_json(&hosts)?)
+    .bind(encode_json(route)?)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM pending_caddy_removals WHERE service_id = ? AND caddy_index = ?")
+        .bind(service_id)
+        .bind(caddy_index)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(CaddyClaim::Claimed)
+}
+
+/// Every `(service_id, caddy_index, hosts)` Caddy mapping of the given
+/// services, ordered by `(service_id, caddy_index)`.  Used to capture the
+/// routes of services about to leave a snapshot, before `upsert_snapshot`'s
+/// cascade deletes the `caddy_routes` rows.
+pub async fn get_caddy_routes_for_services(
+    pool: &Pool<Sqlite>,
+    service_ids: &[String],
+) -> sqlx::Result<Vec<(String, i64, Vec<String>)>> {
+    let mut out = Vec::new();
+    for chunk in service_ids.chunks(MAX_BIND_PARAMS) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT service_id, caddy_index, hosts_json FROM caddy_routes \
+             WHERE service_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (String, i64, String)>(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for (service_id, caddy_index, hosts) in q.fetch_all(pool).await? {
+            out.push((service_id, caddy_index, decode_json(&hosts)?));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Record a Caddy route whose service has left a snapshot, so the
+/// pending-removal sweep deletes it once its grace period ends.  Its hosts
+/// stay claimed until then.  A row already pending keeps the later of the
+/// two sightings.
+pub async fn add_pending_caddy_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    caddy_index: i64,
+    hosts: &[String],
+    last_seen: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO pending_caddy_removals (service_id, caddy_index, hosts_json, last_seen)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(service_id, caddy_index) DO UPDATE SET
+             hosts_json = excluded.hosts_json,
+             last_seen  = MAX(last_seen, excluded.last_seen)"#,
+    )
+    .bind(service_id)
+    .bind(caddy_index)
+    .bind(encode_json(&hosts)?)
+    .bind(last_seen)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_caddy_route(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    caddy_index: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM caddy_routes WHERE service_id = ? AND caddy_index = ?")
+        .bind(service_id)
+        .bind(caddy_index)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Move a service's Caddy route mapping to `pending_caddy_removals`, seen
+/// last at `last_seen`, in one transaction.  Its hosts stay claimed.
+pub async fn park_caddy_route(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    caddy_index: i64,
+    hosts: &[String],
+    last_seen: i64,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"INSERT INTO pending_caddy_removals (service_id, caddy_index, hosts_json, last_seen)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(service_id, caddy_index) DO UPDATE SET
+             hosts_json = excluded.hosts_json,
+             last_seen  = excluded.last_seen"#,
+    )
+    .bind(service_id)
+    .bind(caddy_index)
+    .bind(encode_json(&hosts)?)
+    .bind(last_seen)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM caddy_routes WHERE service_id = ? AND caddy_index = ?")
+        .bind(service_id)
+        .bind(caddy_index)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+pub async fn delete_pending_caddy_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    caddy_index: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM pending_caddy_removals WHERE service_id = ? AND caddy_index = ?")
+        .bind(service_id)
+        .bind(caddy_index)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_pending_caddy_removals(
+    db: impl SqliteExecutor<'_>,
+) -> sqlx::Result<Vec<PendingCaddyRemoval>> {
+    let rows: Vec<(String, i64, String, i64)> = sqlx::query_as(
+        "SELECT service_id, caddy_index, hosts_json, last_seen FROM pending_caddy_removals \
+         ORDER BY service_id, caddy_index",
+    )
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|(service_id, caddy_index, hosts, last_seen)| {
+            Ok(PendingCaddyRemoval {
+                service_id,
+                caddy_index,
+                hosts: decode_json(&hosts)?,
+                last_seen,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -467,11 +914,13 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -486,15 +935,17 @@ mod tests {
     #[tokio::test]
     async fn updates_existing_when_labels_change() {
         let p = pool().await;
-        let m = MachineId::new("m1");
+        let m = MachineId::new("m1").unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
                 machine_id: m.clone(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -504,8 +955,10 @@ mod tests {
                 machine_id: m,
                 forward_host: "10.0.0.10".into(),
                 taken_at: 200,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "2")])],
             },
+            200,
         )
         .await
         .unwrap();
@@ -517,18 +970,20 @@ mod tests {
     #[tokio::test]
     async fn removes_containers_not_in_latest_snapshot() {
         let p = pool().await;
-        let m = MachineId::new("m1");
+        let m = MachineId::new("m1").unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
                 machine_id: m.clone(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![
                     entry("a", &[("docktornet.x", "1")]),
                     entry("b", &[("docktornet.y", "2")]),
                 ],
             },
+            100,
         )
         .await
         .unwrap();
@@ -538,8 +993,10 @@ mod tests {
                 machine_id: m,
                 forward_host: "10.0.0.10".into(),
                 taken_at: 200,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            200,
         )
         .await
         .unwrap();
@@ -554,15 +1011,17 @@ mod tests {
     #[tokio::test]
     async fn empty_snapshot_clears_machine() {
         let p = pool().await;
-        let m = MachineId::new("m1");
+        let m = MachineId::new("m1").unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
                 machine_id: m.clone(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -572,8 +1031,10 @@ mod tests {
                 machine_id: m,
                 forward_host: "10.0.0.10".into(),
                 taken_at: 200,
+                agent_version: None,
                 containers: vec![],
             },
+            200,
         )
         .await
         .unwrap();
@@ -588,22 +1049,26 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            100,
         )
         .await
         .unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m2"),
+                machine_id: MachineId::new("m2").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![],
             },
+            100,
         )
         .await
         .unwrap();
@@ -615,13 +1080,14 @@ mod tests {
     #[tokio::test]
     async fn returns_removed_services_for_machine() {
         let p = pool().await;
-        let m = MachineId::new("m1");
+        let m = MachineId::new("m1").unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
                 machine_id: m.clone(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry(
                     "a",
                     &[
@@ -630,6 +1096,7 @@ mod tests {
                     ],
                 )],
             },
+            100,
         )
         .await
         .unwrap();
@@ -646,11 +1113,13 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("app", &[])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -666,11 +1135,13 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[]), entry("b", &[])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -729,13 +1200,6 @@ mod tests {
                 ("m1/b".to_string(), 0, 20, 150),
             ]
         );
-
-        // Clearing by service removes all of that service's pending entries.
-        clear_pending_npm_removals_for_service(&p, "m1/a")
-            .await
-            .unwrap();
-        let pending = list_pending_npm_removals(&p).await.unwrap();
-        assert_eq!(pending, vec![("m1/b".to_string(), 0, 20, 150)]);
     }
 
     #[tokio::test]
@@ -758,34 +1222,74 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.1".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![],
             },
+            100,
         )
         .await
         .unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m2"),
+                machine_id: MachineId::new("m2").unwrap(),
                 forward_host: "10.0.0.2".into(),
                 taken_at: 200,
+                agent_version: None,
                 containers: vec![],
             },
+            200,
         )
         .await
         .unwrap();
 
         let machines = list_machines(&p).await.unwrap();
-        assert_eq!(machines.len(), 2);
-        assert_eq!(machines[0].0, "m1");
-        assert_eq!(machines[0].1, "10.0.0.1");
-        assert_eq!(machines[0].2, 100);
-        assert_eq!(machines[1].0, "m2");
-        assert_eq!(machines[1].1, "10.0.0.2");
-        assert_eq!(machines[1].2, 200);
+        assert_eq!(
+            machines,
+            vec![
+                Machine {
+                    machine_id: "m1".into(),
+                    forward_host: "10.0.0.1".into(),
+                    last_seen: 100,
+                    agent_version: None,
+                },
+                Machine {
+                    machine_id: "m2".into(),
+                    forward_host: "10.0.0.2".into(),
+                    last_seen: 200,
+                    agent_version: None,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_keeps_its_latest_agent_version() {
+        let p = pool().await;
+        let snap = |taken_at, agent_version: Option<&str>| Snapshot {
+            machine_id: MachineId::new("m1").unwrap(),
+            forward_host: "10.0.0.1".into(),
+            taken_at,
+            containers: vec![],
+            agent_version: agent_version.map(str::to_string),
+        };
+        upsert_snapshot(&p, &snap(100, Some("1.1.0")), 100)
+            .await
+            .unwrap();
+        upsert_snapshot(&p, &snap(200, Some("1.2.0")), 200)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_machines(&p).await.unwrap()[0].agent_version.as_deref(),
+            Some("1.2.0")
+        );
+
+        // An agent rolled back to a release without version reporting.
+        upsert_snapshot(&p, &snap(300, None), 300).await.unwrap();
+        assert_eq!(list_machines(&p).await.unwrap()[0].agent_version, None);
     }
 
     #[tokio::test]
@@ -794,22 +1298,26 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![entry("a", &[("docktornet.x", "1")])],
             },
+            1,
         )
         .await
         .unwrap();
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m2"),
+                machine_id: MachineId::new("m2").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 1,
+                agent_version: None,
                 containers: vec![entry("b", &[("docktornet.y", "2")])],
             },
+            1,
         )
         .await
         .unwrap();
@@ -826,11 +1334,13 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 42,
+                agent_version: None,
                 containers: vec![entry("app", &[])],
             },
+            42,
         )
         .await
         .unwrap();
@@ -862,11 +1372,13 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 42,
+                agent_version: None,
                 containers: vec![entry("app", &[])],
             },
+            42,
         )
         .await
         .unwrap();
@@ -884,11 +1396,13 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[]), entry("b", &[])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -908,11 +1422,13 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("app", &[])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -931,11 +1447,13 @@ mod tests {
         upsert_snapshot(
             &p,
             &Snapshot {
-                machine_id: MachineId::new("m1"),
+                machine_id: MachineId::new("m1").unwrap(),
                 forward_host: "10.0.0.10".into(),
                 taken_at: 100,
+                agent_version: None,
                 containers: vec![entry("a", &[]), entry("b", &[])],
             },
+            100,
         )
         .await
         .unwrap();
@@ -994,6 +1512,25 @@ mod tests {
         assert_eq!(
             list_pending_cf_removals(&p).await.unwrap(),
             vec![("m1/b".to_string(), "rec-b".to_string(), 150)]
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_gatus_removals_round_trip() {
+        let p = pool().await;
+        add_pending_gatus_removal(&p, "m1/b", 150).await.unwrap();
+        add_pending_gatus_removal(&p, "m1/a", 100).await.unwrap();
+        // Leaving again moves left_at rather than erroring.
+        add_pending_gatus_removal(&p, "m1/a", 200).await.unwrap();
+        assert_eq!(
+            list_pending_gatus_removals(&p).await.unwrap(),
+            vec![("m1/a".to_string(), 200), ("m1/b".to_string(), 150)]
+        );
+
+        delete_pending_gatus_removal(&p, "m1/a").await.unwrap();
+        assert_eq!(
+            list_pending_gatus_removals(&p).await.unwrap(),
+            vec![("m1/b".to_string(), 150)]
         );
     }
 }

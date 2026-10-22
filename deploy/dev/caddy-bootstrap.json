@@ -1,0 +1,22 @@
+{
+  "admin": {
+    "listen": "0.0.0.0:2019",
+    "origins": ["localhost:2019", "0.0.0.0:2019"]
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "dev": {
+          "listen": [":80"],
+          "automatic_https": { "disable": true },
+          "routes": [
+            {
+              "@id": "docktornet",
+              "handle": [{ "handler": "subroute", "routes": [] }]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

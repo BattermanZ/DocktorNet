@@ -1,7 +1,7 @@
 # Caddy Reverse Proxy Provider — Design
 
 **Date:** 2026-06-25
-**Status:** Approved (pre-implementation)
+**Status:** Superseded by [2026-10-21 Caddy provider design](2026-10-21-caddy-provider-design.md)
 
 ## Summary
 

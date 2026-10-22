@@ -32,12 +32,47 @@ do
   need "$name"
 done
 
-command -v curl >/dev/null || { echo "curl is required" >&2; exit 2; }
-command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
+# Optional settings, from the env file or the environment.
+backup_root="${DOCKTORNET_BACKUP_DIR:-$ROOT/docktornet-backups}"
+server_container="${DOCKTORNET_BACKUP_SERVER_CONTAINER:-docktornet-server}"
+gatus_dir="${DOCKTORNET_BACKUP_GATUS_DIR:-/etc/gatus/config.d}"
+keep="${DOCKTORNET_BACKUP_KEEP:-14}"
+cf_api="${DOCKTORNET_CF_API_URL:-https://api.cloudflare.com/client/v4}"
+cf_api="${cf_api%/}"
 
+if [[ ! "$keep" =~ ^[1-9][0-9]*$ ]]; then
+  echo "DOCKTORNET_BACKUP_KEEP must be a whole number of at least 1, got '$keep'" >&2
+  exit 2
+fi
+if [[ ! -d "$gatus_dir" ]]; then
+  echo "Gatus config dir not found: $gatus_dir (set DOCKTORNET_BACKUP_GATUS_DIR)" >&2
+  exit 2
+fi
+
+for tool in curl jq docker tar; do
+  command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 2; }
+done
+
+# The backup is written to <stamp>.partial and renamed to <stamp> only once
+# every part has succeeded, so retention never counts a failed run.
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-out="$ROOT/docktornet-backups/$stamp"
-mkdir -p "$out/npm" "$out/cloudflare"
+final="$backup_root/$stamp"
+out="$final.partial"
+mkdir -p "$backup_root"
+if [[ -e "$final" ]]; then
+  echo "backup already exists: $final" >&2
+  exit 1
+fi
+mkdir "$out"
+mkdir "$out/npm" "$out/cloudflare"
+
+complete=false
+on_exit() {
+  if [[ "$complete" != true ]]; then
+    echo "backup FAILED; incomplete files left in $out" >&2
+  fi
+}
+trap on_exit EXIT
 
 echo "writing backup to $out"
 
@@ -73,7 +108,6 @@ npm_get "/api/nginx/streams" "streams.json"
 npm_get "/api/nginx/access-lists" "access-lists.json"
 npm_get "/api/settings" "settings.json"
 
-cf_api="https://api.cloudflare.com/client/v4"
 cf_get() {
   local path="$1"
   local file="$2"
@@ -128,5 +162,46 @@ done
 jq -s "." "$all" > "$out/cloudflare/dns-records.json"
 rm "$all"
 
-find "$out" -type f -maxdepth 3 -print | sort
-echo "backup complete: $out"
+# The server image has no shell or sqlite3, so the server binary takes the
+# copy itself and writes it to stdout.
+docker exec -i "$server_container" docktornet-server backup > "$out/docktornet.db"
+if [[ "$(head -c 15 "$out/docktornet.db")" != "SQLite format 3" ]]; then
+  echo "the database backup from $server_container is not a SQLite database" >&2
+  exit 1
+fi
+
+# The server may replace a file while tar reads the directory. GNU tar then
+# exits 1, and the archive still holds each file whole, old or new, because
+# the server writes every file to a temporary name and renames it into place.
+tar_status=0
+tar -czf "$out/gatus-config.tar.gz" -C "$gatus_dir" . || tar_status=$?
+if (( tar_status > 1 )); then
+  echo "archiving $gatus_dir failed with tar exit $tar_status" >&2
+  exit 1
+fi
+
+mv "$out" "$final"
+complete=true
+find "$final" -maxdepth 3 -type f -print | sort
+echo "backup complete: $final"
+
+# Retention: keep the newest $keep stamped directories. Only names in the
+# stamp format are counted or deleted; the stamp sorts by time.
+stamps=()
+shopt -s nullglob
+for dir in "$backup_root"/*/; do
+  dir="${dir%/}"
+  name="${dir##*/}"
+  if [[ "$name" =~ ^[0-9]{8}T[0-9]{6}Z$ && ! -L "$dir" ]]; then
+    stamps+=("$name")
+  fi
+done
+shopt -u nullglob
+if (( ${#stamps[@]} > 0 )); then
+  mapfile -t stamps < <(printf '%s\n' "${stamps[@]}" | LC_ALL=C sort)
+fi
+excess=$(( ${#stamps[@]} - keep ))
+for (( i = 0; i < excess; i++ )); do
+  rm -rf -- "${backup_root:?}/${stamps[i]}"
+  echo "pruned $backup_root/${stamps[i]}"
+done

@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::AgentConfig::from_env()?;
-    let client = push::PushClient::new(&cfg.server_url, &cfg.secret)?;
+    let client = push::PushClient::new(&cfg.server_url, cfg.secret.expose())?;
 
     let mut sources: Vec<Box<dyn ContainerSource>> = Vec::new();
     for spec in &cfg.sockets {
@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
     }
 
     info!(
+        version = env!("CARGO_PKG_VERSION"),
         machine_id = %cfg.machine_id.as_str(),
         sources = sources.len(),
         interval = ?cfg.poll_interval,

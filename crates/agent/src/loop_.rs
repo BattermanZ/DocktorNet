@@ -195,7 +195,7 @@ mod tests {
         ];
 
         let snap = poll_once(
-            &MachineId::new("m1"),
+            &MachineId::new("m1").unwrap(),
             "10.0.0.10",
             &sources,
             Duration::from_secs(30),
@@ -292,7 +292,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             run_until(
-                MachineId::new("m1"),
+                MachineId::new("m1").unwrap(),
                 "10.0.0.10".into(),
                 sources,
                 client,
@@ -408,7 +408,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             run_until(
-                MachineId::new("m1"),
+                MachineId::new("m1").unwrap(),
                 "10.0.0.10".into(),
                 sources,
                 client,
@@ -451,7 +451,7 @@ mod tests {
         ];
 
         let snap = poll_once(
-            &MachineId::new("m1"),
+            &MachineId::new("m1").unwrap(),
             "10.0.0.10",
             &sources,
             Duration::from_secs(30),

@@ -73,6 +73,7 @@ pub fn build(machine_id: &MachineId, forward_host: &str, raw: &[RawContainer]) -
         forward_host: forward_host.to_string(),
         taken_at,
         containers,
+        agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     }
 }
 
@@ -93,7 +94,7 @@ mod tests {
     #[test]
     fn keeps_only_docktornet_prefixed_labels_and_drops_unlabelled_containers() {
         let snap = build(
-            &MachineId::new("m1"),
+            &MachineId::new("m1").unwrap(),
             "10.0.0.10",
             &[
                 rc(
@@ -122,7 +123,7 @@ mod tests {
         // DNS/proxy config on the server. Rather than let one win at random,
         // build must drop the ambiguous entries entirely.
         let snap = build(
-            &MachineId::new("m1"),
+            &MachineId::new("m1").unwrap(),
             "10.0.0.10",
             &[
                 rc("app", &[("docktornet.npm.0.domain", "docker.example.com")]),
@@ -146,9 +147,18 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_carries_the_agent_version() {
+        let snap = build(&MachineId::new("m1").unwrap(), "10.0.0.10", &[]);
+        assert_eq!(
+            snap.agent_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
     fn containers_sorted_by_name_for_stable_diffs() {
         let snap = build(
-            &MachineId::new("m1"),
+            &MachineId::new("m1").unwrap(),
             "10.0.0.10",
             &[
                 rc("zebra", &[("docktornet.x", "1")]),

@@ -13,23 +13,38 @@ Use this runbook to safely flip docktornet from dry-run to live writes against N
 
 ## 2. Backup
 
+The script copies the server's database out of the running `docktornet-server`
+container, so the server must be up. On a first cutover, when it has never
+run, start it once in dry-run first (`DOCKTORNET_DRY_RUN=true` in
+`deploy/server.env`, then
+`docker compose -f deploy/main-host.compose.yaml up -d docktornet-server`).
+
 ```bash
-./scripts/backup_external_state.sh
-ls docktornet-backups/$(date +%F)/
+./scripts/backup_external_state.sh deploy/server.env
+backup="$(ls -d docktornet-backups/[0-9]*T*Z | tail -n 1)"
+ls "$backup" "$backup/npm" "$backup/cloudflare"
 git tag pre-cutover-$(date +%F)
 ```
 
+The script names each backup directory after its UTC start time,
+`YYYYMMDDTHHMMSSZ`. It ends with `backup complete: <dir>`. On any failure it
+exits non-zero, prints `backup FAILED`, and leaves what it wrote in
+`<stamp>.partial`, which the `ls -d` above skips. The `ls -d` assumes the
+default backup directory. If `DOCKTORNET_BACKUP_DIR` is set, use the directory
+the `backup complete:` line names.
+
 Verify the backup directory contains:
 
-- `npm-proxy-hosts.json`
-- `cloudflare-dns.json`
+- `npm/proxy-hosts.json`
+- `cloudflare/dns-records.json`
+- `docktornet.db`
 - `gatus-config.tar.gz`
 
 Do **not** proceed if any file is missing.
 
 ## 3. Shadow phase (dry-run)
 
-- [ ] In `.env`: set `DOCKTORNET_DRY_RUN=true`.
+- [ ] In `server.env`: set `DOCKTORNET_DRY_RUN=true`.
 - [ ] Deploy `deploy/main-host.compose.yaml`.
 - [ ] Tail logs for at least one `DOCKTORNET_FULL_RESYNC_INTERVAL` (default 1h):
 
@@ -54,7 +69,7 @@ Pick **one** low-stakes service to flip first. The simplest way is:
    docker compose -f deploy/main-host.compose.yaml stop docktornet-server
    ```
 
-2. In `.env`: `DOCKTORNET_DRY_RUN=false`.
+2. In `server.env`: `DOCKTORNET_DRY_RUN=false`.
 3. Restart:
 
    ```bash
@@ -92,7 +107,12 @@ After the canary is healthy:
 
 ## 7. Rollback
 
-Use the most recent `docktornet-backups/<date>/` directory.
+Use the backup taken in §2, the newest `docktornet-backups/<stamp>/`
+directory:
+
+```bash
+backup=docktornet-backups/<stamp>
+```
 
 1. Stop the server:
    ```bash
@@ -101,7 +121,7 @@ Use the most recent `docktornet-backups/<date>/` directory.
 
 2. Restore NPM hosts. Snippet (adjust to backup JSON shape):
    ```bash
-   jq -c '.[]' docktornet-backups/<date>/npm-proxy-hosts.json | \
+   jq -c '.[]' "$backup/npm/proxy-hosts.json" | \
    while read -r host; do
      curl -fsS -X POST "$DOCKTORNET_NPM_URL/api/nginx/proxy-hosts" \
        -H "Authorization: Bearer $NPM_TOKEN" \
@@ -112,7 +132,7 @@ Use the most recent `docktornet-backups/<date>/` directory.
 
 3. Restore Cloudflare records:
    ```bash
-   jq -c '.[]' docktornet-backups/<date>/cloudflare-dns.json | \
+   jq -c '.[]' "$backup/cloudflare/dns-records.json" | \
    while read -r rec; do
      curl -fsS -X POST \
        "https://api.cloudflare.com/client/v4/zones/$DOCKTORNET_CF_ZONE_ID/dns_records" \
@@ -124,16 +144,16 @@ Use the most recent `docktornet-backups/<date>/` directory.
 
 4. Restore Gatus config:
    ```bash
-   sudo tar -xzf docktornet-backups/<date>/gatus-config.tar.gz -C /etc/gatus/config.d
+   sudo tar -xzf "$backup/gatus-config.tar.gz" -C /etc/gatus/config.d
    ```
 
-5. Wipe docktornet tracked state so it cannot try to manage resources it no longer "owns":
+5. Wipe docktornet tracked state so it cannot try to manage resources it no longer "owns". The database is on the `./data` bind mount next to the compose file, owned by uid 65532:
    ```bash
-   rm ./data/docktornet.db
+   sudo rm -f deploy/data/docktornet.db deploy/data/docktornet.db-wal deploy/data/docktornet.db-shm
    ```
 
 6. Bring docktornet back up in dry-run for a second look before reattempting:
    ```bash
-   # .env: DOCKTORNET_DRY_RUN=true
+   # deploy/server.env: DOCKTORNET_DRY_RUN=true
    docker compose -f deploy/main-host.compose.yaml up -d
    ```

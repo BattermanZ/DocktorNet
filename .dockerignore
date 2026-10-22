@@ -2,5 +2,7 @@ target/
 docktornet-backups/
 data/
 .env
+*.env
 *.db
 .git/
+dev-data/

@@ -17,6 +17,14 @@ const CF_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// header, so we still stop hammering the API for a sensible interval.
 const DEFAULT_CF_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Prefix of the ownership marker docktornet writes as a record's `comment`,
+/// followed by the owning service ID (ADR 0001).
+pub const MARKER_PREFIX: &str = "docktornet:";
+
+/// Longest comment Cloudflare accepts on the Free plan. Docktornet uses it on
+/// every plan.
+pub const COMMENT_MAX_CHARS: usize = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DnsRecordPayload {
     #[serde(rename = "type")]
@@ -25,6 +33,18 @@ pub struct DnsRecordPayload {
     pub content: String,
     pub proxied: bool,
     pub ttl: u32,
+    /// The ownership marker. A PUT overwrites the whole record, so every
+    /// create and update carries `comment`. It is `None` only when the service
+    /// ID is too long for a marker, and is then sent empty, leaving no comment.
+    #[serde(serialize_with = "comment_or_empty")]
+    pub comment: Option<String>,
+}
+
+fn comment_or_empty<S: serde::Serializer>(
+    comment: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(comment.as_deref().unwrap_or_default())
 }
 
 #[derive(Clone)]
@@ -36,6 +56,9 @@ pub struct CloudflareClient {
     /// Instant until which further calls are suppressed after a 429.  Shared
     /// across clones so every reconcile honours the same back-off window.
     rate_limited_until: Arc<Mutex<Option<Instant>>>,
+    /// The configured zone, once a fetch has succeeded. It never changes for a
+    /// zone id, so every later call, on every clone, reads it from here.
+    zone: Arc<Mutex<Option<Zone>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,16 +92,49 @@ pub struct DnsRecordResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DnsRecord {
     pub id: String,
+    #[serde(rename = "type", default)]
+    pub record_type: String,
     pub name: String,
+    // Defaults, so one unusual record in a whole-zone listing cannot fail it.
+    #[serde(default)]
     pub content: String,
+    #[serde(default)]
     pub proxied: bool,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+impl DnsRecord {
+    /// The record's comment, with an empty one read as none.
+    pub fn comment(&self) -> Option<&str> {
+        self.comment
+            .as_deref()
+            .filter(|comment| !comment.is_empty())
+    }
+
+    /// The service ID the record's ownership marker names, if it has one.
+    pub fn marker_owner(&self) -> Option<&str> {
+        self.comment()?.strip_prefix(MARKER_PREFIX)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DnsRecordListResponse {
     pub success: bool,
     pub result: Vec<DnsRecord>,
+    #[serde(default)]
+    pub result_info: Option<ResultInfo>,
 }
+
+/// The page a list response holds, out of how many.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ResultInfo {
+    pub page: u32,
+    pub total_pages: u32,
+}
+
+/// Records asked for per page when listing the whole zone.
+const LIST_PAGE_SIZE: u32 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct DeleteResponse {
@@ -87,7 +143,7 @@ struct DeleteResponse {
 
 impl CloudflareClient {
     pub fn new(config: CloudflareConfig) -> Self {
-        Self::with_base_url(config, "https://api.cloudflare.com/client/v4")
+        Self::with_base_url(config, crate::config::CLOUDFLARE_API_URL)
     }
 
     pub fn with_base_url(config: CloudflareConfig, base_url: impl Into<String>) -> Self {
@@ -106,11 +162,12 @@ impl CloudflareClient {
             .expect("failed to build Cloudflare HTTP client");
 
         Self {
-            api_token: config.api_token,
+            api_token: config.api_token.expose().to_owned(),
             zone_id: config.zone_id,
             base_url,
             http,
             rate_limited_until: Arc::new(Mutex::new(None)),
+            zone: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -156,7 +213,17 @@ impl CloudflareClient {
         Ok(resp)
     }
 
+    /// The configured zone. Only the first successful call reaches Cloudflare;
+    /// a failed fetch is not cached, so the next call tries again.
     pub async fn zone(&self) -> Result<Zone, CloudflareError> {
+        if let Some(zone) = self
+            .zone
+            .lock()
+            .expect("cloudflare zone mutex poisoned")
+            .clone()
+        {
+            return Ok(zone);
+        }
         self.check_rate_limit()?;
         let resp = self
             .http
@@ -167,7 +234,9 @@ impl CloudflareClient {
         let resp = self.guard_rate_limit(resp)?.error_for_status()?;
 
         let response = resp.json::<ZoneResponse>().await?;
-        response.result_if_success()
+        let zone = response.result_if_success()?;
+        *self.zone.lock().expect("cloudflare zone mutex poisoned") = Some(zone.clone());
+        Ok(zone)
     }
 
     pub async fn find_record_by_name(
@@ -190,6 +259,65 @@ impl CloudflareClient {
         }
 
         Ok(response.result.into_iter().next())
+    }
+
+    /// The record whose comment is exactly `comment`. Cloudflare's
+    /// `comment.exact` filter ignores case, so the match is checked again here.
+    pub async fn find_record_by_marker(
+        &self,
+        comment: &str,
+    ) -> Result<Option<DnsRecord>, CloudflareError> {
+        self.check_rate_limit()?;
+        let resp = self
+            .http
+            .get(self.endpoint(&format!("zones/{}/dns_records", self.zone_id)))
+            .query(&[("comment.exact", comment)])
+            .bearer_auth(&self.api_token)
+            .send()
+            .await?;
+        let resp = self.guard_rate_limit(resp)?.error_for_status()?;
+
+        let response = resp.json::<DnsRecordListResponse>().await?;
+        if !response.success {
+            return Err(CloudflareError::Api);
+        }
+
+        Ok(response
+            .result
+            .into_iter()
+            .find(|record| record.comment() == Some(comment)))
+    }
+
+    /// Every DNS record in the zone, of any type, following Cloudflare's
+    /// pagination. A response without `result_info` is read as the only page.
+    pub async fn list_records(&self) -> Result<Vec<DnsRecord>, CloudflareError> {
+        let mut records = Vec::new();
+        let mut page = 1u32;
+        loop {
+            self.check_rate_limit()?;
+            let resp = self
+                .http
+                .get(self.endpoint(&format!("zones/{}/dns_records", self.zone_id)))
+                .query(&[
+                    ("page", page.to_string()),
+                    ("per_page", LIST_PAGE_SIZE.to_string()),
+                ])
+                .bearer_auth(&self.api_token)
+                .send()
+                .await?;
+            let resp = self.guard_rate_limit(resp)?.error_for_status()?;
+
+            let response = resp.json::<DnsRecordListResponse>().await?;
+            if !response.success {
+                return Err(CloudflareError::Api);
+            }
+            let empty = response.result.is_empty();
+            records.extend(response.result);
+            match response.result_info {
+                Some(info) if !empty && info.page < info.total_pages => page = info.page + 1,
+                _ => return Ok(records),
+            }
+        }
     }
 
     pub async fn create_record(
@@ -310,7 +438,22 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
-pub fn dns_payload(dns: &CloudflareDns, zone_name: &str) -> DnsRecordPayload {
+/// The ownership marker comment for `service_id`, or `None` with a warning
+/// when it would be longer than Cloudflare accepts.
+pub fn marker_comment(service_id: &str) -> Option<String> {
+    let comment = format!("{MARKER_PREFIX}{service_id}");
+    if comment.chars().count() > COMMENT_MAX_CHARS {
+        tracing::warn!(
+            service_id,
+            max_chars = COMMENT_MAX_CHARS,
+            "service ID too long for a Cloudflare ownership marker; the record gets no comment"
+        );
+        return None;
+    }
+    Some(comment)
+}
+
+pub fn dns_payload(dns: &CloudflareDns, zone_name: &str, service_id: &str) -> DnsRecordPayload {
     let name = format!(
         "{}.{}",
         dns.name.trim_end_matches('.'),
@@ -323,6 +466,7 @@ pub fn dns_payload(dns: &CloudflareDns, zone_name: &str) -> DnsRecordPayload {
         content: dns.target.clone(),
         proxied: dns.proxied,
         ttl: 1,
+        comment: marker_comment(service_id),
     }
 }
 
@@ -339,7 +483,7 @@ mod tests {
             proxied: true,
         };
 
-        let payload = dns_payload(&dns, "example.com");
+        let payload = dns_payload(&dns, "example.com", "m1/app");
 
         assert_eq!(
             payload,
@@ -349,8 +493,46 @@ mod tests {
                 content: "home.example.com".to_string(),
                 proxied: true,
                 ttl: 1,
+                comment: Some("docktornet:m1/app".to_string()),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn zone_retries_a_failed_fetch_and_then_serves_the_cached_zone() {
+        let mut server = Server::new_async().await;
+        let failing = server
+            .mock("GET", "/zones/z")
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "t".into(),
+                zone_id: "z".to_string(),
+            },
+            server.url(),
+        );
+
+        client.zone().await.unwrap_err();
+        failing.assert_async().await;
+        failing.remove_async().await;
+
+        let working = server
+            .mock("GET", "/zones/z")
+            .with_status(200)
+            .with_body(r#"{"success":true,"result":{"id":"z","name":"example.com"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let expected = Zone {
+            id: "z".to_string(),
+            name: "example.com".to_string(),
+        };
+        assert_eq!(client.zone().await.unwrap(), expected);
+        assert_eq!(client.clone().zone().await.unwrap(), expected);
+        working.assert_async().await;
     }
 
     #[tokio::test]
@@ -381,7 +563,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "token-abc".to_string(),
+                api_token: "token-abc".into(),
                 zone_id: "zone-123".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -393,11 +575,92 @@ mod tests {
             record,
             Some(DnsRecord {
                 id: "rec-1".to_string(),
+                record_type: String::new(),
                 name: "app.example.com".to_string(),
                 content: "target.example.com".to_string(),
                 proxied: true,
+                comment: None,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn list_records_follows_every_page() {
+        let mut server = Server::new_async().await;
+        let page = |n: u32, id: &str, name: &str| {
+            serde_json::json!({
+                "success": true,
+                "result": [{
+                    "id": id,
+                    "type": "A",
+                    "name": name,
+                    "content": "192.0.2.1",
+                    "proxied": false,
+                    "comment": null
+                }],
+                "result_info": {"page": n, "per_page": 1000, "total_pages": 2, "count": 1, "total_count": 2}
+            })
+            .to_string()
+        };
+        let first = server
+            .mock("GET", "/client/v4/zones/zone-123/dns_records")
+            .match_header("authorization", "Bearer token-abc")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("page".into(), "1".into()),
+                Matcher::UrlEncoded("per_page".into(), "1000".into()),
+            ]))
+            .with_status(200)
+            .with_body(page(1, "rec-1", "a.example.com"))
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/client/v4/zones/zone-123/dns_records")
+            .match_query(Matcher::UrlEncoded("page".into(), "2".into()))
+            .with_status(200)
+            .with_body(page(2, "rec-2", "b.example.com"))
+            .create_async()
+            .await;
+
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "token-abc".into(),
+                zone_id: "zone-123".to_string(),
+            },
+            format!("{}/client/v4", server.url()),
+        );
+
+        let records = client.list_records().await.unwrap();
+        first.assert_async().await;
+        second.assert_async().await;
+        let ids: Vec<_> = records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["rec-1", "rec-2"]);
+        assert_eq!(records[0].record_type, "A");
+    }
+
+    #[tokio::test]
+    async fn list_records_reads_a_response_without_result_info_as_one_page() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("GET", "/client/v4/zones/zone-123/dns_records")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"success":true,"result":[{"id":"rec-1","type":"CNAME","name":"a.example.com","content":"t","proxied":false}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "token-abc".into(),
+                zone_id: "zone-123".to_string(),
+            },
+            format!("{}/client/v4", server.url()),
+        );
+
+        assert_eq!(client.list_records().await.unwrap().len(), 1);
+        m.assert_async().await;
     }
 
     #[tokio::test]
@@ -421,7 +684,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "token-abc".to_string(),
+                api_token: "token-abc".into(),
                 zone_id: "zone-123".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -452,7 +715,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url_and_timeout(
             CloudflareConfig {
-                api_token: "t".to_string(),
+                api_token: "t".into(),
                 zone_id: "zone-id".to_string(),
             },
             format!("http://{addr}/client/v4"),
@@ -499,7 +762,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "t".to_string(),
+                api_token: "t".into(),
                 zone_id: "zone-id".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -530,7 +793,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "t".to_string(),
+                api_token: "t".into(),
                 zone_id: "zone-id".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -563,7 +826,7 @@ mod tests {
 
         let client = CloudflareClient::with_base_url(
             CloudflareConfig {
-                api_token: "t".to_string(),
+                api_token: "t".into(),
                 zone_id: "zone-id".to_string(),
             },
             format!("{}/client/v4", server.url()),
@@ -571,5 +834,56 @@ mod tests {
         let got = client.get_record("recX").await.unwrap();
         m.assert_async().await;
         assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_record_by_marker_matches_case_sensitively() {
+        // Cloudflare's comment.exact filter ignores case, so it can return a
+        // record marked for a service whose ID differs only in case.
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("GET", "/client/v4/zones/zone-id/dns_records")
+            .match_query(Matcher::UrlEncoded(
+                "comment.exact".into(),
+                "docktornet:m1/app".into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "success": true,
+                    "result": [
+                        {"id": "upper", "name": "a.example.com", "content": "t",
+                         "proxied": false, "comment": "docktornet:m1/APP"},
+                        {"id": "exact", "name": "b.example.com", "content": "t",
+                         "proxied": false, "comment": "docktornet:m1/app"}
+                    ]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client = CloudflareClient::with_base_url(
+            CloudflareConfig {
+                api_token: "t".into(),
+                zone_id: "zone-id".to_string(),
+            },
+            format!("{}/client/v4", server.url()),
+        );
+        let found = client
+            .find_record_by_marker("docktornet:m1/app")
+            .await
+            .unwrap()
+            .unwrap();
+        m.assert_async().await;
+        assert_eq!(found.id, "exact");
+    }
+
+    #[test]
+    fn marker_comment_stops_at_one_hundred_characters() {
+        // "docktornet:" is 11 characters, so an 89-character ID fits exactly.
+        let fits = "m".repeat(89);
+        assert_eq!(marker_comment(&fits).map(|c| c.chars().count()), Some(100));
+        assert_eq!(marker_comment(&"m".repeat(90)), None);
     }
 }

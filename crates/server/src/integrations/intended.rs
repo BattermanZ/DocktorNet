@@ -8,6 +8,15 @@ pub struct IntendedService {
     pub labels: ParsedLabels,
 }
 
+/// Whether parsed labels ask docktornet for any resource.  A container without
+/// any is not a service docktornet reconciles.
+pub fn has_intent(parsed: &ParsedLabels) -> bool {
+    !parsed.npm.is_empty()
+        || parsed.cf_dns.is_some()
+        || !parsed.gatus.is_empty()
+        || !parsed.caddy.is_empty()
+}
+
 pub fn intended_services(
     machine_id: &MachineId,
     containers: &[ContainerEntry],
@@ -24,9 +33,7 @@ pub fn intended_services(
                     "dropping malformed docktornet labels; affected resources will not be published"
                 );
             }
-            let has_intent =
-                !parsed.npm.is_empty() || parsed.cf_dns.is_some() || !parsed.gatus.is_empty();
-            has_intent.then(|| IntendedService {
+            has_intent(&parsed).then(|| IntendedService {
                 service_id: service_id(machine_id, &container.name),
                 machine_id: machine_id.clone(),
                 container: container.name.clone(),
@@ -54,7 +61,7 @@ mod tests {
     #[test]
     fn ignores_containers_without_docktornet_labels() {
         let services = intended_services(
-            &MachineId::new("m1"),
+            &MachineId::new("m1").unwrap(),
             &[entry("plain", &[("traefik.enable", "true")])],
         );
         assert!(services.is_empty());
@@ -92,7 +99,7 @@ mod tests {
         // Without surfacing warnings the public proxy host silently vanishes.
         tracing::subscriber::with_default(subscriber, || {
             let services = intended_services(
-                &MachineId::new("m1"),
+                &MachineId::new("m1").unwrap(),
                 &[entry(
                     "app",
                     &[("docktornet.npm.0.host", "app.example.com")],
@@ -111,7 +118,7 @@ mod tests {
     #[test]
     fn parses_opted_in_container() {
         let services = intended_services(
-            &MachineId::new("m1"),
+            &MachineId::new("m1").unwrap(),
             &[entry(
                 "app",
                 &[
@@ -125,5 +132,21 @@ mod tests {
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].service_id, "m1/app");
         assert_eq!(services[0].labels.npm[0].hosts, vec!["app.example.com"]);
+    }
+
+    #[test]
+    fn a_container_with_only_caddy_labels_is_a_service() {
+        let services = intended_services(
+            &MachineId::new("m1").unwrap(),
+            &[entry(
+                "app",
+                &[
+                    ("docktornet.caddy.0.host", "app.example.com"),
+                    ("docktornet.caddy.0.port", "3000"),
+                ],
+            )],
+        );
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].labels.caddy[0].hosts, vec!["app.example.com"]);
     }
 }

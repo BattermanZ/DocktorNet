@@ -36,16 +36,37 @@ mod tests {
     use tempfile::tempdir;
     use tower::ServiceExt;
 
+    use crate::agent_versions::AgentVersionTracker;
     use crate::db;
     use crate::flapping::FlappingTracker;
     use crate::reconcile::{ReconcileOptions, Reconciler};
     use crate::storage::list_services_for_machine;
 
+    const SERVER_VERSION: &str = "1.2.3-test";
+
     async fn make_app() -> (Router, crate::db::Db, tempfile::TempDir) {
+        make_app_with_window(Duration::from_secs(300)).await
+    }
+
+    async fn make_app_with_window(window: Duration) -> (Router, crate::db::Db, tempfile::TempDir) {
+        let (state, dir) = make_state(window).await;
+        let pool = state.reconciler.pool().clone();
+        (build(state), pool, dir)
+    }
+
+    /// The app, with a handle on the reconciler behind it.
+    async fn make_app_with_reconciler() -> (Router, Reconciler, tempfile::TempDir) {
+        let (state, dir) = make_state(Duration::from_secs(300)).await;
+        let reconciler = state.reconciler.clone();
+        (build(state), reconciler, dir)
+    }
+
+    /// The app state over a fresh database, before it becomes a router.
+    async fn make_state(window: Duration) -> (AppState, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
         let reconciler = Reconciler::new(
-            pool.clone(),
+            pool,
             ReconcileOptions {
                 dry_run: true,
                 adopt_existing: false,
@@ -55,9 +76,10 @@ mod tests {
         let state = AppState {
             reconciler,
             secret: Arc::new("s3cret".into()),
-            flapping: Arc::new(FlappingTracker::new(Duration::from_secs(300))),
+            flapping: Arc::new(FlappingTracker::new(window)),
+            agent_versions: Arc::new(AgentVersionTracker::new(SERVER_VERSION)),
         };
-        (build(state), pool, dir)
+        (state, dir)
     }
 
     fn body(snap: &Snapshot) -> Body {
@@ -69,9 +91,10 @@ mod tests {
         labels.insert("docktornet.gatus.0.url".into(), "u".into());
         labels.insert("docktornet.gatus.0.interval".into(), "30s".into());
         Snapshot {
-            machine_id: MachineId::new("m1"),
+            machine_id: MachineId::new("m1").unwrap(),
             forward_host: "10.0.0.10".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "a".into(),
                 labels,
@@ -80,6 +103,11 @@ mod tests {
     }
 
     fn req(method: &str, token: Option<&str>, snap: &Snapshot) -> Request<Body> {
+        req_from(method, "127.0.0.1:9999", token, body(snap))
+    }
+
+    /// A request to the snapshot endpoint carrying `body`, arriving from `from`.
+    fn req_from(method: &str, from: &str, token: Option<&str>, body: Body) -> Request<Body> {
         let mut b = Request::builder()
             .method(method)
             .uri("/api/v1/snapshot")
@@ -87,11 +115,11 @@ mod tests {
         if let Some(t) = token {
             b = b.header("authorization", format!("Bearer {t}"));
         }
-        let mut request = b.body(body(snap)).unwrap();
+        let mut request = b.body(body).unwrap();
         request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo::<SocketAddr>(
-                "127.0.0.1:9999".parse().unwrap(),
+                from.parse().unwrap(),
             ));
         request
     }
@@ -184,6 +212,7 @@ mod tests {
             reconciler,
             secret: Arc::new("s3cret".into()),
             flapping: Arc::new(FlappingTracker::new(Duration::from_secs(300))),
+            agent_versions: Arc::new(AgentVersionTracker::new(SERVER_VERSION)),
         };
         let app = build(state);
 
@@ -193,9 +222,10 @@ mod tests {
         labels.insert("docktornet.npm.0.scheme".into(), "http".into());
         labels.insert("docktornet.npm.0.ssl".into(), "false".into());
         let snap = Snapshot {
-            machine_id: MachineId::new("m1"),
+            machine_id: MachineId::new("m1").unwrap(),
             forward_host: "10.0.0.10".into(),
             taken_at: 1,
+            agent_version: None,
             containers: vec![ContainerEntry {
                 name: "app".into(),
                 labels,
@@ -212,6 +242,221 @@ mod tests {
         // background NPM reconcile will fail.
         let rows = list_services_for_machine(&pool, "m1").await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    fn snapshot_json(machine_id: &str) -> Body {
+        Body::from(
+            serde_json::json!({
+                "machine_id": machine_id,
+                "forward_host": "10.0.0.10",
+                "taken_at": 1,
+                "containers": [],
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_an_invalid_machine_id_with_400() {
+        let (app, pool, _dir) = make_app().await;
+        for bad in ["", "a/b", "a b", "a\u{1}b"] {
+            let resp = app
+                .clone()
+                .oneshot(req_from(
+                    "POST",
+                    "127.0.0.1:9999",
+                    Some("s3cret"),
+                    snapshot_json(bad),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "machine id {bad:?}");
+        }
+        assert!(
+            crate::storage::list_machines(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A snapshot of `m1` from an agent forwarding to `forward_host`, with one
+    /// service carrying NPM and Cloudflare labels.
+    fn published(forward_host: &str) -> Snapshot {
+        let mut labels = BTreeMap::new();
+        labels.insert("docktornet.npm.0.host".into(), "a.example.com".into());
+        labels.insert("docktornet.npm.0.port".into(), "3000".into());
+        labels.insert("docktornet.npm.0.scheme".into(), "http".into());
+        labels.insert("docktornet.npm.0.ssl".into(), "false".into());
+        labels.insert("docktornet.cf.dns.name".into(), "a".into());
+        labels.insert("docktornet.cf.dns.target".into(), "home.example.com".into());
+        Snapshot {
+            forward_host: forward_host.into(),
+            containers: vec![ContainerEntry {
+                name: "intruder".into(),
+                labels,
+            }],
+            ..snap()
+        }
+    }
+
+    #[tokio::test]
+    async fn second_agent_with_another_forward_host_gets_409_and_leaves_no_trace() {
+        let dir = tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+        // NPM and Cloudflare both point at a server that must never be called.
+        let mut external = mockito::Server::new_async().await;
+        let mut untouched = Vec::new();
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            untouched.push(
+                external
+                    .mock(method, mockito::Matcher::Any)
+                    .expect(0)
+                    .create_async()
+                    .await,
+            );
+        }
+        let npm = crate::integrations::npm::NpmClient::new(crate::config::NpmConfig {
+            url: url::Url::parse(&external.url()).unwrap(),
+            user: "u".into(),
+            password: "p".into(),
+        });
+        let cf = crate::integrations::cloudflare::CloudflareClient::with_base_url(
+            crate::config::CloudflareConfig {
+                api_token: "t".into(),
+                zone_id: "z".into(),
+            },
+            external.url(),
+        );
+        let reconciler = Reconciler::with_clients(
+            pool.clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+            npm,
+            cf,
+        );
+        let app = build(AppState {
+            reconciler: reconciler.clone(),
+            secret: Arc::new("s3cret".into()),
+            flapping: Arc::new(FlappingTracker::new(Duration::from_secs(300))),
+            agent_versions: Arc::new(AgentVersionTracker::new(SERVER_VERSION)),
+        });
+
+        // The owner publishes nothing, so its own apply calls neither API.
+        let owner = Snapshot {
+            containers: vec![],
+            ..snap()
+        };
+        let resp = app
+            .clone()
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.1:1000",
+                Some("s3cret"),
+                body(&owner),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        reconciler.wait_for_applies().await;
+        let before = crate::storage::list_machines(&pool).await.unwrap();
+
+        let resp = app
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.2:1000",
+                Some("s3cret"),
+                body(&published("10.0.0.99")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        reconciler.wait_for_applies().await;
+
+        assert_eq!(crate::storage::list_machines(&pool).await.unwrap(), before);
+        assert!(
+            list_services_for_machine(&pool, "m1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for mock in untouched {
+            mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn second_agent_takes_over_once_the_owner_is_silent_for_the_window() {
+        let (app, pool, _dir) = make_app_with_window(Duration::from_millis(200)).await;
+        let resp = app
+            .clone()
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.1:1000",
+                Some("s3cret"),
+                body(&snap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app
+            .clone()
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.2:1000",
+                Some("s3cret"),
+                body(&published("10.0.0.99")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let resp = app
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.2:1000",
+                Some("s3cret"),
+                body(&published("10.0.0.99")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let machines = crate::storage::list_machines(&pool).await.unwrap();
+        assert_eq!(machines[0].forward_host, "10.0.0.99");
+    }
+
+    #[tokio::test]
+    async fn new_source_ip_with_the_same_forward_host_is_accepted() {
+        let (app, pool, _dir) = make_app().await;
+        let resp = app
+            .clone()
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.1:1000",
+                Some("s3cret"),
+                body(&snap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let moved = published("10.0.0.10");
+        let resp = app
+            .oneshot(req_from(
+                "POST",
+                "10.0.0.2:1000",
+                Some("s3cret"),
+                body(&moved),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let rows = list_services_for_machine(&pool, "m1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "m1/intruder");
     }
 
     #[tokio::test]
@@ -231,11 +476,25 @@ mod tests {
         // With a valid bearer token, the agent inventory is disclosed.
         let (app, _pool, _dir) = make_app().await;
 
-        // Push a snapshot for machine "m1".
-        let push = req("POST", Some("s3cret"), &snap());
-        app.clone().oneshot(push).await.unwrap();
+        // Push a snapshot for machine "m1" from an agent reporting 0.9.0, and
+        // one for "m2" from an agent that predates version reporting.
+        let reporting = Snapshot {
+            agent_version: Some("0.9.0".into()),
+            ..snap()
+        };
+        let silent = Snapshot {
+            machine_id: MachineId::new("m2").unwrap(),
+            ..snap()
+        };
+        for push in [&reporting, &silent] {
+            let resp = app
+                .clone()
+                .oneshot(req("POST", Some("s3cret"), push))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        }
 
-        // Fetch /healthz WITH the bearer token and assert the body contains "m1".
         let get_req = Request::builder()
             .method("GET")
             .uri("/healthz")
@@ -247,10 +506,15 @@ mod tests {
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let body_str = std::str::from_utf8(&body_bytes).unwrap();
-        assert!(
-            body_str.contains("m1"),
-            "authed body should contain machine id m1: {body_str}"
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["version"], SERVER_VERSION, "{body}");
+        assert_eq!(body["agents"][0]["machine_id"], "m1", "{body}");
+        assert_eq!(body["agents"][0]["agent_version"], "0.9.0", "{body}");
+        assert_eq!(body["agents"][1]["machine_id"], "m2", "{body}");
+        assert_eq!(
+            body["agents"][1].get("agent_version"),
+            Some(&serde_json::Value::Null),
+            "{body}"
         );
     }
 
@@ -258,11 +522,14 @@ mod tests {
     async fn healthz_hides_agent_inventory_without_auth() {
         // Unauthenticated /healthz must stay a bare liveness probe: 200, but it
         // must NOT leak any agent's machine id or internal forward address.
-        let (app, _pool, _dir) = make_app().await;
+        let (app, reconciler, _dir) = make_app_with_reconciler().await;
 
         // Push a snapshot for machine "m1" (forward_host 10.0.0.10).
         let push = req("POST", Some("s3cret"), &snap());
         app.clone().oneshot(push).await.unwrap();
+        // Neither a finished resync nor an open breaker shows here.
+        reconciler.full_resync().await.unwrap();
+        reconciler.trip_npm_breaker();
 
         // Fetch /healthz WITHOUT any Authorization header.
         let get_req = Request::builder()
@@ -284,5 +551,246 @@ mod tests {
             !body_str.contains("10.0.0.10"),
             "unauthenticated body must not leak forward address: {body_str}"
         );
+        // No version either: the exact release must not be fingerprintable.
+        let body: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&body_bytes).unwrap();
+        let keys: Vec<&str> = body.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["server_time", "status"], "{body_str}");
+        // Nor does the open breaker turn it degraded.
+        assert_eq!(body["status"], "ok", "{body_str}");
+    }
+
+    /// The body of `/healthz` fetched with the bearer token.
+    async fn authenticated_health(app: Router) -> serde_json::Value {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .header("authorization", "Bearer s3cret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_the_last_full_resync_with_valid_bearer() {
+        let (app, reconciler, _dir) = make_app_with_reconciler().await;
+
+        let body = authenticated_health(app.clone()).await;
+        assert_eq!(
+            body.get("last_resync"),
+            Some(&serde_json::Value::Null),
+            "null before the first resync: {body}"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(req("POST", Some("s3cret"), &snap()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        reconciler.full_resync().await.unwrap();
+
+        let body = authenticated_health(app).await;
+        let last = &body["last_resync"];
+        assert_eq!(last["outcome"], "ok", "{body}");
+        assert_eq!(last["verified"], 1, "{body}");
+        assert_eq!(last["repaired"], 0, "{body}");
+        assert_eq!(last["failed"], 0, "{body}");
+        assert_eq!(last.get("error"), None, "{body}");
+        let finished_at = last["finished_at"].as_str().unwrap();
+        humantime::parse_rfc3339(finished_at).unwrap();
+        assert_eq!(body["status"], "ok", "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_a_failed_full_resync_with_its_error() {
+        let (app, reconciler, _dir) = make_app_with_reconciler().await;
+        // The resync cannot read its services from a closed database.
+        reconciler.pool().close().await;
+        reconciler.full_resync().await.unwrap_err();
+
+        let body = authenticated_health(app).await;
+        let last = &body["last_resync"];
+        assert_eq!(last["outcome"], "error", "{body}");
+        assert_eq!(last["verified"], 0, "{body}");
+        assert_eq!(last["repaired"], 0, "{body}");
+        assert_eq!(last["failed"], 0, "{body}");
+        assert!(
+            last["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{body}"
+        );
+        humantime::parse_rfc3339(last["finished_at"].as_str().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_a_closed_npm_breaker_with_valid_bearer() {
+        let (app, _pool, _dir) = make_app().await;
+
+        let body = authenticated_health(app).await;
+
+        assert_eq!(
+            body["npm_breaker"],
+            serde_json::json!({ "open": false, "open_until": null }),
+            "{body}"
+        );
+        assert_eq!(body["status"], "ok", "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_is_degraded_while_the_npm_breaker_is_open() {
+        let (app, reconciler, _dir) = make_app_with_reconciler().await;
+        reconciler.trip_npm_breaker();
+
+        let body = authenticated_health(app).await;
+
+        assert_eq!(body["npm_breaker"]["open"], true, "{body}");
+        let open_until =
+            humantime::parse_rfc3339(body["npm_breaker"]["open_until"].as_str().unwrap()).unwrap();
+        // The cooldown is a minute; the endpoint rounds to whole seconds.
+        let ahead = open_until
+            .duration_since(std::time::SystemTime::now() - Duration::from_secs(1))
+            .unwrap();
+        assert!(ahead <= Duration::from_secs(62), "{body}");
+        assert!(ahead >= Duration::from_secs(55), "{body}");
+        assert_eq!(body["status"], "degraded", "{body}");
+    }
+
+    /// The app over a reconciler with Caddy alone configured, at `caddy`.  It
+    /// is not a dry run, which would skip the anchor check.
+    async fn make_app_with_caddy(
+        caddy: &mockito::ServerGuard,
+    ) -> (Router, Reconciler, tempfile::TempDir) {
+        let (mut state, dir) = make_state(Duration::from_secs(300)).await;
+        state.reconciler = Reconciler::new(
+            state.reconciler.pool().clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+        )
+        .with_caddy(crate::integrations::caddy::CaddyClient::new(
+            crate::config::CaddyConfig {
+                admin_url: url::Url::parse(&caddy.url()).unwrap(),
+                anchor_id: "docktornet".into(),
+            },
+        ));
+        let reconciler = state.reconciler.clone();
+        (build(state), reconciler, dir)
+    }
+
+    /// Caddy's anchor route answers with `status` and `body`.
+    async fn caddy_anchor(status: usize, body: &str) -> (mockito::ServerGuard, mockito::Mock) {
+        let mut caddy = mockito::Server::new_async().await;
+        let mock = caddy
+            .mock("GET", "/id/docktornet/handle/0/routes")
+            .with_status(status)
+            .with_body(body)
+            .create_async()
+            .await;
+        (caddy, mock)
+    }
+
+    #[tokio::test]
+    async fn healthz_has_no_caddy_fields_when_caddy_is_unconfigured() {
+        let (app, _pool, _dir) = make_app().await;
+
+        let body = authenticated_health(app).await;
+
+        assert_eq!(body.get("caddy_breaker"), None, "{body}");
+        assert_eq!(body.get("caddy_anchor"), None, "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_hides_the_caddy_fields_without_auth() {
+        let (caddy, _anchor) = caddy_anchor(404, "{}").await;
+        let (app, reconciler, _dir) = make_app_with_caddy(&caddy).await;
+        reconciler.sweep_pending_removals().await.unwrap();
+        reconciler.trip_caddy_breaker();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&bytes).unwrap();
+        let keys: Vec<&str> = body.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["server_time", "status"]);
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_a_closed_caddy_breaker_and_its_anchor() {
+        let (caddy, anchor) = caddy_anchor(200, "[]").await;
+        let (app, reconciler, _dir) = make_app_with_caddy(&caddy).await;
+
+        let body = authenticated_health(app.clone()).await;
+        assert_eq!(
+            body["caddy_anchor"], "unknown",
+            "before the first check: {body}"
+        );
+        assert_eq!(body["status"], "ok", "{body}");
+
+        reconciler.sweep_pending_removals().await.unwrap();
+        anchor.assert_async().await;
+
+        let body = authenticated_health(app).await;
+        assert_eq!(
+            body["caddy_breaker"],
+            serde_json::json!({ "open": false, "open_until": null }),
+            "{body}"
+        );
+        assert_eq!(body["caddy_anchor"], "ok", "{body}");
+        assert_eq!(body["status"], "ok", "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_is_degraded_while_the_caddy_breaker_is_open() {
+        let (caddy, _anchor) = caddy_anchor(200, "[]").await;
+        let (app, reconciler, _dir) = make_app_with_caddy(&caddy).await;
+        reconciler.sweep_pending_removals().await.unwrap();
+        reconciler.trip_caddy_breaker();
+
+        let body = authenticated_health(app).await;
+
+        assert_eq!(body["caddy_breaker"]["open"], true, "{body}");
+        let open_until =
+            humantime::parse_rfc3339(body["caddy_breaker"]["open_until"].as_str().unwrap())
+                .unwrap();
+        let ahead = open_until
+            .duration_since(std::time::SystemTime::now() - Duration::from_secs(1))
+            .unwrap();
+        assert!(ahead <= Duration::from_secs(62), "{body}");
+        assert!(ahead >= Duration::from_secs(55), "{body}");
+        assert_eq!(
+            body["caddy_anchor"], "unknown",
+            "no anchor read happens while the breaker is open: {body}"
+        );
+        assert_eq!(body["npm_breaker"]["open"], false, "{body}");
+        assert_eq!(body["status"], "degraded", "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_is_degraded_while_the_caddy_anchor_is_missing() {
+        let (caddy, anchor) = caddy_anchor(404, r#"{"error":"unknown object ID"}"#).await;
+        let (app, reconciler, _dir) = make_app_with_caddy(&caddy).await;
+        reconciler.sweep_pending_removals().await.unwrap();
+        anchor.assert_async().await;
+
+        let body = authenticated_health(app).await;
+
+        assert_eq!(body["caddy_anchor"], "missing", "{body}");
+        assert_eq!(body["caddy_breaker"]["open"], false, "{body}");
+        assert_eq!(body["status"], "degraded", "{body}");
     }
 }

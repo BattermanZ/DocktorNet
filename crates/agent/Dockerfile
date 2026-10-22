@@ -1,18 +1,22 @@
 # syntax=docker/dockerfile:1
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+# Base images are pinned by tag and digest.  The cargo-chef image's Rust
+# matches rust-toolchain.toml, and its Debian matches the distroless runtime.
+FROM docker.io/lukemathwalker/cargo-chef:0.1.78-rust-1.99.1-trixie@sha256:cccf15fc75944521a3aa230fe72a101ee0edc65cd1d4b50b5914ce25317c1805 AS chef
 WORKDIR /app
 
 FROM chef AS planner
 COPY . .
-RUN cargo chef prepare --recipe-path recipe.json --bin docktornet-agent
+# The recipe keeps the whole workspace.  `--bin` would drop the other members,
+# and `cook --locked` then fails because the lock file no longer matches.
+RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --bin docktornet-agent
+RUN cargo chef cook --release --locked --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --bin docktornet-agent
+RUN cargo build --release --locked --bin docktornet-agent
 
-FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf AS runtime
 WORKDIR /app
 COPY --from=builder /app/target/release/docktornet-agent /usr/local/bin/docktornet-agent
 USER nonroot:nonroot

@@ -1,8 +1,9 @@
 services:
   docktornet-agent:
-    image: ghcr.io/battermanz/docktornet-agent:latest
+    # Set AGENT_IMAGE to the image you built, e.g. docktornet-agent:<version>
+    image: ${AGENT_IMAGE:?set AGENT_IMAGE to the image to run}
     restart: unless-stopped
-    env_file: ../.env
+    env_file: agent.env
     user: "65532:${DOCKER_GID:-988}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
