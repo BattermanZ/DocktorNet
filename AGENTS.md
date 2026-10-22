@@ -81,3 +81,56 @@ The subject is `type(scope): concise summary`, for example
 `test(client): close remaining frontend coverage gaps`. The body is required
 and is a list of `- ` bullets, each saying what changed and why. A commit that
 finishes an issue ends its bullets with `- Closes #N.`
+
+## Changelog
+
+`CHANGELOG.md` opens with `## Unreleased`, and a release is cut from it.
+
+A commit that changes what an operator sees or does adds its line under
+`## Unreleased` in the same commit: a label, a setting, a subcommand, a
+`/healthz` field, what Docktornet writes to NPM, Caddy, Cloudflare or Gatus, or
+a step an upgrade needs. A refactor, a test or a change to these instructions
+adds none.
+
+- A line goes under `### After upgrading`, `### Added`, `### Changed` or
+  `### Fixed`. A step the operator must take sits under `### After upgrading`.
+- End the line with its issue as `[#N]`, and add `[#N]: <url>` to the
+  definitions at the foot of the section, in number order.
+- A fix to something still under `## Unreleased` corrects the line already
+  there, and a change reverted before a release takes its line out.
+
+## Releasing
+
+A release is cut by hand, in this order. The version is bare, as in `1.2.0`;
+the tag and the GitHub Release add the `v`. No image is published.
+
+1. On `development`, set the version in every `crates/*/Cargo.toml` and let
+   `cargo check` carry it into `Cargo.lock`. Rename `## Unreleased` to
+   `## v<version> - <today>` and put a new, empty `## Unreleased` above it.
+2. Make each check, and fix what it finds on `development` before going on:
+   - The dated section lists everything in
+     `git log --no-merges v<previous>..development` that an operator would
+     notice, and nothing reverted.
+   - `README.md` and `docs/deployment.md` describe what shipped, and the README
+     names this version as the current release.
+   - No ADR is contradicted by what shipped, and `GLOSSARY.md` holds every term
+     the release added.
+   - `cargo audit` is clean, or each advisory it reports is ignored in
+     `.cargo/audit.toml` with its reasoning.
+   - `just fmt`, `just lint` and `just test` pass.
+3. Commit and push `development`.
+4. Draft the GitHub Release with
+   `gh release create v<version> --draft --target main --title 'v<version> - <name>' --notes-file <file>`.
+   The notes follow v1.2.0's shape: an opening on what the release does for an
+   operator, how to build the images from the tag, an `[!IMPORTANT]` callout
+   when the database migrates or a setting is refused, `## What's new` grouped
+   by theme, `## Upgrade`, and a link to the changelog.
+5. Show the maintainer the title and notes as they stand on the draft, and
+   stop. Go on only after the reply "approved" in this session. Ask again when
+   the text changed or the session is new.
+6. Merge `development` into `main`, create the annotated tag `v<version>` on
+   that merge, push both with `git push origin main v<version>`, and publish
+   the draft with `gh release edit v<version> --draft=false --latest`.
+
+A tag is never moved and a published version is never replaced. A release found
+broken is fixed by the next patch version.

@@ -8,11 +8,11 @@ Caddy runs beside NPM as a second reverse proxy, chosen per service.
 
 ## Status
 
-**v1.1.0 is the current stable release.** The agent/server architecture,
-SQLite-backed ownership, Nginx Proxy Manager, Cloudflare DNS, Gatus, full
-resync, health endpoint, deployment manifests, and cutover runbook are
-implemented. See the [v1.1.0 release notes](https://github.com/BattermanZ/DocktorNet/releases/tag/v1.1.0)
-for the multi-domain NPM workflow and post-v1 reliability and security changes.
+**v1.2.0 is the current stable release.** It adds Caddy as a second reverse
+proxy, ownership markers on every managed resource, and the `audit`, `backup`
+and `healthcheck` subcommands. See the [v1.2.0 release notes](https://github.com/BattermanZ/DocktorNet/releases/tag/v1.2.0)
+and the [changelog](CHANGELOG.md), whose "After upgrading" section lists the
+steps an upgrade from 1.1.0 needs.
 
 ## Why Docktornet Is Technically Interesting
 
@@ -53,7 +53,7 @@ flowchart LR
 - [Design specification](docs/superpowers/specs/2026-05-21-docktornet-design.md)
 - [Deployment guide](docs/deployment.md)
 - [v1 cutover runbook](docs/runbooks/v1-cutover.md)
-- [v1.1.0 release notes](https://github.com/BattermanZ/DocktorNet/releases/tag/v1.1.0)
+- [Changelog](CHANGELOG.md)
 
 The public `GET /healthz` response contains liveness status and server time.
 Send the configured bearer token to include agent inventory and versions: the
