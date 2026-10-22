@@ -1,0 +1,5 @@
+[advisories]
+# RUSTSEC-2023-0071 (rsa, Marvin attack) has no fixed release. rsa reaches
+# Cargo.lock only through sqlx-mysql, which sqlx lists as optional and no
+# Docktornet build compiles: `cargo tree -i rsa` prints nothing.
+ignore = ["RUSTSEC-2023-0071"]
