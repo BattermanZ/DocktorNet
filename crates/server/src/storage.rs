@@ -294,16 +294,20 @@ pub async fn add_pending_npm_removal(
     Ok(())
 }
 
-/// Move the last sighting of a service's pending NPM and Cloudflare removals
-/// up to `last_seen`, never back.  A service that came back and left again
-/// before an apply restored its removals starts its grace period from its
-/// latest sighting.
+/// Move the last sighting of a service's pending NPM, Cloudflare and Caddy
+/// removals up to `last_seen`, never back.  A service that came back and left
+/// again before an apply restored its removals starts its grace period from
+/// its latest sighting.
 pub async fn refresh_pending_removals(
     pool: &Pool<Sqlite>,
     service_id: &str,
     last_seen: i64,
 ) -> sqlx::Result<()> {
-    for table in ["pending_npm_removals", "pending_cf_removals"] {
+    for table in [
+        "pending_npm_removals",
+        "pending_cf_removals",
+        "pending_caddy_removals",
+    ] {
         sqlx::query(&format!(
             "UPDATE {table} SET last_seen = MAX(last_seen, ?) WHERE service_id = ?"
         ))
@@ -726,6 +730,62 @@ pub async fn claim_caddy_route(
     Ok(CaddyClaim::Claimed)
 }
 
+/// Every `(service_id, caddy_index, hosts)` Caddy mapping of the given
+/// services, ordered by `(service_id, caddy_index)`.  Used to capture the
+/// routes of services about to leave a snapshot, before `upsert_snapshot`'s
+/// cascade deletes the `caddy_routes` rows.
+pub async fn get_caddy_routes_for_services(
+    pool: &Pool<Sqlite>,
+    service_ids: &[String],
+) -> sqlx::Result<Vec<(String, i64, Vec<String>)>> {
+    let mut out = Vec::new();
+    for chunk in service_ids.chunks(MAX_BIND_PARAMS) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT service_id, caddy_index, hosts_json FROM caddy_routes \
+             WHERE service_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (String, i64, String)>(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for (service_id, caddy_index, hosts) in q.fetch_all(pool).await? {
+            out.push((service_id, caddy_index, decode_json(&hosts)?));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Record a Caddy route whose service has left a snapshot, so the
+/// pending-removal sweep deletes it once its grace period ends.  Its hosts
+/// stay claimed until then.  A row already pending keeps the later of the
+/// two sightings.
+pub async fn add_pending_caddy_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    caddy_index: i64,
+    hosts: &[String],
+    last_seen: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO pending_caddy_removals (service_id, caddy_index, hosts_json, last_seen)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(service_id, caddy_index) DO UPDATE SET
+             hosts_json = excluded.hosts_json,
+             last_seen  = MAX(last_seen, excluded.last_seen)"#,
+    )
+    .bind(service_id)
+    .bind(caddy_index)
+    .bind(encode_json(&hosts)?)
+    .bind(last_seen)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn delete_caddy_route(
     pool: &Pool<Sqlite>,
     service_id: &str,
@@ -768,6 +828,19 @@ pub async fn park_caddy_route(
         .execute(&mut *tx)
         .await?;
     tx.commit().await
+}
+
+pub async fn delete_pending_caddy_removal(
+    pool: &Pool<Sqlite>,
+    service_id: &str,
+    caddy_index: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM pending_caddy_removals WHERE service_id = ? AND caddy_index = ?")
+        .bind(service_id)
+        .bind(caddy_index)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn list_pending_caddy_removals(

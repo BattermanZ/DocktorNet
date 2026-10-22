@@ -1100,3 +1100,478 @@ async fn caddy_labels_without_caddy_configured_are_skipped_with_a_warning() {
     );
     assert!(f.rows("m1/app").await.is_empty());
 }
+
+/// Publish `m1/app` with `groups` at `at` on a reconciler with Caddy alone,
+/// then forget every Caddy mock.
+async fn publish_app(f: &mut Fixture, at: i64, groups: &[(u8, &str, u16)]) -> Reconciler {
+    let _anchor = f.anchor(json!([])).await;
+    let _elsewhere = f.no_marked_route_elsewhere().await;
+    let _append = f
+        .caddy
+        .mock("POST", ANCHOR_ROUTES)
+        .with_status(200)
+        .create_async()
+        .await;
+    let reconciler = f.reconciler();
+    reconciler.set_now(at);
+    reconciler
+        .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![("app", caddy_labels(groups))]))
+        .await
+        .unwrap();
+    f.caddy.reset();
+    reconciler
+}
+
+/// Push m1's snapshot with no containers at `at`.
+async fn leave(reconciler: &Reconciler, at: i64) -> Result<(), ReconcileError> {
+    reconciler.set_now(at);
+    reconciler
+        .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![]))
+        .await
+}
+
+async fn pending(f: &Fixture) -> Vec<storage::PendingCaddyRemoval> {
+    storage::list_pending_caddy_removals(&f.pool).await.unwrap()
+}
+
+fn pending_app(index: i64, host: &str, last_seen: i64) -> storage::PendingCaddyRemoval {
+    storage::PendingCaddyRemoval {
+        service_id: "m1/app".into(),
+        caddy_index: index,
+        hosts: vec![host.into()],
+        last_seen,
+    }
+}
+
+#[tokio::test]
+async fn a_route_whose_service_leaves_within_grace_is_kept_pending() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let delete = f.never("DELETE").await;
+
+    leave(&reconciler, 1_010).await.unwrap();
+
+    delete.assert_async().await;
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(0, "app.example.com", 1_000)]
+    );
+}
+
+/// Expect `service_id`'s route at `index` deleted `times` times, answered
+/// with `status`.
+async fn expect_delete(
+    f: &mut Fixture,
+    service_id: &str,
+    index: u8,
+    status: usize,
+    times: usize,
+) -> Mock {
+    f.caddy
+        .mock("DELETE", path(service_id, index).as_str())
+        .with_status(status)
+        .expect(times)
+        .create_async()
+        .await
+}
+
+#[tokio::test]
+async fn the_sweep_deletes_a_pending_route_once_grace_ends_without_a_full_resync() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    leave(&reconciler, 1_010).await.unwrap();
+
+    let early = f.never("DELETE").await;
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS - 1);
+    reconciler.sweep_pending_removals().await.unwrap();
+    early.assert_async().await;
+    assert_eq!(pending(&f).await.len(), 1);
+    f.caddy.reset();
+
+    let delete = expect_delete(&mut f, "m1/app", 0, 200, 1).await;
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS);
+    let report = reconciler.sweep_pending_removals().await.unwrap();
+
+    delete.assert_async().await;
+    assert_eq!(report.repaired, 1);
+    assert!(pending(&f).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_route_whose_service_left_past_grace_is_deleted_in_the_apply() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let delete = expect_delete(&mut f, "m1/app", 0, 200, 1).await;
+
+    leave(&reconciler, 1_000 + GATUS_REMOVAL_GRACE_SECS)
+        .await
+        .unwrap();
+
+    delete.assert_async().await;
+    assert!(pending(&f).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_service_back_within_grace_keeps_its_route_and_gets_its_mapping_back() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    leave(&reconciler, 1_010).await.unwrap();
+
+    let live = route("m1/app", 0, &["app.example.com"], "10.0.0.1:3000");
+    let _anchor = f.anchor(json!([live.clone()])).await;
+    let mut never = Vec::new();
+    for method in ["POST", "PATCH", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+    let buf = LogBuf(Default::default());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    );
+    reconciler.set_now(1_020);
+    reconciler
+        .reconcile_snapshot(&snap(
+            "m1",
+            "10.0.0.1",
+            vec![("app", caddy_labels(&[(0, "app.example.com", 3000)]))],
+        ))
+        .await
+        .unwrap();
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS + 60);
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    for mock in never {
+        mock.assert_async().await;
+    }
+    let rows = f.rows("m1/app").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].route, live);
+    assert!(pending(&f).await.is_empty());
+    let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        !logs.contains("adopted"),
+        "a restored route is not an adoption: {logs}"
+    );
+}
+
+/// Ingest m1's snapshot holding `app` or nothing with the clock at `at`,
+/// returning the worker if the ingest started one.
+async fn ingest_app(reconciler: &Reconciler, at: i64, present: bool) -> Option<ApplyWorker> {
+    reconciler.set_now(at);
+    let containers = if present {
+        vec![("app", caddy_labels(&[(0, "app.example.com", 3000)]))]
+    } else {
+        vec![]
+    };
+    reconciler
+        .ingest_snapshot(&snap("m1", "10.0.0.1", containers))
+        .await
+        .unwrap()
+}
+
+/// The route of `m1/app` is deleted once grace has run from `last_seen`,
+/// not before.
+async fn assert_deleted_once_grace_ends(f: &mut Fixture, reconciler: &Reconciler, last_seen: i64) {
+    let early = f.never("DELETE").await;
+    reconciler.set_now(last_seen + GATUS_REMOVAL_GRACE_SECS - 1);
+    reconciler.sweep_pending_removals().await.unwrap();
+    early.assert_async().await;
+    f.caddy.reset();
+
+    let delete = expect_delete(f, "m1/app", 0, 200, 1).await;
+    reconciler.set_now(last_seen + GATUS_REMOVAL_GRACE_SECS);
+    reconciler.sweep_pending_removals().await.unwrap();
+    delete.assert_async().await;
+    assert!(pending(f).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_route_captured_by_a_replaced_snapshot_keeps_its_grace() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1, &[(0, "app.example.com", 3000)]).await;
+
+    // app leaves at t=10, is back at t=20 and gone at t=30, all behind one
+    // apply.  Only the t=10 snapshot captured its route.
+    let worker = ingest_app(&reconciler, 10, false).await.unwrap();
+    assert!(ingest_app(&reconciler, 20, true).await.is_none());
+    assert!(ingest_app(&reconciler, 30, false).await.is_none());
+    worker.run().await;
+
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(0, "app.example.com", 20)]
+    );
+    assert_deleted_once_grace_ends(&mut f, &reconciler, 20).await;
+}
+
+#[tokio::test]
+async fn a_service_that_returns_and_leaves_again_while_coalesced_keeps_its_grace() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1, &[(0, "app.example.com", 3000)]).await;
+    // app leaves: its removal waits out the grace period from t=1.
+    ingest_app(&reconciler, 10, false)
+        .await
+        .unwrap()
+        .run()
+        .await;
+
+    // app is back at t=20 and gone again at t=30, both behind one apply.
+    let worker = ingest_app(&reconciler, 20, true).await.unwrap();
+    assert!(ingest_app(&reconciler, 30, false).await.is_none());
+    worker.run().await;
+
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(0, "app.example.com", 20)]
+    );
+    assert_deleted_once_grace_ends(&mut f, &reconciler, 20).await;
+}
+
+#[tokio::test]
+async fn a_returning_service_gets_back_only_the_routes_it_still_labels() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(
+        &mut f,
+        1_000,
+        &[(0, "a.example.com", 3000), (1, "b.example.com", 3001)],
+    )
+    .await;
+    leave(&reconciler, 1_010).await.unwrap();
+
+    let kept = route("m1/app", 0, &["a.example.com"], "10.0.0.1:3000");
+    let _anchor = f
+        .anchor(json!([
+            kept.clone(),
+            route("m1/app", 1, &["b.example.com"], "10.0.0.1:3001"),
+        ]))
+        .await;
+    let mut never = Vec::new();
+    for method in ["POST", "PATCH", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+    reconciler.set_now(1_020);
+    reconciler
+        .reconcile_snapshot(&snap(
+            "m1",
+            "10.0.0.1",
+            vec![("app", caddy_labels(&[(0, "a.example.com", 3000)]))],
+        ))
+        .await
+        .unwrap();
+    for mock in never {
+        mock.assert_async().await;
+    }
+    let rows = f.rows("m1/app").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].route, kept);
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(1, "b.example.com", 1_000)]
+    );
+    f.caddy.reset();
+
+    // The unlabelled route goes once its grace period from t=1000 ends.
+    let keep_0 = expect_delete(&mut f, "m1/app", 0, 200, 0).await;
+    let delete_1 = expect_delete(&mut f, "m1/app", 1, 200, 1).await;
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS);
+    reconciler.sweep_pending_removals().await.unwrap();
+    keep_0.assert_async().await;
+    delete_1.assert_async().await;
+    assert!(pending(&f).await.is_empty());
+    assert_eq!(f.rows("m1/app").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_pending_delete_stays_for_the_next_sweep() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    leave(&reconciler, 1_010).await.unwrap();
+
+    let failed = expect_delete(&mut f, "m1/app", 0, 502, 1).await;
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS);
+    let report = reconciler.sweep_pending_removals().await.unwrap();
+    failed.assert_async().await;
+    assert_eq!(report.failed, 1);
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(0, "app.example.com", 1_000)]
+    );
+    assert_eq!(reconciler.caddy_breaker.consecutive_failures(), 1);
+    f.caddy.reset();
+
+    let retried = expect_delete(&mut f, "m1/app", 0, 200, 1).await;
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS + 60);
+    reconciler.sweep_pending_removals().await.unwrap();
+    retried.assert_async().await;
+    assert!(pending(&f).await.is_empty());
+    assert_eq!(reconciler.caddy_breaker.consecutive_failures(), 0);
+}
+
+#[tokio::test]
+async fn a_pending_route_already_gone_is_cleared_without_feeding_the_breaker() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    leave(&reconciler, 1_010).await.unwrap();
+    // Two failures short of the threshold: one more would open it.
+    for _ in 1..CADDY_BREAKER_THRESHOLD {
+        reconciler
+            .caddy_breaker
+            .record_failure(std::time::Instant::now());
+    }
+
+    let gone = expect_delete(&mut f, "m1/app", 0, 404, 1).await;
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS);
+    let report = reconciler.sweep_pending_removals().await.unwrap();
+
+    gone.assert_async().await;
+    assert_eq!(report.failed, 0);
+    assert!(pending(&f).await.is_empty());
+    assert_eq!(reconciler.caddy_breaker.consecutive_failures(), 0);
+    assert!(!reconciler.caddy_breaker.is_open(std::time::Instant::now()));
+}
+
+#[tokio::test]
+async fn a_route_due_while_the_breaker_is_open_is_parked_pending() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    for _ in 0..CADDY_BREAKER_THRESHOLD {
+        reconciler
+            .caddy_breaker
+            .record_failure(std::time::Instant::now());
+    }
+    let mut never = Vec::new();
+    for method in ["GET", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+
+    leave(&reconciler, 1_000 + GATUS_REMOVAL_GRACE_SECS)
+        .await
+        .unwrap();
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    for mock in never {
+        mock.assert_async().await;
+    }
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(0, "app.example.com", 1_000)]
+    );
+}
+
+#[tokio::test]
+async fn a_route_due_with_caddy_unconfigured_is_parked_pending() {
+    let mut f = fixture().await;
+    publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let unconfigured = Reconciler::new(f.pool.clone(), f.options(false));
+
+    leave(&unconfigured, 1_000 + GATUS_REMOVAL_GRACE_SECS)
+        .await
+        .unwrap();
+    unconfigured.sweep_pending_removals().await.unwrap();
+
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(0, "app.example.com", 1_000)]
+    );
+}
+
+#[tokio::test]
+async fn dry_run_sweeps_delete_no_pending_route() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    leave(&reconciler, 1_010).await.unwrap();
+    let mut never = Vec::new();
+    for method in ["GET", "POST", "PATCH", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+    let dry = Reconciler::new(f.pool.clone(), f.options(true)).with_caddy(f.caddy_client());
+    dry.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS + 60);
+
+    dry.sweep_pending_removals().await.unwrap();
+    dry.full_resync().await.unwrap();
+
+    for mock in never {
+        mock.assert_async().await;
+    }
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(0, "app.example.com", 1_000)]
+    );
+}
+
+#[tokio::test]
+async fn a_departed_route_holds_its_hosts_before_its_apply_runs() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    // m1's departure is persisted, and its apply has not run yet.
+    let _worker = ingest_app(&reconciler, 1_010, false).await.unwrap();
+
+    let _anchor = f.anchor(json!([])).await;
+    let post = f.never("POST").await;
+    let result = reconciler
+        .reconcile_snapshot(&snap(
+            "m2",
+            "10.0.0.2",
+            vec![("x", caddy_labels(&[(0, "app.example.com", 4000)]))],
+        ))
+        .await;
+
+    assert!(result.is_err(), "m2/x must not take m1/app's host");
+    post.assert_async().await;
+    assert!(f.rows("m2/x").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_route_whose_delete_fails_in_the_apply_is_kept_pending() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let failed = expect_delete(&mut f, "m1/app", 0, 502, 1).await;
+
+    let result = leave(&reconciler, 1_000 + GATUS_REMOVAL_GRACE_SECS).await;
+
+    assert!(result.is_err());
+    failed.assert_async().await;
+    assert_eq!(
+        pending(&f).await,
+        vec![pending_app(0, "app.example.com", 1_000)]
+    );
+    assert_eq!(reconciler.caddy_breaker.consecutive_failures(), 1);
+}
+
+#[tokio::test]
+async fn an_apply_that_never_reaches_caddy_leaves_the_breaker_alone() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    for _ in 1..CADDY_BREAKER_THRESHOLD {
+        reconciler
+            .caddy_breaker
+            .record_failure(std::time::Instant::now());
+    }
+
+    leave(&reconciler, 1_010).await.unwrap();
+
+    assert_eq!(
+        reconciler.caddy_breaker.consecutive_failures(),
+        CADDY_BREAKER_THRESHOLD - 1
+    );
+}
+
+#[tokio::test]
+async fn a_route_captured_by_a_replaced_snapshot_is_deleted_in_the_apply_past_grace() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1, &[(0, "app.example.com", 3000)]).await;
+    let delete = expect_delete(&mut f, "m1/app", 0, 200, 1).await;
+
+    // app leaves at t=10, is back at t=20 and gone past grace from there,
+    // all behind one apply.  Only the t=10 snapshot captured its route.
+    let gone_at = 20 + GATUS_REMOVAL_GRACE_SECS + 10;
+    let worker = ingest_app(&reconciler, 10, false).await.unwrap();
+    assert!(ingest_app(&reconciler, 20, true).await.is_none());
+    assert!(ingest_app(&reconciler, gone_at, false).await.is_none());
+    worker.run().await;
+
+    delete.assert_async().await;
+    assert!(pending(&f).await.is_empty());
+}

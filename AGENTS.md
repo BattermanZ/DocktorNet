@@ -62,7 +62,7 @@ Cloudflare.
    - Cloudflare stub: `curl -s 127.0.0.1:18086/_stub/records`
    - Gatus: `ls dev-data/gatus-config` and `curl -s 127.0.0.1:18085/api/v1/endpoints/statuses`
    - Server log: `docker compose -f deploy/dev.compose.yaml logs docktornet-server`
-4) Remove: `docker compose -f deploy/dev.compose.yaml exec dind docker rm -f whoami`. Deletions wait out the 300s grace period. Pending removals then drain within a minute: the pending-removal sweep runs every 60s, and this stack's full resync, every 30s, sweeps too. Gatus drops the monitor at its next 30s config check. Rerun the step 3 reads: the proxy host, the stub record, the `devbox__whoami--*.yaml` file and the Gatus endpoint are gone.
+4) Remove: `docker compose -f deploy/dev.compose.yaml exec dind docker rm -f whoami`. Deletions wait out the 300s grace period. Pending removals then drain within a minute: the pending-removal sweep runs every 60s, and this stack's full resync, every 30s, sweeps too. Gatus drops the monitor at its next 30s config check. Rerun the step 3 reads: the proxy host, the anchor's Caddy route, the stub record, the `devbox__whoami--*.yaml` file and the Gatus endpoint are gone.
 5) Tear down: `docker compose -f deploy/dev.compose.yaml down -v && rm -rf dev-data`
 
 ## Branching

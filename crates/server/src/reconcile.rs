@@ -74,7 +74,8 @@ struct PendingApply {
     snap: Snapshot,
     /// Every service that left the machine in this snapshot or in a snapshot
     /// it replaced.  Persisting cascade-deleted their mappings, so this is the
-    /// only copy of the NPM host and Cloudflare record ids they owned.
+    /// only copy of the NPM hosts, Cloudflare record and Caddy routes they
+    /// owned.
     removed: Vec<RemovedService>,
     /// When the server persisted the snapshot.  The apply judges each removal
     /// against this, so waiting for a worker never shortens a grace period.
@@ -101,6 +102,11 @@ impl PendingApply {
                     }
                     if rs.cf_record.is_none() {
                         rs.cf_record = older.cf_record;
+                    }
+                    for route in older.caddy_routes {
+                        if !rs.caddy_routes.iter().any(|(index, _)| *index == route.0) {
+                            rs.caddy_routes.push(route);
+                        }
                     }
                 }
                 None => newer.removed.push(older),
@@ -170,6 +176,9 @@ pub struct RemovedService {
     /// `cf_dns_records` cascade wipes it, so the public record can still be
     /// deleted after the service row is gone.
     pub cf_record: Option<String>,
+    /// `(caddy_index, hosts)` for every Caddy route the service owned,
+    /// captured before the `caddy_routes` cascade wipes them.
+    pub caddy_routes: Vec<(i64, Vec<String>)>,
 }
 
 /// The NPM proxy-host list for one reconcile pass, fetched on first need and
@@ -887,10 +896,11 @@ impl Reconciler {
     }
 
     /// Delete what services that left their snapshot still own once their grace
-    /// period is over: Gatus files kept through it, then pending NPM and
-    /// Cloudflare removals.  The server runs this on a short timer so a
-    /// removal lands soon after its grace period ends, rather than on the next
-    /// `full_resync`.  Unlike `full_resync`, it never re-verifies live services.
+    /// period is over: Gatus files kept through it, then pending NPM,
+    /// Cloudflare and Caddy removals.  The server runs this on a short timer
+    /// so a removal lands soon after its grace period ends, rather than on
+    /// the next `full_resync`.  Unlike `full_resync`, it never re-verifies
+    /// live services.
     pub async fn sweep_pending_removals(&self) -> Result<ResyncReport, ReconcileError> {
         let _guard = self.lock.lock().await;
         let mut report = ResyncReport::default();
@@ -974,6 +984,7 @@ impl Reconciler {
         self.sweep_orphan_gatus_files(expected_gatus_files).await;
         let npm_failed = self.sweep_pending_npm_removals(npm_ctx, report).await;
         self.sweep_pending_cf_removals(report).await;
+        self.sweep_pending_caddy_removals(report).await;
         npm_failed
     }
 
@@ -1232,9 +1243,9 @@ impl Reconciler {
     }
 
     /// Prune NPM proxy hosts recorded in `pending_npm_removals` once they are
-    /// past the grace period.  This is the backstop for removals deferred by
-    /// `apply_inner` (within-grace, breaker open, or a failed delete) and for
-    /// machines that went offline entirely without a final empty snapshot.
+    /// past the grace period.  These are the removals `apply_inner` deferred:
+    /// within grace, breaker open, or a failed delete.  A machine that stops
+    /// reporting leaves no pending rows, so its hosts stay.
     /// Returns whether an NPM delete failed.
     async fn sweep_pending_npm_removals(
         &self,
@@ -1296,9 +1307,9 @@ impl Reconciler {
     }
 
     /// Delete Cloudflare DNS records recorded in `pending_cf_removals` once they
-    /// are past the grace period.  This is the backstop for removals deferred by
-    /// `apply_inner` (within-grace, no client, or a failed delete) and for
-    /// machines that went offline entirely without a final empty snapshot.
+    /// are past the grace period.  These are the removals `apply_inner`
+    /// deferred: within grace, no client, or a failed delete.  A machine that
+    /// stops reporting leaves no pending rows, so its records stay.
     async fn sweep_pending_cf_removals(&self, report: &mut ResyncReport) {
         let pending = match crate::storage::list_pending_cf_removals(&self.db).await {
             Ok(p) => p,
@@ -1532,12 +1543,32 @@ impl Reconciler {
             crate::storage::removed_service_ids(&self.db, snap.machine_id.as_str(), &current_ids)
                 .await?;
         let removed_last_seen = crate::storage::get_services_last_seen(&self.db, &removed).await?;
-        // Capture NPM host + Cloudflare record mappings before upsert_snapshot's
-        // cascade wipes them.
+        // Capture NPM host, Cloudflare record and Caddy route mappings before
+        // upsert_snapshot's cascade wipes them.
         let npm_hosts = crate::storage::get_npm_hosts_for_services(&self.db, &removed).await?;
         let cf_records = crate::storage::get_cf_records_for_services(&self.db, &removed).await?;
+        let caddy_routes =
+            crate::storage::get_caddy_routes_for_services(&self.db, &removed).await?;
         self.record_gatus_departures(now, &current_ids, &removed_last_seen)
             .await?;
+        // A departed route keeps its hosts claimed from this moment, so no
+        // apply that runs before this snapshot's can take them.
+        let last_seen_of: HashMap<&str, i64> = removed_last_seen
+            .iter()
+            .map(|(service_id, last_seen)| (service_id.as_str(), *last_seen))
+            .collect();
+        for (service_id, caddy_index, hosts) in &caddy_routes {
+            if let Some(&last_seen) = last_seen_of.get(service_id.as_str()) {
+                crate::storage::add_pending_caddy_removal(
+                    &self.db,
+                    service_id,
+                    *caddy_index,
+                    hosts,
+                    last_seen,
+                )
+                .await?;
+            }
+        }
         for (service_id, last_seen) in &removed_last_seen {
             crate::storage::refresh_pending_removals(&self.db, service_id, *last_seen).await?;
         }
@@ -1554,11 +1585,19 @@ impl Reconciler {
         for (service_id, record_id) in cf_records {
             cf_by_service.insert(service_id, record_id);
         }
+        let mut caddy_by_service: HashMap<String, Vec<(i64, Vec<String>)>> = HashMap::new();
+        for (service_id, caddy_index, hosts) in caddy_routes {
+            caddy_by_service
+                .entry(service_id)
+                .or_default()
+                .push((caddy_index, hosts));
+        }
         Ok(removed_last_seen
             .into_iter()
             .map(|(service_id, last_seen)| RemovedService {
                 npm_hosts: hosts_by_service.remove(&service_id).unwrap_or_default(),
                 cf_record: cf_by_service.remove(&service_id),
+                caddy_routes: caddy_by_service.remove(&service_id).unwrap_or_default(),
                 service_id,
                 last_seen,
             })
@@ -1950,7 +1989,7 @@ impl Reconciler {
 
         // Caddy runs whatever NPM's outcome, so an NPM outage never stalls it.
         let caddy = self
-            .apply_caddy(&intended, &snap.forward_host, ingested_at)
+            .apply_caddy(&intended, &removed, due, &snap.forward_host, ingested_at)
             .await?;
         failures += caddy.failures;
 
