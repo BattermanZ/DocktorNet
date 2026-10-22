@@ -1583,8 +1583,9 @@ impl Reconciler {
         Ok(rewrote)
     }
 
-    /// Persist the snapshot to SQLite and return the `(service_id, last_seen)`
-    /// pairs for services that have just left this machine's snapshot.  This is
+    /// Persist the snapshot's services, the containers whose labels ask for a
+    /// resource, to SQLite and return the `(service_id, last_seen)` pairs for
+    /// services that have just left this machine's snapshot.  This is
     /// the fast, local-only half of reconciliation and must run before a push
     /// is acked so the snapshot is durable even when the external reconcile is
     /// deferred.  `removed_last_seen` is captured here because `upsert_snapshot`
@@ -1594,11 +1595,27 @@ impl Reconciler {
         snap: &Snapshot,
         now: i64,
     ) -> Result<Vec<RemovedService>, ReconcileError> {
-        let current_ids =
-            crate::integrations::intended::intended_services(&snap.machine_id, &snap.containers)
+        let intended =
+            crate::integrations::intended::intended_services(&snap.machine_id, &snap.containers);
+        let current_ids = intended
+            .iter()
+            .map(|service| service.service_id.clone())
+            .collect::<Vec<_>>();
+        // A container whose labels ask for nothing has left, so it is not
+        // stored: a stored row would refresh its departure on every push.
+        let stored = Snapshot {
+            containers: snap
+                .containers
                 .iter()
-                .map(|service| service.service_id.clone())
-                .collect::<Vec<_>>();
+                .filter(|container| {
+                    intended
+                        .iter()
+                        .any(|service| service.container == container.name)
+                })
+                .cloned()
+                .collect(),
+            ..snap.clone()
+        };
         let removed =
             crate::storage::removed_service_ids(&self.db, snap.machine_id.as_str(), &current_ids)
                 .await?;
@@ -1632,7 +1649,7 @@ impl Reconciler {
         for (service_id, last_seen) in &removed_last_seen {
             crate::storage::refresh_pending_removals(&self.db, service_id, *last_seen).await?;
         }
-        crate::storage::upsert_snapshot(&self.db, snap, now).await?;
+        crate::storage::upsert_snapshot(&self.db, &stored, now).await?;
 
         let mut hosts_by_service: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
         for (service_id, npm_index, npm_id) in npm_hosts {

@@ -42,6 +42,7 @@ async fn agent_push_lands_in_sqlite_via_real_http() {
 
     let mut labels = BTreeMap::new();
     labels.insert("docktornet.gatus.0.url".into(), "https://x".into());
+    labels.insert("docktornet.gatus.0.interval".into(), "30s".into());
     let snap = Snapshot {
         machine_id: MachineId::new("e2e-host").unwrap(),
         forward_host: "10.0.0.10".into(),

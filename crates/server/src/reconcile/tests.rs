@@ -706,9 +706,9 @@ async fn a_service_that_returns_and_leaves_again_while_coalesced_keeps_its_grace
 }
 
 #[tokio::test]
-async fn sweep_deletes_what_a_stored_service_without_labels_left_behind() {
-    // x keeps running but its only docktornet label is malformed, so it is
-    // stored without any intent.  Its removal must still go through.
+async fn sweep_deletes_what_a_running_service_without_intent_left_behind() {
+    // x keeps running but its only docktornet label is malformed, so it has
+    // left.  Its removal must still go through.
     let dir = tempdir().unwrap();
     let gatus_dir = dir.path().join("gatus");
     let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
@@ -737,6 +737,53 @@ async fn sweep_deletes_what_a_stored_service_without_labels_left_behind() {
     for mock in deletes {
         mock.assert_async().await;
     }
+}
+
+#[tokio::test]
+async fn later_pushes_of_a_service_without_intent_leave_its_grace_period_alone() {
+    // x had intent at t=1, then keeps running with only a malformed label.
+    // Its grace period runs from t=1, however often the agent pushes it.
+    let dir = tempdir().unwrap();
+    let gatus_dir = dir.path().join("gatus");
+    let pool = db::connect(&dir.path().join("t.db")).await.unwrap();
+    let (server, deletes) = x_resources_server(1).await;
+    let reconciler = reconciler_on(pool.clone(), &gatus_dir, &server);
+    storage::upsert_snapshot(&pool, &m1_snapshot(vec![x_entry()]), 1)
+        .await
+        .unwrap();
+    storage::set_npm_host(&pool, "m1/x", 0, 50).await.unwrap();
+    storage::set_cf_dns_record(&pool, "m1/x", "rec-1")
+        .await
+        .unwrap();
+    std::fs::create_dir_all(&gatus_dir).unwrap();
+    let gatus_file = gatus::service_file_path(&gatus_dir, "m1/x");
+    std::fs::write(&gatus_file, "endpoints: []\n").unwrap();
+    let malformed = ContainerEntry {
+        name: "x".into(),
+        labels: [(
+            "docktornet.npm.0.host".to_string(),
+            "a.example.com".to_string(),
+        )]
+        .into(),
+    };
+    for at in [2, 100, 200] {
+        push(&reconciler, at, vec![malformed.clone()]).await;
+    }
+    assert_eq!(
+        storage::list_pending_gatus_removals(&pool).await.unwrap(),
+        vec![("m1/x".to_string(), 1)]
+    );
+
+    reconciler.set_now(1 + GATUS_REMOVAL_GRACE_SECS);
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    for mock in deletes {
+        mock.assert_async().await;
+    }
+    assert!(
+        !gatus_file.exists(),
+        "the gatus file outlived the grace period"
+    );
 }
 
 #[tokio::test]

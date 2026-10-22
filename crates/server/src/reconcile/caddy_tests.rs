@@ -1558,6 +1558,77 @@ async fn a_service_whose_only_labels_are_a_malformed_group_waits_out_the_grace_p
 }
 
 #[tokio::test]
+async fn later_pushes_of_a_service_without_intent_leave_its_route_grace_alone() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+
+    let mut labels = caddy_labels(&[(0, "app.example.com", 3000)]);
+    labels.insert("docktornet.caddy.0.port".to_string(), "80a".to_string());
+    for at in [1_010, 1_100, 1_200] {
+        reconciler.set_now(at);
+        reconciler
+            .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![("app", labels.clone())]))
+            .await
+            .unwrap();
+    }
+    f.caddy.reset();
+
+    assert_deleted_once_grace_ends(&mut f, &reconciler, 1_000).await;
+    f.caddy.reset();
+
+    // The route is gone for good: drift repair has nothing to put back.
+    let _anchor = f.anchor(json!([])).await;
+    let _elsewhere = f.no_marked_route_elsewhere().await;
+    let append = f.never("POST").await;
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS + 60);
+    reconciler.sweep_pending_removals().await.unwrap();
+    append.assert_async().await;
+    assert!(f.rows("m1/app").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_service_that_regains_intent_within_grace_keeps_its_route() {
+    let mut f = fixture().await;
+    let reconciler = publish_app(&mut f, 1_000, &[(0, "app.example.com", 3000)]).await;
+    let mut malformed = caddy_labels(&[(0, "app.example.com", 3000)]);
+    malformed.insert("docktornet.caddy.0.port".to_string(), "80a".to_string());
+    for at in [1_010, 1_015] {
+        reconciler.set_now(at);
+        reconciler
+            .reconcile_snapshot(&snap("m1", "10.0.0.1", vec![("app", malformed.clone())]))
+            .await
+            .unwrap();
+    }
+    f.caddy.reset();
+
+    let live = route("m1/app", 0, &["app.example.com"], "10.0.0.1:3000");
+    let _anchor = f.anchor(json!([live.clone()])).await;
+    let mut never = Vec::new();
+    for method in ["POST", "PATCH", "DELETE"] {
+        never.push(f.never(method).await);
+    }
+    reconciler.set_now(1_020);
+    reconciler
+        .reconcile_snapshot(&snap(
+            "m1",
+            "10.0.0.1",
+            vec![("app", caddy_labels(&[(0, "app.example.com", 3000)]))],
+        ))
+        .await
+        .unwrap();
+    reconciler.set_now(1_000 + GATUS_REMOVAL_GRACE_SECS + 60);
+    reconciler.sweep_pending_removals().await.unwrap();
+
+    for mock in never {
+        mock.assert_async().await;
+    }
+    let rows = f.rows("m1/app").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].route, live);
+    assert!(pending(&f).await.is_empty());
+}
+
+#[tokio::test]
 async fn the_sweep_keeps_the_pending_route_of_a_returning_service_with_a_malformed_group() {
     let mut f = fixture().await;
     let reconciler = publish_app_with_two_routes(&mut f, 1_000).await;
