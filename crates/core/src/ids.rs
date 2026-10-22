@@ -69,13 +69,17 @@ pub fn stable_service_hash(service_id: &str) -> u64 {
     })
 }
 
+/// How every Caddy route marker starts.  The audit finds docktornet's routes
+/// by it.
+pub const CADDY_ROUTE_MARKER_PREFIX: &str = "docktornet--";
+
 /// The ownership marker of a service's Caddy route at `index`: the route's
 /// `@id` and its address under Caddy's `/id/` admin endpoint (ADR 0001).  It
 /// holds only ASCII alphanumerics, `_` and `-`, so it is a URL path segment
 /// as it stands.  It can't be read back into a service id.
 pub fn caddy_route_marker(service_id: &str, index: u8) -> String {
     format!(
-        "docktornet--{}--{:016x}--{index}",
+        "{CADDY_ROUTE_MARKER_PREFIX}{}--{:016x}--{index}",
         sanitize_service_id(service_id),
         stable_service_hash(service_id)
     )

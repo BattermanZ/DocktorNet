@@ -6,6 +6,7 @@ use axum::http::HeaderMap;
 use serde::Serialize;
 
 use crate::handlers::snapshot::AppState;
+use crate::reconcile::CaddyAnchor;
 
 #[derive(Serialize)]
 pub struct AgentStatus {
@@ -59,10 +60,24 @@ pub struct HealthResponse {
     /// Authenticated only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_breaker: Option<BreakerStatus>,
+    /// Authenticated only, and only when Caddy is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caddy_breaker: Option<BreakerStatus>,
+    /// What the last read of Caddy's anchor route found.  Authenticated only,
+    /// and only when Caddy is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caddy_anchor: Option<CaddyAnchor>,
 }
 
 fn rfc3339(time: SystemTime) -> String {
     humantime::format_rfc3339_seconds(time).to_string()
+}
+
+fn breaker_status(open_until: Option<SystemTime>) -> BreakerStatus {
+    BreakerStatus {
+        open: open_until.is_some(),
+        open_until: open_until.map(rfc3339),
+    }
 }
 
 /// Returns true when the request carries the expected bearer token.
@@ -88,6 +103,8 @@ pub async fn healthz(State(state): State<AppState>, headers: HeaderMap) -> Json<
             agents: None,
             last_resync: None,
             npm_breaker: None,
+            caddy_breaker: None,
+            caddy_anchor: None,
         });
     }
 
@@ -122,7 +139,16 @@ pub async fn healthz(State(state): State<AppState>, headers: HeaderMap) -> Json<
         error: last.error,
     });
     let open_until = state.reconciler.npm_breaker_open_until();
-    let status = if open_until.is_some() {
+    let caddy = state.reconciler.has_caddy().then(|| {
+        (
+            state.reconciler.caddy_breaker_open_until(),
+            state.reconciler.caddy_anchor(),
+        )
+    });
+    let caddy_degraded = caddy.is_some_and(|(caddy_open_until, anchor)| {
+        caddy_open_until.is_some() || anchor == CaddyAnchor::Missing
+    });
+    let status = if open_until.is_some() || caddy_degraded {
         "degraded"
     } else {
         status
@@ -134,9 +160,8 @@ pub async fn healthz(State(state): State<AppState>, headers: HeaderMap) -> Json<
         version: Some(state.agent_versions.server_version().to_string()),
         agents,
         last_resync: Some(last_resync),
-        npm_breaker: Some(BreakerStatus {
-            open: open_until.is_some(),
-            open_until: open_until.map(rfc3339),
-        }),
+        npm_breaker: Some(breaker_status(open_until)),
+        caddy_breaker: caddy.map(|(caddy_open_until, _)| breaker_status(caddy_open_until)),
+        caddy_anchor: caddy.map(|(_, anchor)| anchor),
     })
 }

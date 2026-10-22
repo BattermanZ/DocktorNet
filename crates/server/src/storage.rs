@@ -676,12 +676,14 @@ fn caddy_route_row(caddy_index: i64, hosts: &str, route: &str) -> sqlx::Result<C
 /// Every Caddy route mapping, with its service ID, ordered by service and
 /// index.  A row exists only while its service is stored, because the
 /// `services` cascade deletes it.
-pub async fn list_caddy_routes(pool: &Pool<Sqlite>) -> sqlx::Result<Vec<(String, CaddyRouteRow)>> {
+pub async fn list_caddy_routes(
+    db: impl SqliteExecutor<'_>,
+) -> sqlx::Result<Vec<(String, CaddyRouteRow)>> {
     let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
         "SELECT service_id, caddy_index, hosts_json, route_json FROM caddy_routes \
          ORDER BY service_id, caddy_index",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?;
     rows.into_iter()
         .map(|(service_id, caddy_index, hosts, route)| {
@@ -863,13 +865,13 @@ pub async fn delete_pending_caddy_removal(
 }
 
 pub async fn list_pending_caddy_removals(
-    pool: &Pool<Sqlite>,
+    db: impl SqliteExecutor<'_>,
 ) -> sqlx::Result<Vec<PendingCaddyRemoval>> {
     let rows: Vec<(String, i64, String, i64)> = sqlx::query_as(
         "SELECT service_id, caddy_index, hosts_json, last_seen FROM pending_caddy_removals \
          ORDER BY service_id, caddy_index",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?;
     rows.into_iter()
         .map(|(service_id, caddy_index, hosts, last_seen)| {

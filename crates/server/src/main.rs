@@ -34,13 +34,13 @@ fn bind_exposes_plaintext(listen: &str) -> bool {
     }
 }
 
-const USAGE: &str = "usage: docktornet-server [audit | backup | healthcheck]";
+const USAGE: &str = "usage: docktornet-server [audit [--only caddy] | backup | healthcheck]";
 
 /// What the server binary was asked to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Serve,
-    Audit,
+    Audit(audit::Scope),
     Backup,
     Healthcheck,
 }
@@ -48,12 +48,15 @@ enum Command {
 /// The command named by the arguments after the program name, or the usage
 /// line when they name none the binary knows.
 fn parse_command<I: IntoIterator<Item = OsString>>(args: I) -> Result<Command, &'static str> {
-    let mut args = args.into_iter();
-    match (args.next(), args.next()) {
-        (None, _) => Ok(Command::Serve),
-        (Some(arg), None) if arg == "audit" => Ok(Command::Audit),
-        (Some(arg), None) if arg == "backup" => Ok(Command::Backup),
-        (Some(arg), None) if arg == "healthcheck" => Ok(Command::Healthcheck),
+    let args: Vec<OsString> = args.into_iter().collect();
+    match args.as_slice() {
+        [] => Ok(Command::Serve),
+        [arg] if arg == "audit" => Ok(Command::Audit(audit::Scope::All)),
+        [arg, only, provider] if arg == "audit" && only == "--only" && provider == "caddy" => {
+            Ok(Command::Audit(audit::Scope::Caddy))
+        }
+        [arg] if arg == "backup" => Ok(Command::Backup),
+        [arg] if arg == "healthcheck" => Ok(Command::Healthcheck),
         _ => Err(USAGE),
     }
 }
@@ -80,9 +83,9 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     match parse_command(std::env::args_os().skip(1)) {
         Ok(Command::Serve) => serve().await,
-        Ok(Command::Audit) => {
+        Ok(Command::Audit(scope)) => {
             init_stderr_logging();
-            std::process::exit(audit::cli().await)
+            std::process::exit(audit::cli(scope).await)
         }
         Ok(Command::Backup) => {
             init_stderr_logging();
@@ -198,7 +201,14 @@ mod tests {
     #[test]
     fn no_argument_serves_and_subcommands_are_recognised() {
         assert_eq!(parse_command(args(&[])), Ok(Command::Serve));
-        assert_eq!(parse_command(args(&["audit"])), Ok(Command::Audit));
+        assert_eq!(
+            parse_command(args(&["audit"])),
+            Ok(Command::Audit(audit::Scope::All))
+        );
+        assert_eq!(
+            parse_command(args(&["audit", "--only", "caddy"])),
+            Ok(Command::Audit(audit::Scope::Caddy))
+        );
         assert_eq!(parse_command(args(&["backup"])), Ok(Command::Backup));
         assert_eq!(
             parse_command(args(&["healthcheck"])),
@@ -210,6 +220,12 @@ mod tests {
     fn unknown_or_extra_arguments_are_usage_errors() {
         assert_eq!(parse_command(args(&["bogus"])), Err(USAGE));
         assert_eq!(parse_command(args(&["audit", "--only", "npm"])), Err(USAGE));
+        assert_eq!(parse_command(args(&["audit", "--only"])), Err(USAGE));
+        assert_eq!(
+            parse_command(args(&["audit", "--only", "caddy", "extra"])),
+            Err(USAGE)
+        );
+        assert_eq!(parse_command(args(&["--only", "caddy"])), Err(USAGE));
         assert_eq!(parse_command(args(&["backup", "out.db"])), Err(USAGE));
     }
 

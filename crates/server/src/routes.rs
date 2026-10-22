@@ -659,4 +659,138 @@ mod tests {
         assert!(ahead >= Duration::from_secs(55), "{body}");
         assert_eq!(body["status"], "degraded", "{body}");
     }
+
+    /// The app over a reconciler with Caddy alone configured, at `caddy`.  It
+    /// is not a dry run, which would skip the anchor check.
+    async fn make_app_with_caddy(
+        caddy: &mockito::ServerGuard,
+    ) -> (Router, Reconciler, tempfile::TempDir) {
+        let (mut state, dir) = make_state(Duration::from_secs(300)).await;
+        state.reconciler = Reconciler::new(
+            state.reconciler.pool().clone(),
+            ReconcileOptions {
+                dry_run: false,
+                adopt_existing: false,
+                gatus_config_dir: dir.path().join("gatus"),
+            },
+        )
+        .with_caddy(crate::integrations::caddy::CaddyClient::new(
+            crate::config::CaddyConfig {
+                admin_url: url::Url::parse(&caddy.url()).unwrap(),
+                anchor_id: "docktornet".into(),
+            },
+        ));
+        let reconciler = state.reconciler.clone();
+        (build(state), reconciler, dir)
+    }
+
+    /// Caddy's anchor route answers with `status` and `body`.
+    async fn caddy_anchor(status: usize, body: &str) -> (mockito::ServerGuard, mockito::Mock) {
+        let mut caddy = mockito::Server::new_async().await;
+        let mock = caddy
+            .mock("GET", "/id/docktornet/handle/0/routes")
+            .with_status(status)
+            .with_body(body)
+            .create_async()
+            .await;
+        (caddy, mock)
+    }
+
+    #[tokio::test]
+    async fn healthz_has_no_caddy_fields_when_caddy_is_unconfigured() {
+        let (app, _pool, _dir) = make_app().await;
+
+        let body = authenticated_health(app).await;
+
+        assert_eq!(body.get("caddy_breaker"), None, "{body}");
+        assert_eq!(body.get("caddy_anchor"), None, "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_hides_the_caddy_fields_without_auth() {
+        let (caddy, _anchor) = caddy_anchor(404, "{}").await;
+        let (app, reconciler, _dir) = make_app_with_caddy(&caddy).await;
+        reconciler.sweep_pending_removals().await.unwrap();
+        reconciler.trip_caddy_breaker();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&bytes).unwrap();
+        let keys: Vec<&str> = body.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["server_time", "status"]);
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_a_closed_caddy_breaker_and_its_anchor() {
+        let (caddy, anchor) = caddy_anchor(200, "[]").await;
+        let (app, reconciler, _dir) = make_app_with_caddy(&caddy).await;
+
+        let body = authenticated_health(app.clone()).await;
+        assert_eq!(
+            body["caddy_anchor"], "unknown",
+            "before the first check: {body}"
+        );
+        assert_eq!(body["status"], "ok", "{body}");
+
+        reconciler.sweep_pending_removals().await.unwrap();
+        anchor.assert_async().await;
+
+        let body = authenticated_health(app).await;
+        assert_eq!(
+            body["caddy_breaker"],
+            serde_json::json!({ "open": false, "open_until": null }),
+            "{body}"
+        );
+        assert_eq!(body["caddy_anchor"], "ok", "{body}");
+        assert_eq!(body["status"], "ok", "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_is_degraded_while_the_caddy_breaker_is_open() {
+        let (caddy, _anchor) = caddy_anchor(200, "[]").await;
+        let (app, reconciler, _dir) = make_app_with_caddy(&caddy).await;
+        reconciler.sweep_pending_removals().await.unwrap();
+        reconciler.trip_caddy_breaker();
+
+        let body = authenticated_health(app).await;
+
+        assert_eq!(body["caddy_breaker"]["open"], true, "{body}");
+        let open_until =
+            humantime::parse_rfc3339(body["caddy_breaker"]["open_until"].as_str().unwrap())
+                .unwrap();
+        let ahead = open_until
+            .duration_since(std::time::SystemTime::now() - Duration::from_secs(1))
+            .unwrap();
+        assert!(ahead <= Duration::from_secs(62), "{body}");
+        assert!(ahead >= Duration::from_secs(55), "{body}");
+        assert_eq!(
+            body["caddy_anchor"], "unknown",
+            "no anchor read happens while the breaker is open: {body}"
+        );
+        assert_eq!(body["npm_breaker"]["open"], false, "{body}");
+        assert_eq!(body["status"], "degraded", "{body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_is_degraded_while_the_caddy_anchor_is_missing() {
+        let (caddy, anchor) = caddy_anchor(404, r#"{"error":"unknown object ID"}"#).await;
+        let (app, reconciler, _dir) = make_app_with_caddy(&caddy).await;
+        reconciler.sweep_pending_removals().await.unwrap();
+        anchor.assert_async().await;
+
+        let body = authenticated_health(app).await;
+
+        assert_eq!(body["caddy_anchor"], "missing", "{body}");
+        assert_eq!(body["caddy_breaker"]["open"], false, "{body}");
+        assert_eq!(body["status"], "degraded", "{body}");
+    }
 }

@@ -127,3 +127,34 @@ fn no_argument_starts_the_server() {
     child.wait().ok();
     assert!(listening, "the server never listened on {port}");
 }
+
+#[test]
+fn audit_only_caddy_without_caddy_configured_exits_2() {
+    let dir = tempdir().unwrap();
+    let mut child = Command::new(BIN)
+        .args(["audit", "--only", "caddy"])
+        .current_dir(dir.path())
+        .env_clear()
+        .env("DOCKTORNET_LISTEN", "127.0.0.1:0")
+        .env("DOCKTORNET_SECRET", "0123456789abcdef".repeat(4))
+        .env("DOCKTORNET_DB_PATH", dir.path().join("server.db"))
+        .env("DOCKTORNET_GATUS_CONFIG_DIR", dir.path().join("gatus"))
+        .env("DOCKTORNET_NPM_URL", "http://127.0.0.1:9")
+        .env("DOCKTORNET_NPM_USER", "u")
+        .env("DOCKTORNET_NPM_PASSWORD", "p")
+        .env("DOCKTORNET_CF_API_URL", "http://127.0.0.1:9/client/v4")
+        .env("DOCKTORNET_CF_API_TOKEN", "t")
+        .env("DOCKTORNET_CF_ZONE_ID", "z")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let code = wait_with_limit(&mut child, Duration::from_secs(10));
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(code, Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("DOCKTORNET_CADDY_ADMIN_URL"), "{stderr}");
+    assert!(!dir.path().join("server.db").exists());
+}

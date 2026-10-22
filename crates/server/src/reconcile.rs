@@ -211,7 +211,8 @@ impl ResyncReport {
 }
 
 /// What the last read of Caddy's anchor route found.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CaddyAnchor {
     /// Not read yet, the read failed, or the Caddy breaker is open.
     #[default]
@@ -343,6 +344,13 @@ fn snapshot_intent_hash(forward_host: &str, containers: &[docktornet_core::Conta
     hasher.finish()
 }
 
+/// When `breaker`'s cooldown ends while it is open, on the wall clock.
+fn wall_clock_open_until(breaker: &CircuitBreaker) -> Option<SystemTime> {
+    let now = std::time::Instant::now();
+    let until = breaker.open_until(now)?;
+    Some(SystemTime::now() + (until - now))
+}
+
 impl Reconciler {
     pub fn pool(&self) -> &Db {
         &self.db
@@ -359,9 +367,18 @@ impl Reconciler {
     /// The wall-clock time the NPM breaker's cooldown ends while it is open,
     /// or `None` when it is closed.
     pub fn npm_breaker_open_until(&self) -> Option<SystemTime> {
-        let now = std::time::Instant::now();
-        let until = self.npm_breaker.open_until(now)?;
-        Some(SystemTime::now() + (until - now))
+        wall_clock_open_until(&self.npm_breaker)
+    }
+
+    /// Whether Caddy is configured.
+    pub fn has_caddy(&self) -> bool {
+        self.caddy.is_some()
+    }
+
+    /// The wall-clock time the Caddy breaker's cooldown ends while it is
+    /// open, or `None` when it is closed.
+    pub fn caddy_breaker_open_until(&self) -> Option<SystemTime> {
+        wall_clock_open_until(&self.caddy_breaker)
     }
 
     /// What the last read of Caddy's anchor route found, or `Unknown` while
@@ -383,6 +400,15 @@ impl Reconciler {
         let now = std::time::Instant::now();
         for _ in 0..NPM_BREAKER_THRESHOLD {
             self.npm_breaker.record_failure(now);
+        }
+    }
+
+    /// Open the Caddy breaker as a run of failed Caddy calls would.
+    #[cfg(test)]
+    pub(crate) fn trip_caddy_breaker(&self) {
+        let now = std::time::Instant::now();
+        for _ in 0..CADDY_BREAKER_THRESHOLD {
+            self.caddy_breaker.record_failure(now);
         }
     }
 
