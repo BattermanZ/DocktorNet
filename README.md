@@ -3,7 +3,8 @@
 Docktornet is a declarative infrastructure reconciler for self-hosted services.
 Containers describe reverse-proxy, DNS, and monitoring intent through
 `docktornet.*` labels; Docktornet discovers that intent and reconciles Nginx
-Proxy Manager, Cloudflare DNS, and Gatus from one source of truth.
+Proxy Manager, Cloudflare DNS, and Gatus from one source of truth. An optional
+Caddy runs beside NPM as a second reverse proxy, chosen per service.
 
 ## Status
 
@@ -23,10 +24,11 @@ for the multi-domain NPM workflow and post-v1 reliability and security changes.
   the server can converge external systems and remove resources it owns after
   their labels disappear and the restart grace period expires.
 - **Failure-aware integrations:** reconciliation includes request timeouts,
-  no-op detection, Cloudflare rate-limit handling, an NPM circuit breaker, and
-  atomic Gatus configuration writes.
-- **Ownership markers:** every NPM proxy host and Cloudflare record Docktornet
-  manages names its owning service, so a lost database does not lose ownership.
+  no-op detection, Cloudflare rate-limit handling, separate NPM and Caddy
+  circuit breakers, and atomic Gatus configuration writes.
+- **Ownership markers:** every NPM proxy host, Caddy route and Cloudflare record
+  Docktornet manages names its owning service, so a lost database does not lose
+  ownership.
   Dry-run is the default, and Docktornet adopts an unmarked resource only when
   you enable it.
 - **Small deployment shape:** three Rust crates produce an agent and a central
@@ -38,6 +40,7 @@ flowchart LR
     agents -->|Authenticated snapshots| server[Docktornet server]
     server <--> state[(SQLite ownership state)]
     server --> npm[Nginx Proxy Manager]
+    server -.->|optional| caddy[Caddy]
     server --> cf[Cloudflare DNS]
     server --> gatus[Gatus]
 ```
@@ -56,12 +59,14 @@ The public `GET /healthz` response contains liveness status and server time.
 Send the configured bearer token to include agent inventory and versions: the
 server's `version`, and each agent's `agent_version` (`null` for an agent that
 predates version reporting). The same response has the last full resync's
-result and the NPM circuit breaker's state, described in the
-[deployment guide](docs/deployment.md#health) along with the
-`docktornet-server healthcheck` command the compose files use. Unauthenticated
-callers do not receive machine IDs, forwarding addresses, last-seen times,
-versions, resync results or breaker state. The server logs a
-warning once per change when an agent's version differs from its own.
+result and the NPM circuit breaker's state. With Caddy configured, it also has
+the Caddy circuit breaker's state and whether the anchor route was found. The
+[deployment guide](docs/deployment.md#health) describes these fields along with
+the `docktornet-server healthcheck` command the compose files use.
+Unauthenticated callers do not receive machine IDs, forwarding addresses,
+last-seen times, versions, resync results, breaker state or anchor state. The
+server logs a warning once per change when an agent's version differs from its
+own.
 
 The server refuses a relative `DOCKTORNET_DB_PATH`, and inside a container it
 refuses a database on the container's own filesystem. The
@@ -71,18 +76,27 @@ override.
 ### Resource removal lifecycle
 
 When a service disappears from an agent snapshot, Docktornet preserves its
-managed NPM proxy hosts, Cloudflare DNS record, and Gatus configuration for a
-five-minute restart grace period. If the service returns, its stored external
-resource mappings are restored. If it remains absent, Docktornet removes the
-owned resources within about a minute of the grace period ending; failed
-external deletions are persisted and retried on that same minute timer. Gatus
-picks up a removed monitor on its next config check, every 30 seconds.
+managed NPM proxy hosts, Caddy routes, Cloudflare DNS record, and Gatus
+configuration for a five-minute restart grace period. Each one waits as a
+pending removal, and a Caddy route keeps serving traffic until it goes. If the
+service returns, its stored external resource mappings are restored. If it
+remains absent, Docktornet removes the owned resources within about a minute of
+the grace period ending; failed external deletions are persisted and retried on
+that same minute timer. Gatus picks up a removed monitor on its next config
+check, every 30 seconds.
 
-A running service that drops a `docktornet.npm.<n>` group loses that proxy host
-in the same update, with no grace period, because a label edit is not a
-restart. Docktornet retries a failed delete on the same minute timer. A group
-that is still there but fails to parse keeps its proxy host. A service that
-returns after a removal gets back only the proxy hosts its labels still list.
+A running service that drops a `docktornet.npm.<n>` or `docktornet.caddy.<n>`
+group loses that proxy host or Caddy route in the same update, with no grace
+period, because a label edit is not a restart. Docktornet retries a failed
+delete on the same minute timer. An NPM group that is still there but fails to
+parse keeps its proxy host. A Caddy group that fails to parse counts as
+dropped and loses its route. A service that returns after a removal gets back
+only the proxy hosts and Caddy routes its labels still list.
+
+Removals that come due while Caddy is unreachable or its circuit breaker is
+open stay pending and run once Caddy answers again. Every minute, and on each
+full resync, Docktornet also compares the Caddy routes in the anchor route with
+what it last wrote, and puts back any route that was deleted or edited by hand.
 
 ### Ownership markers
 
@@ -97,6 +111,13 @@ resource also carries an ownership marker naming the service ID
 - Cloudflare DNS record: the comment `docktornet:<machine>/<container>`. If
   that would be longer than 100 characters, Docktornet leaves the comment empty
   and logs a warning naming the service.
+- Caddy route: the route's `@id`,
+  `docktornet--<machine slug>__<container slug>--<hash>--<n>`. Caddy rejects
+  unknown fields in a route, so the `@id` is the only place a marker fits. The
+  slugs replace every character other than a letter or digit with `_`, the hash
+  keeps two service IDs that slug the same apart, and `<n>` is the label index.
+  The `@id` can't be read back into a service ID; Docktornet computes it from a
+  known service and looks it up.
 
 A missing or wrong marker counts as drift, and the next full resync rewrites
 it. When a service has no stored mapping, Docktornet first looks for a resource
@@ -106,10 +127,12 @@ marked host that serves domains the labels no longer list loses them on the
 next update, as a label edit would.
 
 Hostname adoption, enabled by `DOCKTORNET_ADOPT_EXISTING=true`, still takes
-over an existing resource whose hostname matches the labels. It now adopts
-only unmarked resources and writes the marker when it does. A resource whose
-marker names another service is never adopted: the reconcile fails and logs
-both the owner and the service that wanted it.
+over an existing NPM proxy host or Cloudflare record whose hostname matches the
+labels. It now adopts only unmarked resources and writes the marker when it
+does. Caddy routes have no hostname adoption. Docktornet adopts a Caddy route
+only by its `@id`. A resource whose marker names another service is never
+adopted: the reconcile fails and logs both the owner and the service that
+wanted it.
 
 Docktornet deletes only what a stored mapping or pending removal points to. It
 never deletes a marked resource that has no mapping, and dry-run writes no
@@ -117,7 +140,9 @@ markers. See [ADR 0001](docs/adr/0001-ownership-markers.md) for the format.
 
 To find orphans, run `docker exec docktornet-server docktornet-server audit`.
 It prints, as JSON, the resources no mapping points to and the mappings whose
-resource is gone or unmarked. The
+resource is gone or unmarked. With Caddy configured, it also lists the Caddy
+routes that don't match the mappings, and `audit --only caddy` lists those
+alone. The
 [deployment guide](docs/deployment.md#auditing-ownership) explains the output.
 
 The first full resync after upgrading to a version with markers runs at startup
@@ -182,6 +207,41 @@ domains share that entry's port, scheme, SSL and certificate. Use a separate
 | `docktornet.npm.<index>.block_exploits` | no | bool | `true` | `false` | Block common exploits. |
 | `docktornet.npm.<index>.websockets` | no | bool | `true` | `false` | Enable Websocket support. |
 | `docktornet.npm.<index>.cert_id` | no | u32 | unset | `7` | Existing NPM certificate ID. |
+
+### Caddy (`docktornet.caddy.<index>.*`)
+
+Caddy is optional. These labels do something only when the server has
+`DOCKTORNET_CADDY_ADMIN_URL` set; without it, the server logs a warning for a
+service that has them and skips them. The
+[deployment guide](docs/deployment.md#caddy) covers setting Caddy up.
+
+Each group becomes one Caddy route inside the anchor route, the route in your
+Caddy config that Docktornet writes into. The Caddy route sends its hostnames
+to the agent's `DOCKTORNET_FORWARD_HOST` and the label's port, as NPM does. A
+service can carry `npm.*` and `caddy.*` groups at once, even for the same
+hostname.
+
+| Label | Required | Type | Default | Example | Notes |
+|-------|----------|------|---------|---------|-------|
+| `docktornet.caddy.<index>.host` | yes | string (comma-separated) | — | `flowsync.example.com` | One or more hostnames, matched by one Caddy route. Lowercased. |
+| `docktornet.caddy.<index>.port` | yes | u16 | — | `8080` | Upstream port. |
+| `docktornet.caddy.<index>.scheme` | no | `http` \| `https` | `http` | `https` | Scheme Caddy uses toward the upstream. With `https`, Caddy doesn't verify the upstream's certificate, the same as NPM. |
+
+Caddy serves plain HTTP here, behind whatever terminates TLS in front of it,
+such as a Cloudflare tunnel. There are no `ssl`, HSTS, HTTP/2 or `cert_id`
+labels, because the front owns those. Caddy proxies websockets without a setting.
+
+- Docktornet drops a group with a missing `host` or `port`, a bad port, or an
+  unknown scheme, and logs a warning. If the group already had a Caddy route,
+  Docktornet deletes it in the same update. The container's other labels still
+  apply.
+- When two groups of the same container list one hostname, the lower index
+  keeps it. Docktornet drops the later group the same way.
+- Docktornet refuses a hostname that another service's Caddy route already
+  holds, in any letter case. The service that claimed it first keeps it, and
+  the server logs an error naming both services. Docktornet retries the refused
+  group on later updates, so it comes up once the clash is resolved. A Caddy
+  route whose service is in its grace period still holds its hostnames.
 
 ### Cloudflare DNS (`docktornet.cf.dns.*`)
 

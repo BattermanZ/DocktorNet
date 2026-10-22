@@ -56,8 +56,9 @@ services:
     restart: unless-stopped
     # --resume keeps the routes the server wrote across a restart. The admin
     # API listens on the compose network only: its port is never published.
-    # The bootstrap allows the origin localhost:2019, which the caddy CLI
-    # sends, so `caddy reload` works from inside the container.
+    # The bootstrap allows the origins the caddy CLI sends from inside the
+    # container: http://0.0.0.0:2019 for `caddy reload --config` with the
+    # bootstrap file, http://localhost:2019 otherwise.
     command: ["caddy", "run", "--config", "/etc/caddy/bootstrap.json", "--resume"]
     ports:
       - "127.0.0.1:18087:80"

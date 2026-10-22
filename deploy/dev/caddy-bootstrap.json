@@ -1,7 +1,7 @@
 {
   "admin": {
     "listen": "0.0.0.0:2019",
-    "origins": ["localhost:2019"]
+    "origins": ["localhost:2019", "0.0.0.0:2019"]
   },
   "apps": {
     "http": {

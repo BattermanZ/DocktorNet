@@ -47,6 +47,8 @@ openssl rand -hex 32
 | `DOCKTORNET_NPM_*` | required | — |
 | `DOCKTORNET_CF_API_TOKEN`, `DOCKTORNET_CF_ZONE_ID` | required | — |
 | `DOCKTORNET_CF_API_URL` | optional (`https://api.cloudflare.com/client/v4`); the dev stack points it at its stub | — |
+| `DOCKTORNET_CADDY_ADMIN_URL` | optional; Caddy's admin API, such as `http://caddy:2019`. Unset turns the Caddy integration off. See [Caddy](#caddy) | — |
+| `DOCKTORNET_CADDY_ANCHOR_ID` | optional (`docktornet`); the `@id` of the anchor route, non-empty and without `/` | — |
 | `DOCKTORNET_SERVER_URL` | — | required |
 | `DOCKTORNET_POLL_INTERVAL` | — | required |
 | `DOCKTORNET_MACHINE_ID` | — | required; non-empty, with no `/`, whitespace or control characters. Give each agent its own: within 5 minutes of the first agent's last push, the server answers `409` to another agent pushing the same id with a different forward host |
@@ -88,20 +90,22 @@ The `database ready` line in the startup log shows the resolved path, whether it
 
 ## Ownership markers and adoption
 
-The server writes an ownership marker on every NPM proxy host and Cloudflare
-DNS record it manages: the `docktornet` key in the host's `meta`, and the
-comment `docktornet:<machine>/<container>` on the record. The format is fixed
-by [ADR 0001](adr/0001-ownership-markers.md).
+The server writes an ownership marker on every NPM proxy host, Caddy route and
+Cloudflare DNS record it manages: the `docktornet` key in the host's `meta`,
+the route's `@id`, and the comment `docktornet:<machine>/<container>` on the
+record. The format is fixed by [ADR 0001](adr/0001-ownership-markers.md).
 
 - **Losing the database.** When a service has no stored mapping, the server
   adopts a resource marked with its service ID before it creates one. This
   needs no flag, so a server started on an empty database takes back what it
   owned as each agent pushes, without duplicates.
 - **Hostname adoption.** With `DOCKTORNET_ADOPT_EXISTING=true`, a create that
-  fails because the hostname is taken adopts the existing resource, but only
-  if it is unmarked. The server writes the marker as it adopts. It refuses a
-  resource marked for another service and logs both service IDs. If adoption replaces a Cloudflare comment the server did not write, it
-  logs the old text first.
+  fails because the hostname is taken adopts the existing proxy host or record,
+  but only if it is unmarked. The server writes the marker as it adopts. It
+  refuses a resource marked for another service and logs both service IDs. If
+  adoption replaces a Cloudflare comment the server did not write, it logs the
+  old text first. Caddy routes have no hostname adoption, so the server never
+  takes over a hand-written route.
 - **Deletion.** Unchanged: the server deletes only what a stored mapping or
   pending removal points to, never a marked resource on its own.
 - **Long service IDs.** The server never writes a comment over 100
@@ -117,16 +121,21 @@ by [ADR 0001](adr/0001-ownership-markers.md).
 
 ## Auditing ownership
 
-`docktornet-server audit` compares NPM and Cloudflare with the server's
-ownership mappings and prints what does not line up. It changes nothing. It
-opens the database read-only and runs no migrations. Apart from the NPM token
-request it sends only GET requests, whatever `DOCKTORNET_DRY_RUN` says. It reads
+`docktornet-server audit` compares NPM, Cloudflare and, when
+`DOCKTORNET_CADDY_ADMIN_URL` is set, Caddy with the server's ownership mappings
+and prints what does not line up. It changes nothing. It opens the database
+read-only and runs no migrations. Apart from the NPM token request it sends
+only GET requests, whatever `DOCKTORNET_DRY_RUN` says. It reads
 the same environment as the server, so run it inside the server container,
 next to the live server. The image has no shell, so call the binary directly:
 
 ```bash
 docker exec docktornet-server docktornet-server audit > audit.json
+docker exec docktornet-server docktornet-server audit --only caddy  # Caddy alone
 ```
+
+`--only caddy` skips NPM and Cloudflare, and exits 2 when Caddy isn't
+configured.
 
 The upstream probes below go out from the container, over the server's
 network. Logs and errors go to stderr, and stdout carries only the report: one
@@ -148,9 +157,21 @@ to report.
     "mapped_missing": [],
     "mapped_unmarked": [],
     "unmarked_unmapped": []
-  }
+  },
+  "caddy": {
+    "marked_unmapped": [],
+    "pending_removal": [],
+    "mapped_missing": [],
+    "marked_outside_anchor": []
+  },
+  "errors": []
 }
 ```
+
+The `caddy` section appears only when Caddy is configured, and under
+`--only caddy` it is the only section besides `errors`. `errors` holds problems
+that belong to no one resource. Today that is a missing anchor route:
+`Caddy anchor route "<id>" not found`.
 
 Every entry has the resource's `id`. Where the resource still exists, NPM
 entries add `domain_names` and Cloudflare entries add `name`, plus `type`
@@ -167,6 +188,17 @@ ran.
 | `unmarked_unreachable` (NPM) | A proxy host with no marker and no mapping whose `forward_host:forward_port` does not take a TCP connect within 2 seconds: refused, unresolvable, unroutable or silent. At most 8 probes run at once. | `forward_host`, `forward_port` |
 | `unmarked_unmapped` (Cloudflare) | A record of any type with no marker and no mapping. It is listed without a probe, since a record does not say which port to try, so hand-made records show up here too. | `content` |
 
+The Caddy section has its own four lists. A Caddy entry's `id` is the route's
+`@id`, and `hosts` is what its host matcher holds. A marker can't be turned
+back into a service ID, so `marked_unmapped` entries have none.
+
+| Category | What it lists | Extra fields |
+| --- | --- | --- |
+| `marked_unmapped` (Caddy) | A route in the anchor whose `@id` starts with `docktornet--`, but no mapping or pending removal points to it. The server never deletes one of these; remove it by hand once you are sure. | `hosts` |
+| `pending_removal` (Caddy) | A row in `pending_caddy_removals`: a Caddy route waiting out its grace period, or one whose deletion keeps failing. | `hosts`, `exists`, `service_id`, `caddy_index`, `last_seen`, `last_seen_secs_ago` |
+| `mapped_missing` (Caddy) | A mapping whose route is nowhere in Caddy's config. The drift check puts it back within a minute, so a lasting entry means the drift check is failing or the server is in dry-run. | `service_id`, `caddy_index` |
+| `marked_outside_anchor` | A route carrying a mapped service's marker somewhere outside the anchor route. The server won't add a second route with the same `@id`, so it leaves the service without one in the anchor. Delete or move the stray route. | `hosts`, `service_id`, `caddy_index` |
+
 A record whose service ID is too long for a marker (see
 [Long service IDs](#ownership-markers-and-adoption)) is listed under
 `mapped_unmarked`.
@@ -176,17 +208,18 @@ The exit code says what the audit found:
 | Code | Meaning |
 | --- | --- |
 | `0` | Every list is empty. |
-| `1` | At least one list has entries. |
+| `1` | At least one list, `errors` included, has entries. |
 | `2` | The audit failed, for example on config, opening the database, the NPM login or an API error. The error goes to stderr and stdout stays empty. |
 
-The audit lists NPM and Cloudflare first and then reads the database in one
-transaction. A service that is created or removed while the audit runs can
+The audit lists NPM, Cloudflare and Caddy's anchor route first and then reads
+the database in one transaction. A service that is created or removed while the audit runs can
 still show up in a list, so run it again before acting on a finding.
 
 Running the binary with no argument starts the server as before.
 `docktornet-server backup` is described under [Backups](#backups), and
 `docktornet-server healthcheck` under [Health](#health). Any other argument
-exits 2 with a usage line.
+exits 2 with the usage line,
+`usage: docktornet-server [audit [--only caddy] | backup | healthcheck]`.
 
 ## Backups
 
@@ -338,8 +371,23 @@ Besides `version` and `agents`, the authenticated response carries:
   failures in a row and stays open for a minute, during which the server
   leaves NPM alone.
 
-`status` is `"degraded"` while the NPM breaker is open or when the server
-cannot read its agent list, and `"ok"` otherwise.
+With `DOCKTORNET_CADDY_ADMIN_URL` set, it also carries:
+
+- `caddy_breaker`: the Caddy circuit breaker, in the same shape as
+  `npm_breaker`. It opens after three Caddy failures in a row and stays open
+  for a minute. Connection errors, timeouts and unexpected statuses count as
+  failures. A route Caddy rejects with a 400 or a 500 fails on its own and
+  doesn't count, so one bad route can't stall the rest.
+- `caddy_anchor`: what the last read of the anchor route found. `"ok"` means
+  Caddy has it, `"missing"` means Caddy answered that no route has the anchor's
+  `@id`, and `"unknown"` means no read has happened yet, the last read failed,
+  or the Caddy breaker is open.
+
+Both are left out when Caddy isn't configured.
+
+`status` is `"degraded"` while the NPM breaker or the Caddy breaker is open,
+while `caddy_anchor` is `"missing"`, or when the server cannot read its agent
+list, and `"ok"` otherwise. The unauthenticated response always says `"ok"`.
 
 ## Filesystem permissions
 
@@ -392,3 +440,278 @@ alerting:
 `alerting.custom` is **required** if any service has `docktornet.gatus.N.telegram=true` (the default), because docktornet emits `type: custom` alert references. **The `alerting.custom` block must exist before the new docktornet binary runs** — Gatus validates each endpoint's alert type against a configured provider at config load, so a missing `alerting.custom` block makes Gatus fail to load once per-service files reference it. The env vars `GATUS_TELEGRAM_TOKEN` and `GATUS_TELEGRAM_CHAT_ID` must be available to the Gatus container.
 
 Docktornet also writes `docktornet-classification.json` to this directory: the classification map an alert service reads for each endpoint's severity, area, host and alert thresholds. Gatus ignores it, since it loads only `.yaml` and `.yml` files. To report thresholds, the server reads `alerting.custom.default-alert` from the other YAML files in the directory, so keep the base config there rather than mounting it into the Gatus container alone. The [README](../README.md#gatus-classification-map) documents the format.
+
+## Caddy
+
+Caddy is an optional second reverse proxy beside NPM. A service picks it with
+`docktornet.caddy.<index>.*` labels, listed in the
+[README](../README.md#caddy-docktornetcaddyindex). NPM stays required.
+
+Caddy runs on the same machine as the docktornet server, because its admin API
+must stay on a private network between the two. It keeps services reachable
+through an NPM outage only when that machine isn't NPM's, for example a second
+site that runs the server.
+
+The server manages Caddy routes the way it manages NPM proxy hosts: ownership
+mappings, ownership markers, the grace period, pending removals, restore on
+return, marker adoption, the audit and a circuit breaker of its own. Every
+minute, and on each full resync, a drift check reads the anchor route and puts
+back any Caddy route that was deleted or edited by hand. In dry-run it writes
+nothing, the drift check included.
+
+The server never runs, starts or configures Caddy. You run one Caddy, with a
+bootstrap config that contains the anchor route, and the server writes only
+inside that anchor. A failing or unreachable NPM never stops Caddy work, and
+the reverse holds too.
+
+### Bootstrap config
+
+Save this as `caddy/bootstrap.json` next to the compose file:
+
+```json
+{
+  "admin": {
+    "listen": "0.0.0.0:2019",
+    "origins": ["localhost:2019", "0.0.0.0:2019"]
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "proxy": {
+          "listen": [":80"],
+          "automatic_https": { "disable": true },
+          "trusted_proxies": { "source": "static", "ranges": ["172.31.253.0/24"] },
+          "client_ip_headers": ["CF-Connecting-IP"],
+          "routes": [
+            {
+              "@id": "docktornet",
+              "handle": [{ "handler": "subroute", "routes": [] }]
+            },
+            {
+              "handle": [{ "handler": "static_response", "status_code": 404 }]
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+What each part is for:
+
+- **A plain HTTP listener, automatic HTTPS off.** Caddy sits behind something
+  that terminates TLS, such as a Cloudflare tunnel. With automatic HTTPS on,
+  Caddy would try to get certificates and redirect to HTTPS, which fails or
+  loops behind the tunnel.
+- **The anchor route first.** Its `@id` is `DOCKTORNET_CADDY_ANCHOR_ID`,
+  `docktornet` by default, and its only handler is a `subroute` with an explicit
+  `"routes": []`. Without the `routes` key Caddy has no list to append to, and
+  the server can neither read nor write the anchor's routes. The server reads
+  and writes only that `routes` list. It never creates the anchor. When the
+  anchor is missing, the server logs an error, reports
+  `caddy_anchor: "missing"` in `/healthz`, and writes nothing.
+- **Hand-written routes after the anchor.** Caddy tries routes in order, and
+  every Caddy route the server writes is terminal. Put your own routes after
+  the anchor; a catch-all placed before it would shadow every Caddy route. The
+  last route above answers 404 for any hostname nothing else matched.
+- **`admin.listen` on an address the server can reach.** The official image
+  listens on `localhost:2019`, which another container can't reach.
+  `0.0.0.0:2019` listens on every network Caddy is attached to, so attach Caddy
+  only to networks you trust with the admin API. See
+  [The admin API](#the-admin-api).
+- **`trusted_proxies` and `client_ip_headers`** pass the visitor's address on
+  to your apps. See [Client IPs](#client-ips).
+
+Point the server at the admin API in `server.env`:
+
+```bash
+DOCKTORNET_CADDY_ADMIN_URL=http://caddy:2019
+# DOCKTORNET_CADDY_ANCHOR_ID=docktornet  # only if the anchor's @id differs
+```
+
+### Running Caddy
+
+Add Caddy to the server's compose file, and put it and the server on a network
+of their own:
+
+```yaml
+services:
+  docktornet-server:
+    # ... as in deploy/main-host.compose.yaml, plus:
+    networks: [default, caddy-admin]
+
+  caddy:
+    image: caddy:2.11.7
+    container_name: caddy
+    restart: unless-stopped
+    command: ["caddy", "run", "--config", "/etc/caddy/bootstrap.json", "--resume"]
+    ports:
+      # Only the HTTP port, and only on loopback, for the tunnel. 2019 is never published.
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./caddy/bootstrap.json:/etc/caddy/bootstrap.json:ro
+      - ./caddy/config:/config
+    networks: [caddy-admin]
+
+networks:
+  caddy-admin:
+    ipam:
+      # Fixed so trusted_proxies in the bootstrap can name it. Any free subnet
+      # works; change both together.
+      config:
+        - subnet: 172.31.253.0/24
+```
+
+`--resume` makes Caddy start from its autosave, the last config it ran, instead
+of the bootstrap file. Every change the server makes through the admin API is
+autosaved, so after a restart Caddy serves its Caddy routes straight away, even
+while the server is down or unreachable. Without `--resume`, a restarted Caddy
+serves an empty anchor until the server's next drift check refills it, and not
+at all while the server can't reach it. The autosave lives in Caddy's config
+directory, `/config` in the official image, so keep that directory on a
+persistent volume. On the first start there is no autosave yet, and Caddy loads
+the bootstrap file.
+
+Caddy dials each service at its agent's `DOCKTORNET_FORWARD_HOST` and the
+label's port, so it needs to reach every machine whose services it routes. A
+Caddy route to a service on another machine works, and depends on the network
+between the two machines staying up.
+
+### The admin API
+
+The admin API has no authentication. Anyone who can reach it can rewrite or
+stop your Caddy. Keep it on a private container network shared only with the
+docktornet server, like `caddy-admin` above, and never publish port 2019.
+Don't attach other containers, the tunnel connector included, to that network.
+
+`admin.origins` is not access control. Caddy checks it only on requests that
+carry an `Origin` header, which browsers send and the docktornet server and
+`curl` don't. It stops a web page in someone's browser from driving the admin
+API, and nothing else.
+
+The `caddy` CLI inside the container does send an `Origin` header, so the
+origins list has to name it, or `caddy reload` gets a 403. The CLI picks its
+address, and the `Origin` it sends, like this:
+
+- `caddy reload --config /etc/caddy/bootstrap.json` takes the address from the
+  file's `admin.listen` and sends `http://0.0.0.0:2019`.
+- A command given no config file, such as `caddy stop`, uses
+  `localhost:2019`.
+- `--address localhost:2019` on any command sends `http://localhost:2019`.
+
+The bootstrap above allows both. If you'd rather list one, keep
+`localhost:2019` and pass `--address localhost:2019` to every command.
+
+### Changing the config later
+
+Once an autosave exists, `--resume` ignores the bootstrap file, so editing it
+changes nothing on the next restart. You have two ways to change settings:
+
+- **The admin API, preferred.** Change the setting in place from a throwaway
+  container on `caddy-admin`, whose name compose prefixes with the project
+  name. For example, to set `trusted_proxies`:
+
+  ```bash
+  docker run --rm --network <project>_caddy-admin curlimages/curl:8.10.1 \
+    -X PATCH -H 'Content-Type: application/json' -d '["172.31.253.0/24"]' \
+    http://caddy:2019/config/apps/http/servers/proxy/trusted_proxies/ranges
+  ```
+
+  Caddy autosaves the change, and the Caddy routes in the anchor stay as they
+  are. Leave changes inside the anchor to the server.
+- **`caddy reload` with the bootstrap file.** This replaces the whole config,
+  so the anchor comes back empty and every Caddy route stops answering until
+  the drift check refills it, within a minute. The drift check puts back only
+  the Caddy routes of services that are still running. A Caddy route whose
+  service is in its grace period stays gone.
+
+  ```bash
+  docker exec caddy caddy reload --config /etc/caddy/bootstrap.json
+  ```
+
+  Expect that gap, or use the admin API.
+
+### Behind a Cloudflare tunnel
+
+The intended setup runs Caddy on the machine whose services should keep
+working when NPM's machine or network is down, with a Cloudflare tunnel in
+front of it. Run the tunnel connector, `cloudflared`, on the host, or in a
+container with `network_mode: host`, so it reaches Caddy at
+`http://localhost:8080` and stays off `caddy-admin`.
+
+Give the tunnel one catch-all public hostname, `*.<your zone>`, with the service
+`http://localhost:8080`. The tunnel matches ingress rules in order, top to
+bottom, so put the catch-all after every rule the tunnel already has, or it
+takes their traffic. In a locally managed tunnel's `config.yml` that means last
+before the final `http_status:404` rule:
+
+```yaml
+ingress:
+  - hostname: existing.example.com   # rules you already have stay first
+    service: http://localhost:3000
+  - hostname: "*.example.com"
+    service: http://localhost:8080
+  - service: http_status:404
+```
+
+Then point each service that moves to Caddy at the tunnel, through its
+Cloudflare labels. The target is the tunnel's own hostname,
+`<tunnel ID>.cfargotunnel.com`, and the record must be proxied:
+
+```yaml
+docktornet.caddy.0.host: app.example.com
+docktornet.caddy.0.port: "8080"
+docktornet.cf.dns.name: app
+docktornet.cf.dns.target: <tunnel ID>.cfargotunnel.com
+docktornet.cf.dns.proxied: "true"
+```
+
+Only hostnames whose DNS record points at the tunnel reach Caddy. Names that
+still route through NPM keep records that point at NPM, so the catch-all never
+sees them.
+
+### Client IPs
+
+Caddy's peer is the tunnel connector, not the visitor. Cloudflare sends the
+visitor's address in `CF-Connecting-IP` and `X-Forwarded-For`, and the two
+server settings in the bootstrap make Caddy use them:
+
+- `trusted_proxies` lists the addresses Caddy accepts forwarded headers from.
+  Caddy forwards `X-Forwarded-For` from a trusted peer and appends the peer's
+  address, so the visitor's address comes first. From any other peer Caddy
+  replaces the header with the peer's address. `cloudflared` on the host
+  connects through the published port, so Caddy sees it at the gateway of
+  `caddy-admin`, inside that network's subnet. The compose fragment fixes the
+  subnet so the bootstrap can name it. If you change one, change the other, or
+  Caddy stops trusting the tunnel. Caddy's JSON config doesn't accept the
+  Caddyfile's `private_ranges` shorthand. Only processes on the host can reach
+  a port published on loopback, so no one else can send Caddy a forged
+  header.
+- `client_ip_headers: ["CF-Connecting-IP"]` makes Caddy take the client
+  address in its logs and `client_ip` matchers from that header, when the peer
+  is trusted.
+
+Caddy passes `CF-Connecting-IP` through to the app unchanged, so an app that
+reads it gets the visitor's address either way.
+
+### Moving a service from NPM to Caddy
+
+A service can carry `npm.*` and `caddy.*` groups for the same hostname at once,
+so it can move without a gap:
+
+1. Add the `caddy.*` group beside the `npm.*` group, and change `cf.dns.target`
+   to the tunnel hostname, proxied. Recreate the container. In one update the
+   server creates the Caddy route and points the DNS record at the tunnel.
+   Until Cloudflare serves the new record, traffic still reaches NPM, which
+   still has the proxy host.
+2. Check the service answers through the tunnel. If its Caddy route is
+   missing, the request falls through to the bootstrap's last route and gets a
+   404. The server log says why, for example `refusing caddy route` when
+   another service's Caddy route already holds the hostname.
+3. Remove the `npm.*` group and recreate the container. The server deletes the
+   NPM proxy host in that update, with no grace period, because dropping a
+   group is a label edit.
+
+The server never moves anything between the two proxies on its own. Only
+labels decide which proxy routes a service.
