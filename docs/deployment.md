@@ -1,20 +1,20 @@
 # Deployment
 
-Docktornet ships two images, both rootless and distroless:
+Docktornet has two images, both rootless and distroless:
 
-- `ghcr.io/battermanz/docktornet-server` — runs on the main host only.
-- `ghcr.io/battermanz/docktornet-agent` — runs on every host that exposes containers, including the main host.
+- `docktornet-server` runs on the main host only.
+- `docktornet-agent` runs on every host that exposes containers, including the main host.
 
 ## Images
 
-Build locally:
+No registry publishes them. Build both from a release tag, and push them to
+your own registry if your hosts pull from one:
 
 ```bash
+git checkout v<version>
 docker build -f crates/server/Dockerfile -t docktornet-server:<version> .
 docker build -f crates/agent/Dockerfile  -t docktornet-agent:<version>  .
 ```
-
-Publishing images to GHCR is out of scope for v1 — tag and push manually for now.
 
 ## Configuration
 
